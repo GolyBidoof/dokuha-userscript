@@ -1,7 +1,4 @@
 #!/usr/bin/env node
-// =============================================================================
-// ebookjapan adapter — the parts that must not rot silently
-// =============================================================================
 // Deliberately no browser: the glue tripwire is the one thing whose failure is
 // invisible until a run is already descrambling nothing, so it is checked
 // straight out of the built artifact. If the embedded glue and its pinned
@@ -30,7 +27,7 @@ function fnv1a32(str) {
   return ('0000000' + h.toString(16)).slice(-8);
 }
 
-const ARTIFACTS = ['ebookjapan-only.user.js', 'omnimanga-native-downloader.user.js'];
+const ARTIFACTS = ['ebookjapan-only.user.js', 'dokuha-userscript.user.js'];
 
 // The body of one top-level fragment function, so an ordering claim can be
 // asserted against the code rather than against the whole artifact. The search
@@ -47,14 +44,16 @@ function fnBody(src, name) {
   return src.slice(start, ends.length ? Math.min.apply(null, ends) : src.length);
 }
 
-// The doc comment above that function plus its body: a decision has to stay
-// documented, not just implemented.
-function fnDoc(src, name) {
-  const body = fnBody(src, name);
-  if (body == null) return null;
+// The doc comment above a function in the annotated source. The installed
+// bundle is comment-stripped by design (build.mjs runs tools/strip-comments.js
+// over src/), so a "this decision is documented" check reads src/, which keeps
+// every comment, rather than the artifact.
+function srcDoc(name) {
+  const src = fs.readFileSync(path.join(ROOT, 'src/sites/ebookjapan/05-run.js'), 'utf8');
   const decl = src.indexOf('function ' + name + '(');
+  if (decl === -1) return null;
   const doc = src.lastIndexOf('/**', decl);
-  return doc !== -1 ? src.slice(doc, decl + body.length) : body;
+  return doc === -1 ? null : src.slice(doc, decl);
 }
 
 // Evaluate the shipped timing accumulator in Node. It is pure arithmetic over
@@ -119,13 +118,11 @@ for (const file of ARTIFACTS) {
   check('the panel is populated before a run starts', /async refresh\(\)/.test(src));
   check('the adapter satisfies its contract', /run\(ui, mode, options\)/.test(src) && /getCid\(\)/.test(src) && /archiveDefault\(/.test(src));
 
-  // ---------------------------------------------------------------------
   // Per-page stage timing. The complaint is a run that starts fast and falls
   // to ~1 page/s, and the whole point of these numbers is to say which of
   // fetch / descramble / write owns it. A missing or unwired stage would send
   // the next session optimising the wrong one, so both the accumulator and its
   // two surfaces (panel details + console log) are pinned.
-  // ---------------------------------------------------------------------
   check('per-page stage timing exists', /function ebjTimingNew\(/.test(src) && /function ebjTimingAdd\(/.test(src));
   check('fetch, descramble and the archive write are timed separately',
     /ebjTimingAdd\(ebjTiming, 'fetch'/.test(src) &&
@@ -185,13 +182,11 @@ for (const file of ARTIFACTS) {
       t.fetch.ring.length + ' samples');
   }
 
-  // ---------------------------------------------------------------------
   // The retry pass must be bounded-parallel and reuse the main gate. The old
   // serial `for (const i of Array.from(harness.failedIdx))` awaited one full
   // main-thread descramble per iteration, which is the "fast, then 1 page/s"
   // tail; it must not come back, and the page index must come from the retry
   // cursor rather than a leftover main-loop index.
-  // ---------------------------------------------------------------------
   check('the retry pass is no longer a serial awaited loop',
     !/for \(const i of Array\.from\(harness\.failedIdx\)\)/.test(src));
   check('the retry pass is fed through the main worker() and gate',
@@ -201,25 +196,31 @@ for (const file of ARTIFACTS) {
     /const ebjNextJob = \(\) =>/.test(src) &&
     /ebjRetryList\[ebjRetryAt\+\+\]/.test(src) &&
     /const pageIdx = i \+ 1;/.test(src));
+  // The main pass now ramps (firstWave, then the remainder), so counting loops is
+  // no longer the question. What matters is that the retry pass is bounded to the
+  // same gate rather than descending into a serial tail.
   check('the retry stays bounded to the same gate as the main pass',
-    (src.match(/for \(let w = 0; w < concurrency; w\+\+\)/g) || []).length >= 2);
+    /for \(let w = 0; w < concurrency; w\+\+\) retryWorkers\.push\(worker\(\)\);/.test(src),
+    'the retry pass launches the full gate');
 
-  // ---------------------------------------------------------------------
-  // The fetch order is a deliberate decision, not an untested default: GM is
-  // the only transport this page's CSP lets reach either the CDN or a loopback
-  // bridge port, so it is tried first and the shared lanes stay the fallback.
-  // If someone flips it, this fails and points at the reasoning in the body.
-  // ---------------------------------------------------------------------
+  // The fetch order is a deliberate decision, not an untested default: a proxy
+  // port is the only transport that gives this page more than one origin, so it
+  // is tried first; GM straight at the CDN is the single-origin fallback it needs
+  // because the CSP refuses a page-realm fetch to loopback; the shared lanes are
+  // last. If someone flips it, this fails and points at the reasoning in the body.
   const fetchBody = fnBody(src, 'ebjFetchPage');
-  const fetchDoc = fnDoc(src, 'ebjFetchPage');
+  const fetchDoc = srcDoc('ebjFetchPage');
   check('ebjFetchPage is present for the order check', !!fetchBody);
   if (fetchBody) {
-    check('GM is attempted before the shared lanes',
-      fetchBody.indexOf('GM_xmlhttpRequest') !== -1 &&
-      fetchBody.indexOf('laneFetch(') !== -1 &&
+    check('the accelerator port is attempted before GM and the shared lanes',
+      fetchBody.indexOf('proxyLaneFetch') !== -1 &&
+      fetchBody.indexOf('proxyLaneFetch') < fetchBody.indexOf('GM_xmlhttpRequest') &&
       fetchBody.indexOf('GM_xmlhttpRequest') < fetchBody.indexOf('laneFetch('));
     check('the fetch order records why the bridge lane cannot serve here',
-      !!fetchDoc && /connect-src/.test(fetchDoc) && /allowProxy/.test(fetchDoc) && /proxyUrlFor/.test(fetchDoc));
+      !!fetchDoc && /connect-src/.test(fetchDoc) && /socket pools/.test(fetchDoc),
+      'the CSP reason and the one-origin-per-port budget are recorded in src/');
+    check('a proxy miss is asked for explicitly, and the fan-out is no longer pinned at 16',
+      /proxyLaneAvailable\(\)/.test(fetchBody) && src.indexOf('Math.min(16, budget)') === -1);
   }
 
   // The resolve helpers must exist or the run dies before it starts. apiHeaders
@@ -228,6 +229,121 @@ for (const file of ARTIFACTS) {
   check('the viewer API headers helper is defined', /const apiHeaders =/.test(src));
   check('a failed run reaches the panel, not just the console', /setRunDetails\(ui\.details/.test(src));
   check('the live debug surface is exported', /__bwddEbookjapanDebug/.test(src));
+  // A DevTools HAR cannot see this site's page traffic: it rides
+  // GM_xmlhttpRequest, which never appears there. So the run's own stage split
+  // and lane mix are the only way to tell a fetch-bound run from a CPU-bound one,
+  // and they have to survive the run that produced them.
+  check('the last run\'s timing survives for the console to read',
+    /let ebjLastTiming = null;/.test(src) &&
+    /ebjLastTiming = t;/.test(src) &&
+    /timing: ebjLastTiming \? \{/.test(src) &&
+    /lanes: Object\.assign\(\{\}, ebjLastTiming\.lanes\)/.test(src));
+  // A page between decode and hand-off holds a decoded image plus a
+  // full-intrinsic-size canvas - tens of MB each. The socket budget says how many
+  // pages may be on the wire, not how many may hold pixels, and conflating the
+  // two is what makes a run start fast and then stall. CMOA gates this
+  // (cmoaAcquireSlot); ebookjapan must too, and the gate has to sit before the
+  // decode or the pixels are made anyway.
+  check('the decode gate exists and is bounded',
+    /let ebjSlotLimit = 16;/.test(src) &&
+    /function ebjAcquireSlot\(\)/.test(src) &&
+    /function ebjReleaseSlot\(\)/.test(src));
+  check('the gate is armed once per run',
+    /ebjSetSlotLimit\(16\);/.test(src));
+  check('the gate is taken before the decode and released after the descramble',
+    /await ebjAcquireSlot\(\);/.test(src) &&
+    /const tDecodeStart = ebjNow\(\);\s*\n\s*const bitmap = await decodeImage\(got\.buf\)/.test(src) &&
+    /\} finally \{ ebjReleaseSlot\(\); \}/.test(src));
+  check('the pixel depth is readable, so a stall can be told from a slow fetch',
+    /get processDepth\(\) \{ return ebjProcessDepth\(\); \},/.test(src));
+  // The gate's own behaviour, sliced out of the shipped split: the declarations
+  // and the two functions are self-contained, and the interesting property is
+  // synchronous - a 17th page must not get a slot, and the slot a release frees
+  // must go straight to the waiter rather than raising the ceiling.
+  try {
+    const from = src.indexOf('let ebjSlotsBusy = 0;');
+    const to = src.indexOf('function ebjMs(', from);
+    const gate = new Function(src.slice(from, to) +
+      'return { a: ebjAcquireSlot, r: ebjReleaseSlot, s: ebjSetSlotLimit, d: ebjProcessDepth };')();
+    gate.s(4);
+    for (let i = 0; i < 4; i++) gate.a();
+    const full = gate.d();
+    gate.a();
+    const over = gate.d();
+    gate.r();
+    const after = gate.d();
+    gate.r(); gate.r(); gate.r(); gate.r();
+    const drained = gate.d();
+    check('the gate admits exactly its limit and queues the rest',
+      full.busy === 4 && full.queued === 0 && over.busy === 4 && over.queued === 1,
+      'limit=' + over.limit + ' busy=' + over.busy + ' queued=' + over.queued);
+    check('a released slot goes to the waiter instead of raising the ceiling',
+      after.busy === 4 && after.queued === 0 && drained.busy === 0,
+      'after=' + JSON.stringify(after) + ' drained=' + JSON.stringify(drained));
+  } catch (e) {
+    check('the gate admits exactly its limit and queues the rest', false, String(e && e.message));
+  }
+  // The panel polls discovery on its own schedule, so a run that sizes its
+  // fan-out before asking can compute "concurrency 20 on 12 sockets" against a
+  // lane table that has no ports in it yet - and then never use the ports,
+  // however many appear a moment later. Ask first.
+  check('the ports are discovered before the fan-out is sized',
+    /const discovery = \(typeof probeFetchProxy/.test(src) &&
+    src.indexOf('try { await discovery; }') !== -1 &&
+    src.indexOf('try { await discovery; }') < src.indexOf('const budget = (typeof fetchSocketBudget'),
+    'discovery@' + src.indexOf('try { await discovery; }') +
+    ' budget@' + src.indexOf('const budget = (typeof fetchSocketBudget'));
+  // Prep is the phase that feels slow while the download itself gets faster, so
+  // it has to be named per step rather than guessed at. It is also overlapping
+  // work: the probe is started before the resolve and awaited after it, so a slow
+  // probe costs its own latency only where the resolve did not already cover it.
+  check('discovery is started before the resolve and awaited after it',
+    /const discovery = \(typeof probeFetchProxy/.test(src) &&
+    src.indexOf('const discovery = (typeof probeFetchProxy') < src.indexOf('ebjResolvePages(location.href)') &&
+    src.indexOf('try { await discovery; } catch (e) {}') > src.indexOf('prep.resolveMs = ebjNow()'),
+    'probe overlaps the resolve');
+  // Discovery must be asked for exactly once. A second, serial `await
+  // probeFetchProxy()` next to the overlapped one ran the probe twice and put
+  // the whole thing back on the critical path, where probeMs could not see it.
+  const preludeFrom = src.indexOf('const discovery = (typeof probeFetchProxy');
+  const preludeTo = src.indexOf('const budget = (typeof fetchSocketBudget');
+  check('discovery is probed once, not twice',
+    preludeFrom !== -1 && preludeTo > preludeFrom &&
+    src.slice(preludeFrom, preludeTo).indexOf('await probeFetchProxy();') === -1,
+    'no second serial probe inside the ebookjapan prelude');
+  check('the prep phase reports its own breakdown',
+    /ebjLog\('run', 'prep ' \+ ebjMs\(prep.totalMs\)/.test(src) &&
+    /resolve ' \+ ebjMs\(prep.resolveMs\)/.test(src) &&
+    /\+ probe ' \+ ebjMs\(probeMs\)/.test(src),
+    'resolve and probe times are logged separately');
+  // "249 workers, one page a second" is ambiguous between a serialised transport
+  // and a throttled decode gate. Fetch-total over wall-clock separates them, and
+  // the gate's high-water mark says whether the gate was ever the limit.
+  check('the timing line says how many pages were genuinely in flight',
+    /in flight/.test(src) && /t\.fetch\.total \/ t\.phaseMs/.test(src),
+    'effective parallelism is reported');
+  check('the decode gate reports its high-water mark',
+    /ebjSlotsPeak/.test(src) && /gate peak /.test(src),
+    'a throttled gate is distinguishable from a slow transport');
+  check('the resolve loop says when it is waiting, instead of retrying in silence',
+    /the viewer has not reported the volume yet — retry '/.test(src),
+    'a slow viewer no longer looks like a hung run');
+  // The first page is the only one anyone is waiting for. Launching every worker
+  // at once put it in the same queue as the other 248, which is why the script
+  // looked dead for seconds after the prep line. The fan-out ramps on it.
+  check('the fan-out ramps: a small first wave, then widen on the first paint',
+    /const firstWave = Math\.max\(1, Math\.min\(concurrency, 12\);?/.test(src) &&
+    /await firstPainted;/.test(src) &&
+    src.indexOf('await firstPainted;') < src.indexOf('for (let w = firstWave; w < concurrency; w++)'),
+    'first wave gates the widening');
+  check('the first paint releases the ramp and reports its own latency',
+    /releaseFirstPaint\(\);/.test(src) && /prep\.firstPageMs = ebjNow\(\) - prep\.start;/.test(src),
+    'first-paint latency is measured');
+  // Prep ends before the first page exists, which is why the prep number and the
+  // perceived wait disagreed. The gate now says when the page actually arrived.
+  check('the prep line is followed by the time the first page actually arrived',
+    /after the run started/.test(src),
+    'the number matches what the user waits for');
   check('the run announces itself before it does anything', /ebjLog\('run', 'entered:/.test(src));
 
   // These must be declarations in the run's own scope: the finally that

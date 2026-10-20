@@ -1,6 +1,3 @@
-    // =====================================================================
-    // 5. Auth helpers
-    // =====================================================================
     function isPublicBootstrapPage() {
         try { return !!(window.__BWDD_CLI__ && window.__BWDD_CLI__.publicBootstrap); } catch (_) { return false; }
     }

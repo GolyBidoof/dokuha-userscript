@@ -1,17 +1,14 @@
-    // =====================================================================
-    // 10. "all-in-one downloader" pointer (single-store builds only)
-    // =====================================================================
     // Whoever runs this build already chose one store and is the person most
-    // likely to want the other two, so a single-store artifact puts a small
-    // link in the panel header; the combined build, "Omnimanga Native
-    // Downloader", omits this module entirely (it would point at itself). The
+    // likely to want the other stores, so a single-store artifact puts a small
+    // link in the panel header; the combined build, "dokuha-userscript",
+    // omits this module entirely (it would point at itself). The
     // artifact file name also lives in src/targets.json ("both"), and
     // tests/test_artifacts.js fails if the two ever disagree, so renaming the
     // combined script cannot silently break this.
-    const BWDD_UNIFIED_OUT = 'omnimanga-native-downloader.user.js';
+    const BWDD_UNIFIED_OUT = 'dokuha-userscript.user.js';
     // The GreasyFork install page rather than the release asset: it shows the
     // version and the install button, and it is where the script is reviewed.
-    const BWDD_UNIFIED_URL = 'https://greasyfork.org/en/scripts/597313-omnimanga-native-downloader';
+    const BWDD_UNIFIED_URL = 'https://greasyfork.org/en/scripts/597313-dokuha-userscript';
 
     // Styling travels with the feature: a build without this module ships none.
     const UNIFIED_CSS = `
@@ -37,7 +34,6 @@
         } catch (e) {}
     }
 
-    // Returns the header link, or null when there is nothing to point at.
     function unifiedDownloaderLink() {
         mountUnifiedStyles();
         // 115px at 10px, which is the most the header row can take before the
@@ -47,7 +43,7 @@
         a.target = '_blank';
         a.rel = 'noopener noreferrer';
         const tip = 'This build handles one store. One all-in-one downloader covers BookWalker, '
-            + 'CMOA and ebookjapan in a single script (' + BWDD_UNIFIED_OUT + ') - get it here: '
+            + 'ebookjapan, CMOA, Kindle and k-manga in a single script (' + BWDD_UNIFIED_OUT + ') - get it here: '
             + BWDD_UNIFIED_URL;
         a.title = tip;
         a.setAttribute('aria-label', tip);

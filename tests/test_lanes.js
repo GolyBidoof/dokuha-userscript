@@ -1,5 +1,5 @@
 // test_lanes.js — focused harness for the transport-lane changes in
-// omnimanga-native-downloader.user.js.
+// dokuha-userscript.user.js.
 //
 // Two local HTTP servers stand in for the two "socket pools":
 //   * cdnPort  — hit by the page lane (plain fetch())
@@ -21,13 +21,12 @@ const path = require('path');
 const fs = require('fs');
 
 const CHROME = process.env.PUPPETEER_EXECUTABLE_PATH || undefined;
-const US = path.resolve(__dirname, '..', process.env.BWDD_US || 'omnimanga-native-downloader.user.js');
+const US = path.resolve(__dirname, '..', process.env.BWDD_US || 'dokuha-userscript.user.js');
 
 const PNG = Buffer.from(
   'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
   'base64');
 
-// ---------------------------------------------------------------- servers
 const state = { cdnHits: [], gmHits: [], mode: 'ok', seen: new Set() };
 
 function makeServer(tag) {
@@ -121,7 +120,6 @@ const listen = (s) => new Promise(r => s.listen(0, '127.0.0.1', () => r(s.addres
     console.log((pass ? 'PASS  ' : 'FAIL  ') + name + (detail ? '  — ' + detail : ''));
   };
 
-  // --- set up fake auth/base -------------------------------------------
   const setup = async () => page.evaluate((cdn) => {
     const s = window.__bwdd.state;
     s.baseUrl = cdn + '/';
@@ -131,7 +129,6 @@ const listen = (s) => new Promise(r => s.listen(0, '127.0.0.1', () => r(s.addres
     window.__bwdd.laneStats.gm = { inflight: 0, done: 0, bytes: 0, ms: 0, errors: 0 };
   }, CDN);
 
-  // 1 + 2: both lanes are used, roughly evenly
   await setup();
   state.cdnHits.length = 0; state.gmHits.length = 0; state.mode = 'ok';
   const served = await page.evaluate(async () => {
@@ -167,7 +164,6 @@ const listen = (s) => new Promise(r => s.listen(0, '127.0.0.1', () => r(s.addres
     summary.page.pagesPerSec === undefined,
     JSON.stringify(summary));
 
-  // 3: a broken GM lane must not fail any page, and must retire itself
   await setup();
   state.cdnHits.length = 0; state.gmHits.length = 0;
   await page.evaluate(() => { window.__gmBroken = true; });
@@ -190,7 +186,6 @@ const listen = (s) => new Promise(r => s.listen(0, '127.0.0.1', () => r(s.addres
     'gmUsable=' + brokenRes.gmUsable);
   await page.evaluate(() => { window.__gmBroken = false; });
 
-  // 4: 403 recovery, and no breaker trip
   await setup();
   state.cdnHits.length = 0; state.gmHits.length = 0; state.seen.clear(); state.mode = '403once';
   const t403 = await page.evaluate(async () => {
@@ -211,12 +206,10 @@ const listen = (s) => new Promise(r => s.listen(0, '127.0.0.1', () => r(s.addres
   check('403 recovery does not trip the 8s global breaker',
     t403.ms < 4000, Math.round(t403.ms) + 'ms for 10 pages (breaker would add 8s)');
 
-  // 5: the 403 retry carries a cache-buster
   const busted = state.cdnHits.filter(p => p.startsWith('c'));
   check('403 retries carry a cache-busting param',
     busted.length >= 20, busted.length + ' cdn hits for 10 pages (expect 2 each)');
 
-  // 6: inflight de-dupe — two concurrent requests for one URL fetch it once
   await setup();
   state.cdnHits.length = 0; state.gmHits.length = 0; state.mode = 'ok';
   const dedupe = await page.evaluate(async () => {

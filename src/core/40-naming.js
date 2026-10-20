@@ -1,6 +1,3 @@
-    // =====================================================================
-    // 11. Naming, messages and ZIP base name
-    // =====================================================================
     function cleanTitle(t) {
         if (!t) return '';
         let s = String(t).replace(/^【[^】]*】\s*/g, '').trim();
@@ -45,7 +42,7 @@
         // Strip trailing ASCII dots/spaces (Windows drops them on create).
         s = s.replace(/[. ]+$/, '').trim();
         if (!s || s === '.' || s === '..') return '';
-        if (BWDD_RESERVED_DEVICE.test(s)) s = '_' + s;   // CON → _CON
+        if (BWDD_RESERVED_DEVICE.test(s)) s = '_' + s;
         const cps = Array.from(s);
         if (cps.length > 190) s = cps.slice(0, 190).join('').replace(/[. ]+$/, '');
         return s;
@@ -59,7 +56,7 @@
     function archiveDefaultName(rawTitle) {
         let s = String(rawTitle || '').trim();
         s = s.replace(/【[^】]*】/g, ' ');       // drop 【…】 groups, keep word separation
-        s = s.replace(/[ \t　]+/g, ' ').trim();  // tidy the whitespace the removal leaves behind
+        s = s.replace(/[ \t　]+/g, ' ').trim();
         return fsSafePath(s);
     }
     // ZIPs are flat: every page sits at the archive root as page-NNNN.jpg, which
@@ -91,13 +88,21 @@
     }
     function msgStoredLocal(p) { return 'Stored locally to: ' + p; }
     function msgUploadedTo(label, p) { return 'Uploaded to ' + label + ' → ' + p; }
+    // A terminal `done` frame can carry status=partial_upload: the volume files
+    // reached the destination but the series index did not. Surface it as an
+    // issue; reporting a clean success would hide a destination the reader
+    // cannot list.
+    function msgPartialUpload(result) {
+        const detail = result && typeof result.message === 'string' ? result.message.trim() : '';
+        return 'The volume files reached the destination, but the bridge could not finish the upload' +
+            (detail ? ': ' + detail : '.');
+    }
 
     // Best filesystem/destination path the bridge reported for a finished
     // volume (output_dir for local forks, staging/remote_path otherwise).
     function storedPathOf(result) {
         return (result && (result.output_dir || result.staging || result.remote_path)) || null;
     }
-    // Short user-facing label for an upload-method id ('mega' → 'MEGA'…).
     function methodShortLabel(method) {
         const t = { mega: 'MEGA', drive: 'Google Drive', onedrive: 'OneDrive', webdav: 'WebDAV', local: 'Local' };
         return (t && t[method]) || method || '';
@@ -116,10 +121,6 @@
         }
         return '';
     }
-    // Best openable per-file target for a finished OCR run: the http(s) links the
-    // bridge attached (uploadUrls / uploads[].url), else a rebuilt direct WebDAV
-    // URL (base + remote_path/<volume>.cbz). .cbz is preferred over .mokuro /
-    // .webp. Returns {file, url} or null.
     function storedOpenTarget(result) {
         if (!result) return null;
         const cands = [];

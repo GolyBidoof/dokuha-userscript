@@ -1,5 +1,35 @@
 # Changelog
 
+## v3.0.0
+
+**The combined script is now dokuha-userscript, and series downloads live in dokuha-cli.** The combined artifact is `dokuha-userscript.user.js` (`@name dokuha-userscript`), its home is github.com/GolyBidoof/dokuha-userscript, and the panel header carries a small `dokuha-userscript` mark linking there. The per-store artifacts keep their names and banners because they already have users. GreasyFork entry 597313 still serves the earlier Omnimanga Native Downloader 2.0.0 (BookWalker, CMOA, ebookjapan) until this release is published and the listing is repointed; `docs/greasyfork/dokuha-userscript.html` is the paste-ready description for that update.
+
+### Added
+- **k-manga is the fifth store.** `sites/kmanga` downloads the volume open in the k-manga viewer over the viewer's own WebSocket: it opens the session through the launcher's redirect, pipelines BCP000 data requests, matches every reply by its scene number, and unscrambles each page on a canvas. Title and volume come from the viewer or launcher URL and the page's own structured data, so no REST scrape is involved.
+- **k-manga joins the "also available on" card**, which now asks five shops. Its title page states each volume's amount in points rather than yen, so that pill reads `718pt` where the others read `¥810`. A free volume keeps its regular point price on the row, so free is read from its 無料で読む button and never from the amount, and the page paginates its ten-row volume list, so page two is followed before the series size and the free count are believed.
+- The card's grid grows a six-column variant for the five-pill case: two wide cells over three narrow ones, so five shops still occupy exactly two rows and no store name is ellipsized away.
+- **The "also available on" card appears as soon as one shop answers.** The first shop to confirm the book is painted at once, with a placeholder pill for every shop whose search is still in flight; each placeholder is replaced as its answer lands, and a shop that turns out not to carry the book simply loses it. The card is never painted from placeholders alone, so it claims nothing before a shop has actually answered.
+
+### Changed
+- **Every script loads only on reader pages now.** The `@match` lists name the viewers and nothing else: BookWalker's `viewer`, `viewer-trial`, `viewer-ptrial` and `viewer-subscription` hosts, CMOA's `/bib/speedreader/` and `/reader/`, ebookjapan's `/viewer/`, Kindle's `/manga/` and k-manga's `/viewer/`. Series, title, product and search pages are no longer matched, so the panel, the bridge probe, the traffic capture and the debug globals no longer run on the way to a book, and a copy injected on a storefront page finds no adapter and does nothing. The adapter contract follows: `matches()` is reader-only, `ownsHost()` names the store host so a storefront page cannot fall through to another store, and the optional `headlessMatches()` is the explicit claim for the headless product-page path. Headless CLI injection is the one deliberate non-reader path: the CLI opens a BookWalker `/de<uuid>/` or ebookjapan `/books/<id>/<code>/` product page and injects the script itself with `window.__BWDD_HEADLESS__`, which keeps the viewer-free licence exchange working, while a normal page load on those URLs does nothing.
+- **CMOA volumes no longer need a live viewer to be descrambled.** The BinB scramble protocol, its four tables and the tiled permutation are read offline, and the page list can come from the `ttx` document instead of the reader, so a free volume downloads with no SpeedBinb and no `#content`.
+- **The BookWalker viewer-free licence now belongs to the volume store page itself.** With the series queue gone, a `/de<uuid>/` page is the only caller: the licence exchange reads the loader nonce, walks the three reader-host calls in one session, and hands the ordinary pipeline its auth, base URL and cti.
+
+### Fixed
+- **The mokuro-bridge hand-off now matches bridge 0.9.** A page the bridge already holds is no longer reported as a failure. Re-sending identical bytes comes back as a `200` with `already_present`, and a `409` reading `already has completed OCR` or `already queued or present` is a cache hit; a `409` for a page still being OCR'd or ingested is retried with backoff, and only a real conflict such as a filename stem collision fails the page. Health and capability discovery already read `fetchProxyPorts`, `fetchUpstreams` and `fetchPathUpstream` from `/health`, so the extra browser lanes still light up with the bridge running and downloading still works without it.
+- **The finalize request carries what bridge 0.9 accepts.** It sends the `overwrite` policy when an automation caller asks for one (a panel run keeps the bridge's safe `fail` default), still supports the legacy `upload_to_mega` flag when there is no method to name, and reports a rejected finalize (unknown upload account, session already finalizing) with the bridge's own `detail`. It is never retried against another destination, which used to be able to turn a bad alias into an upload to MEGA.
+- **The finalize NDJSON stream is read as bridge 0.9 emits it:** `wait_ocr`, `assemble`, `pack`, `upload`, `upload_progress`, `series_json`, `cleanup`, then a terminal `done` or `error`. A `done` whose status is `partial_upload` (the volume files arrived, the series index did not) is surfaced as an incomplete run instead of a clean success, and a stream that ends without `done` is treated as a truncated upload.
+- `tests/test_mokuro_client.js` pins the whole protocol against a stand-in bridge as part of `npm test`, so the next `mokuro-bridge` change that moves a field fails in CI rather than in a live run.
+
+### Removed
+- **The series/batch subsystem is deleted, not hidden.** dokuha-cli owns series downloads now, so the userscript keeps only the single-volume runner paths. Removed: the hidden-frame queue and its worker, every store's catalogue, the `batch` hook on every adapter, the batch mount in the panel, the `window.__bwddBatchVolumeUrl` marker that fed the queue, and the batch and series tests.
+- **The `panelAllowed()` adapter hook is gone.** A normal page either matches a reader and gets the panel, or matches nothing and does nothing; there is no longer a matched page that installs its hooks and then withholds the UI. `bootSharedPanel` no longer consults the hook, and no adapter defines it.
+- Kept, unchanged: all five stores' single-volume runners, the cross-store "also available on" pills, the combined-build pointer in the single-store builds, OCR and mokuro, ZIP, naming, the page cache and the headless automation API.
+
+### Tests
+- `tests/test_site_dispatch.js` and `tests/test_split_builds.js` pin the reader-only gate: every target's `@match` list is checked against a reader allowlist, a normal load on each storefront URL selects no adapter and leaves no panel, no `window.__bwdd` debug surface and no wrapped `fetch`, the readers still boot their panels, hosts no store owns still fall back to BookWalker, and headless injection on a product page still selects BookWalker or ebookjapan. `tests/test_ui_panel.js` drops its old "matched but paints no panel" cases along with the hook they tested.
+- `tests/test_availability.js` covers the k-manga adapter (its GET search path, the point price, the free-volume button and the paginated free count) and pins the five-pill grid to exactly two rows with every store name readable.
+
 ## v2.0.0
 
 **One script for three stores.** The combined build now handles BookWalker, CMOA
@@ -317,7 +347,7 @@ are reading, and links to their store pages rather than their viewers.
 The version now has one source, and there is a script that releases it.
 
 ### Added
-- `node bump.mjs <patch|minor|major|x.y.z>` (also `npm run bump`) bumps the
+- `node tools/bump.mjs <patch|minor|major|x.y.z>` (also `npm run bump`) bumps the
   version and regenerates every target; `--dry-run` prints the plan without
   writing. It keeps the README title and `package.json` in step, and leaves
   CHANGELOG.md alone - its `## vX.Y.Z` headings are history, and stubbing them

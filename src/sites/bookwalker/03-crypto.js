@@ -1,8 +1,4 @@
 
-    // =====================================================================
-    // 2. Crypto: decrypt configuration_pack.json
-    // =====================================================================
-    //
     // The viewer's configuration_pack.json is a custom envelope:
     //   { "version":"1.0", "data":"<custom-base64 payload>" }
     // Decoding is a fixed pipeline: custom base64 (A8j) -> a byte-keyed
@@ -10,18 +6,14 @@
     // -> UTF-8 JSON of the page manifest. The first 128 chars of the payload
     // are three 32-byte keys (key1/key2/key3) later used to derive per-page
     // descramble seeds (section 3) and image filename tokens (section 4).
-    //
     // NOTE: identifiers like A8j, A3b, B0p, v4..v9 are the original names
     // from the minified viewer, preserved verbatim because this port is
     // validated byte-for-byte against live HAR data and the bookworm
     // offline client. Renaming them would risk silent drift; the
     // pipeline below is annotated instead.
-    // =====================================================================
 
-    // Used by the key-schedule shuffles below.
     function arraySwap(arr, a, b) { const t = arr[a]; arr[a] = arr[b]; arr[b] = t; }
 
-    // --- Custom base64 lookup tables (4 chars -> 3 bytes) ---
     // BookWalker's base64 alphabet is the standard A-Z a-z 0-9 + / set, but
     // the decode uses shifted bit masks per byte position (v5..v9).
     const ARR1 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'.split('');

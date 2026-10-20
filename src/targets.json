@@ -1,136 +1,214 @@
 {
-  "both": {
-    "out": "omnimanga-native-downloader.user.js",
-    "modules": [
-      "_meta",
-      "core",
-      "feature/availability",
-      "sites/bookwalker",
-      "sites/cmoa",
-      "sites/ebookjapan",
-      "entry"
-    ],
-    "name": "Omnimanga Native Downloader",
-    "description": "Saves a book from the BookWalker viewer, the CMOA speed reader or the ebookjapan reader as a ZIP or CBZ of full-resolution page images, fetched from the CDN and unscrambled offline. Optional Japanese OCR through mokuro-bridge, with upload to MEGA, Google Drive or OneDrive.",
-    "icon": "https://www.google.com/s2/favicons?sz=64&domain=bookwalker.jp",
-    "matches": [
-      "https://viewer.bookwalker.jp/*",
-      "https://viewer-trial.bookwalker.jp/*",
-      "https://viewer-ptrial.bookwalker.jp/*",
-      "https://viewer-subscription.bookwalker.jp/*",
-      "https://www.cmoa.jp/bib/speedreader/*",
-      "https://ebookjapan.yahoo.co.jp/viewer/*"
-    ],
-    "connects": [
-      "learnnatively.com",
-      "manga-kotoba.com",
-      "ebookjapan.yahoo.co.jp",
-      "bookwalker.jp",
-      "bw-bv-epubs.bookwalker.jp",
-      "*.bookwalker.jp",
-      "www.cmoa.jp",
-      "free-binb-cmoa.akamaized.net",
-      "binb-cmoa.akamaized.net",
-      "prod-contents-br-page.akamaized.net",
-      "127.0.0.1",
-      "localhost"
-    ],
-    "banner": [
-      "One script, three stores. The panel, its controls, the Mokuro bridge, the",
-      "reading-stat cards, the ZIP naming and the headless automation API are shared",
-      "verbatim; only the store-specific protocol lives in its own module under",
-      "src/sites/. BookWalker is the default for any page no adapter claims."
-    ]
-  },
-  "bookwalker": {
-    "out": "bookwalker-only.user.js",
-    "modules": [
-      "_meta",
-      "core",
-      "feature/unified-link",
-      "sites/bookwalker",
-      "entry"
-    ],
-    "name": "BookWalker Native Downloader",
-    "description": "Saves a book from the BookWalker viewer as a ZIP or CBZ of full-resolution page images, fetched from the CDN and unscrambled offline. Optional Japanese OCR through mokuro-bridge, with upload to MEGA, Google Drive or OneDrive.",
-    "icon": "https://www.google.com/s2/favicons?sz=64&domain=bookwalker.jp",
-    "matches": [
-      "https://viewer.bookwalker.jp/*",
-      "https://viewer-trial.bookwalker.jp/*",
-      "https://viewer-ptrial.bookwalker.jp/*",
-      "https://viewer-subscription.bookwalker.jp/*"
-    ],
-    "connects": [
-      "learnnatively.com",
-      "manga-kotoba.com",
-      "bookwalker.jp",
-      "bw-bv-epubs.bookwalker.jp",
-      "*.bookwalker.jp"
-    ],
-    "banner": [
-      "BookWalker only, built from the same shared core as the CMOA script. It",
-      "matches nothing outside bookwalker.jp and does not carry a single line of",
-      "CMOA code. Install this OR the combined script, never both: they match the",
-      "same hosts and you would get two panels."
-    ]
-  },
-  "cmoa": {
-    "out": "cmoa-only.user.js",
-    "modules": [
-      "_meta",
-      "core",
-      "feature/unified-link",
-      "sites/cmoa",
-      "entry"
-    ],
-    "name": "CMOA Native Downloader",
-    "description": "Saves a book from the CMOA speed reader as a ZIP or CBZ of full-resolution page images, fetched from the CDN and unscrambled offline. Optional Japanese OCR through mokuro-bridge, with upload to MEGA, Google Drive or OneDrive.",
-    "icon": "https://www.google.com/s2/favicons?sz=64&domain=cmoa.jp",
-    "matches": [
-      "https://www.cmoa.jp/bib/speedreader/*"
-    ],
-    "connects": [
-      "learnnatively.com",
-      "manga-kotoba.com",
-      "www.cmoa.jp",
-      "free-binb-cmoa.akamaized.net",
-      "binb-cmoa.akamaized.net"
-    ],
-    "banner": [
-      "CMOA only, built from the same shared core as the BookWalker script. It",
-      "matches nothing outside the CMOA speed reader and does not carry a single",
-      "line of BookWalker code. Install this OR the combined script, never both:",
-      "they match the same hosts and you would get two panels."
-    ]
-  },
-  "ebookjapan": {
-    "out": "ebookjapan-only.user.js",
-    "modules": [
-      "_meta",
-      "core",
-      "feature/unified-link",
-      "sites/ebookjapan",
-      "entry"
-    ],
-    "name": "ebookjapan Native Downloader",
-    "description": "Saves a book from the ebookjapan viewer as a ZIP or CBZ of full-resolution page images, fetched from the CDN and unscrambled in the browser. Optional Japanese OCR through mokuro-bridge, with upload to MEGA, Google Drive or OneDrive.",
-    "icon": "https://www.google.com/s2/favicons?sz=64&domain=ebookjapan.yahoo.co.jp",
-    "matches": [
-      "https://ebookjapan.yahoo.co.jp/viewer/*"
-    ],
-    "connects": [
-      "ebookjapan.yahoo.co.jp",
-      "prod-contents-br-page.akamaized.net",
-      "learnnatively.com",
-      "manga-kotoba.com",
-      "127.0.0.1",
-      "localhost"
-    ],
-    "banner": [
-      "One script, one store. The panel, its controls, the Mokuro bridge, the reading-stat",
-      "cards, the ZIP naming and the headless automation API are the shared core; the",
-      "ebookjapan protocol — its pinned wasm core, the canvas realm ladder and the page",
-      "descrambler — lives in src/sites/ebookjapan/."
-    ]
-  }
+ "both": {
+  "out": "dokuha-userscript.user.js",
+  "modules": [
+   "_meta",
+   "core",
+   "feature/availability",
+   "sites/bookwalker",
+   "sites/cmoa",
+   "sites/ebookjapan",
+   "sites/kindle",
+   "sites/kmanga",
+   "entry"
+  ],
+  "name": "dokuha-userscript",
+  "description": "Saves a book from the BookWalker viewer, the CMOA speed reader, the ebookjapan reader, the Kindle web manga reader or the k-manga viewer as a ZIP or CBZ of full-resolution page images, fetched from the store and unscrambled offline. Optional Japanese OCR through mokuro-bridge, with upload to MEGA, Google Drive or OneDrive.",
+  "icon": "https://www.google.com/s2/favicons?sz=64&domain=bookwalker.jp",
+  "matches": [
+   "https://viewer.bookwalker.jp/*",
+   "https://viewer-trial.bookwalker.jp/*",
+   "https://viewer-ptrial.bookwalker.jp/*",
+   "https://viewer-subscription.bookwalker.jp/*",
+   "https://www.cmoa.jp/bib/speedreader/*",
+   "https://www.cmoa.jp/reader/*",
+   "https://ebookjapan.yahoo.co.jp/viewer/*",
+   "https://read.amazon.co.jp/manga/*",
+   "https://comic.k-manga.jp/viewer/*"
+  ],
+  "connects": [
+   "learnnatively.com",
+   "manga-kotoba.com",
+   "ebookjapan.yahoo.co.jp",
+   "bookwalker.jp",
+   "bw-bv-epubs.bookwalker.jp",
+   "*.bookwalker.jp",
+   "www.cmoa.jp",
+   "free-binb-cmoa.akamaized.net",
+   "binb-cmoa.akamaized.net",
+   "prod-contents-br-page.akamaized.net",
+   "read.amazon.co.jp",
+   "www.amazon.co.jp",
+   "*.cloudfront.net",
+   "comic.k-manga.jp",
+   "bv.k-manga.jp",
+   "ws.viewer.k-manga.jp",
+   "127.0.0.1",
+   "localhost"
+  ],
+  "banner": [
+   "One script, five stores. The panel, its controls, the Mokuro bridge, the",
+   "reading-stat cards, the ZIP naming and the headless automation API are shared",
+   "verbatim; only the store-specific protocol lives in its own module under",
+   "src/sites/. Only the readers are matched; BookWalker stays the fallback for a",
+   "host no store owns, such as a bare injected copy."
+  ]
+ },
+ "bookwalker": {
+  "out": "bookwalker-only.user.js",
+  "modules": [
+   "_meta",
+   "core",
+   "feature/unified-link",
+   "sites/bookwalker",
+   "entry"
+  ],
+  "name": "BookWalker Native Downloader",
+  "description": "Saves a book from the BookWalker viewer as a ZIP or CBZ of full-resolution page images, fetched from the CDN and unscrambled offline. Optional Japanese OCR through mokuro-bridge, with upload to MEGA, Google Drive or OneDrive.",
+  "icon": "https://www.google.com/s2/favicons?sz=64&domain=bookwalker.jp",
+  "matches": [
+   "https://viewer.bookwalker.jp/*",
+   "https://viewer-trial.bookwalker.jp/*",
+   "https://viewer-ptrial.bookwalker.jp/*",
+   "https://viewer-subscription.bookwalker.jp/*"
+  ],
+  "connects": [
+   "learnnatively.com",
+   "manga-kotoba.com",
+   "bookwalker.jp",
+   "bw-bv-epubs.bookwalker.jp",
+   "*.bookwalker.jp",
+   "127.0.0.1",
+   "localhost"
+  ],
+  "banner": [
+   "BookWalker only, built from the same shared core as the CMOA script. It",
+   "matches nothing outside bookwalker.jp and does not carry a single line of",
+   "CMOA code. Install this OR the combined script, never both: they match the",
+   "same hosts and you would get two panels."
+  ]
+ },
+ "cmoa": {
+  "out": "cmoa-only.user.js",
+  "modules": [
+   "_meta",
+   "core",
+   "feature/unified-link",
+   "sites/cmoa",
+   "entry"
+  ],
+  "name": "CMOA Native Downloader",
+  "description": "Saves a book from the CMOA speed reader as a ZIP or CBZ of full-resolution page images, fetched from the CDN and unscrambled offline. Optional Japanese OCR through mokuro-bridge, with upload to MEGA, Google Drive or OneDrive.",
+  "icon": "https://www.google.com/s2/favicons?sz=64&domain=cmoa.jp",
+  "matches": [
+   "https://www.cmoa.jp/bib/speedreader/*",
+   "https://www.cmoa.jp/reader/*"
+  ],
+  "connects": [
+   "learnnatively.com",
+   "manga-kotoba.com",
+   "www.cmoa.jp",
+   "free-binb-cmoa.akamaized.net",
+   "binb-cmoa.akamaized.net",
+   "127.0.0.1",
+   "localhost"
+  ],
+  "banner": [
+   "CMOA only, built from the same shared core as the BookWalker script. It",
+   "matches nothing outside the CMOA readers and does not carry a single line of",
+   "BookWalker code. Install this OR the combined script, never both: they match",
+   "the same hosts and you would get two panels."
+  ]
+ },
+ "ebookjapan": {
+  "out": "ebookjapan-only.user.js",
+  "modules": [
+   "_meta",
+   "core",
+   "feature/unified-link",
+   "sites/ebookjapan",
+   "entry"
+  ],
+  "name": "ebookjapan Native Downloader",
+  "description": "Saves a book from the ebookjapan viewer as a ZIP or CBZ of full-resolution page images, fetched from the CDN and unscrambled in the browser. Optional Japanese OCR through mokuro-bridge, with upload to MEGA, Google Drive or OneDrive.",
+  "icon": "https://www.google.com/s2/favicons?sz=64&domain=ebookjapan.yahoo.co.jp",
+  "matches": [
+   "https://ebookjapan.yahoo.co.jp/viewer/*"
+  ],
+  "connects": [
+   "ebookjapan.yahoo.co.jp",
+   "prod-contents-br-page.akamaized.net",
+   "learnnatively.com",
+   "manga-kotoba.com",
+   "127.0.0.1",
+   "localhost"
+  ],
+  "banner": [
+   "One script, one store. The panel, its controls, the Mokuro bridge, the reading-stat",
+   "cards, the ZIP naming and the headless automation API are the shared core; the",
+   "ebookjapan protocol — its pinned wasm core, the canvas realm ladder and the page",
+   "descrambler — lives in src/sites/ebookjapan/."
+  ]
+ },
+ "kindle": {
+  "out": "kindle-only.user.js",
+  "modules": [
+   "_meta",
+   "core",
+   "feature/unified-link",
+   "sites/kindle",
+   "entry"
+  ],
+  "name": "Kindle Native Downloader",
+  "description": "Saves a book from the Kindle web manga reader as a ZIP or CBZ of full-resolution page images, fetched from the signed CDN and decrypted in the browser. Optional Japanese OCR through mokuro-bridge, with upload to MEGA, Google Drive or OneDrive.",
+  "icon": "https://www.google.com/s2/favicons?sz=64&domain=read.amazon.co.jp",
+  "matches": [
+   "https://read.amazon.co.jp/manga/*"
+  ],
+  "connects": [
+   "read.amazon.co.jp",
+   "*.cloudfront.net",
+   "learnnatively.com",
+   "manga-kotoba.com",
+   "127.0.0.1",
+   "localhost"
+  ],
+  "banner": [
+   "One script, one store. The panel, its controls, the Mokuro bridge, the reading-stat",
+   "cards, the ZIP naming and the headless automation API are the shared core; the Kindle",
+   "protocol — the render-window walk, the ustar bundle reader and the page cipher —",
+   "lives in src/sites/kindle/."
+  ]
+ },
+ "kmanga": {
+  "out": "kmanga-only.user.js",
+  "modules": [
+   "_meta",
+   "core",
+   "feature/unified-link",
+   "sites/kmanga",
+   "entry"
+  ],
+  "name": "k-manga Native Downloader",
+  "description": "Saves a book from the k-manga viewer as a ZIP or CBZ of full-resolution page images, fetched over the viewer's own WebSocket and unscrambled in the browser. Optional Japanese OCR through mokuro-bridge, with upload to MEGA, Google Drive or OneDrive.",
+  "icon": "https://www.google.com/s2/favicons?sz=64&domain=k-manga.jp",
+  "matches": [
+   "https://comic.k-manga.jp/viewer/*"
+  ],
+  "connects": [
+   "comic.k-manga.jp",
+   "bv.k-manga.jp",
+   "ws.viewer.k-manga.jp",
+   "learnnatively.com",
+   "manga-kotoba.com",
+   "127.0.0.1",
+   "localhost"
+  ],
+  "banner": [
+   "One script, one store. The panel, its controls, the Mokuro bridge, the reading-stat",
+   "cards, the ZIP naming and the headless automation API are the shared core; the",
+   "k-manga protocol — the BCP000 viewer socket, the LCG block permutation and the",
+   "canvas descrambler — lives in src/sites/kmanga/."
+  ]
+ }
 }

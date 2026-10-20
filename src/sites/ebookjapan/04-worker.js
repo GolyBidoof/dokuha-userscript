@@ -1,6 +1,3 @@
-    // =====================================================================
-    // ebookjapan — off-thread descrambling, on the shared pool
-    // =====================================================================
     // The shuffle is a synchronous burst on whatever thread runs it, so a run of
     // pages starves the UI thread. A worker is a clean realm: its OffscreenCanvas
     // keeps convertToBlob and getImageData, and the glue's Window shim already

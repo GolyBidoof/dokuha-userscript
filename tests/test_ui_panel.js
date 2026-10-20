@@ -11,7 +11,7 @@ const fs = require('fs');
 const path = require('path');
 
 const CHROME = process.env.PUPPETEER_EXECUTABLE_PATH || undefined;
-const US = path.resolve(__dirname, '..', process.env.BWDD_US || 'omnimanga-native-downloader.user.js');
+const US = path.resolve(__dirname, '..', process.env.BWDD_US || 'dokuha-userscript.user.js');
 const UP = 63842, DEAD = 63899, NPORTS = 12;
 
 const ports = Array.from({ length: NPORTS }, (_, i) => UP + 1 + i);
@@ -47,7 +47,10 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
   const results = [];
   const check = (n, pass, d) => { results.push({ n, pass, d }); console.log((pass?'PASS  ':'FAIL  ')+n+'  — '+d); };
 
-  const browser = await puppeteer.launch({ executablePath: CHROME, headless: true, args: ['--no-sandbox','--ignore-certificate-errors'] });
+  const browser = await puppeteer.launch({ executablePath: CHROME, headless: true, args: ['--no-sandbox','--ignore-certificate-errors',
+    // Store hosts resolve to the local server so the reader gate can be proved
+    // against the real host names without a live session.
+    '--host-resolver-rules=MAP viewer.bookwalker.jp 127.0.0.1, MAP bookwalker.jp 127.0.0.1, MAP ebookjapan.yahoo.co.jp 127.0.0.1'] });
 
   async function loadPanel(bridgePort, fmt, quality) {
     const page = await browser.newPage();
@@ -66,7 +69,6 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
     return page;
   }
 
-  // ---------------- bridge ON -----------------
   let page = await loadPanel(UP);
   const on = await page.evaluate(() => {
     const root = document.querySelector('.bwdd-bridge-anchor .bwdd-caps-line');
@@ -156,7 +158,7 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
     return { clicks: window.__ghClickCount, href: link && link.href, target: link && link.target };
   });
   check('the header GitHub link is clickable and opens the repository target',
-    ghBox && ghState.clicks === 1 && ghState.href === 'https://github.com/GolyBidoof/bookwalker-ebookjapan-cmoa-native-downloader' && ghState.target === '_blank',
+    ghBox && ghState.clicks === 1 && ghState.href === 'https://github.com/GolyBidoof/dokuha-userscript' && ghState.target === '_blank',
     JSON.stringify(ghState));
 
   check('format picker exists with all four choices',
@@ -164,7 +166,6 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
   check('defaults to jpeg', on.fmtVal === 'jpeg' && on.codec.fmt === 'jpeg', `select=${on.fmtVal} codec=${on.codec.fmt}`);
   check('quality control is shown for a lossy format', on.qVisible === true, 'quality row visible');
 
-  // switching to lossless must take effect immediately + hide quality
   const lossless = await page.evaluate(() => {
     const before = window.__bwdd.imageCodec.fmt;
     const sel = document.querySelector('#bwdd-image-format');
@@ -200,7 +201,6 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
   check('quality control comes back for jpeg', q85.qBack === true, 'quality row visible again');
   await page.close();
 
-  // ---------------- bridge OFF -----------------
   page = await loadPanel(DEAD);
   const off = await page.evaluate(() => {
     const root = document.querySelector('.bwdd-bridge-anchor .bwdd-caps-line');
@@ -241,7 +241,6 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
     await page.evaluate(() => !!document.querySelector('#bwdd-image-format')), 'present');
   await page.close();
 
-  // ---------------- bridge comes up later -----------------
   page = await loadPanel(DEAD);
   const before = await page.evaluate(() => window.__bwddUI.capabilitySummary().ports);
   // swap the bridge onto the port the page is watching: restart on DEAD
@@ -254,7 +253,6 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
     before === 0 && after.ports === NPORTS, `ports ${before} -> ${after.ports}`);
   check('the indicator text updates too', /12 ports/.test(after.text), after.text.slice(0,120));
 
-  // and when it goes away again, the panel must stop promising those sockets
   await new Promise(r => bridge.close(r));
   await page.evaluate(() => new Promise(r => setTimeout(r, 11000)));
   const gone = await page.evaluate(() => ({
@@ -276,7 +274,6 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
   await page.close();
 
 
-  // ---------------- version reporting ----------------
   // BWDD_VERSION was pinned at a literal and went stale for four releases, so the
   // panel claimed an old version no matter what was installed. Pin it down.
   {
@@ -300,7 +297,6 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
     await vp.close();
   }
   {
-    // with no GM_info (as when injected) it must fall back to the file's @version
     const vp = await browser.newPage();
     await vp.evaluateOnNewDocument(() => { try { localStorage.clear(); } catch (e) {} });
     await vp.goto(APP);
@@ -310,6 +306,161 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
     check('with no GM_info the fallback matches @version in the file',
       shown.includes(fileVersion), `panel=${JSON.stringify(shown)} file=@version ${fileVersion}`);
     await vp.close();
+  }
+
+  // The reader gate: only a reader page selects an adapter and gets the panel.
+  // A storefront page now runs nothing at all - no adapter, no panel, no debug
+  // surface - instead of the old panelAllowed() behaviour, which kept the
+  // adapter installed behind a hidden panel. The unclaimed host this file
+  // otherwise uses is deliberately outside the gate, so every check above still
+  // runs against the fallback panel.
+  {
+    const patched = src.replace("'http://127.0.0.1:62642'", "'http://127.0.0.1:" + UP + "'");
+    async function probeHost(url) {
+      const p = await browser.newPage();
+      p.on('pageerror', e => console.log('[pageerror]', String(e).slice(0,180)));
+      await p.evaluateOnNewDocument(() => {
+        try { localStorage.clear(); } catch (e) {}
+        window.__origFetch = window.fetch;
+      });
+      await p.goto(url);
+      await p.addScriptTag({ content: patched });
+      await sleep(700);
+      const out = await p.evaluate(() => ({
+        site: window.__bwddSite && window.__bwddSite.id,
+        panel: !!document.querySelector('#bwdd-root'),
+        zip: !!document.querySelector('button.bwdd-btn.zip'),
+        debug: !!(window.__bwdd || window.__bwddSite || window.__bwddUI),
+        fetchWrapped: window.fetch !== window.__origFetch,
+      }));
+      await p.close();
+      return out;
+    }
+    const bwStore = await probeHost('https://bookwalker.jp:' + appPort + '/series/900002/list/?bwddDebug=1');
+    check('a BookWalker series page selects no adapter and paints no panel',
+      bwStore.site === undefined && bwStore.panel === false && bwStore.zip === false &&
+      bwStore.debug === false,
+      `site=${bwStore.site} panel=${bwStore.panel} zip=${bwStore.zip} debug=${bwStore.debug}`);
+    // The /de<uuid> detail page is the one the headless CLI is injected into. A
+    // normal page load there is not a reader either, so it must select nothing;
+    // the headless claim is covered by test_site_dispatch.js.
+    const bwDetail = await probeHost('https://bookwalker.jp:' + appPort + '/decf5c400b-42c7-4c7f-af26-7181721d9f5e/?bwddDebug=1');
+    check('a BookWalker /de<uuid> detail page selects no adapter and paints no panel',
+      bwDetail.site === undefined && bwDetail.panel === false && bwDetail.zip === false &&
+      bwDetail.debug === false,
+      `site=${bwDetail.site} panel=${bwDetail.panel} zip=${bwDetail.zip} debug=${bwDetail.debug}`);
+    const bwViewer = await probeHost('https://viewer.bookwalker.jp:' + appPort + '/deno/1/1/1/?cid=abc123&bwddDebug=1');
+    check('the BookWalker viewer still gets the panel',
+      bwViewer.site === 'bookwalker' && bwViewer.panel === true && bwViewer.zip === true,
+      `site=${bwViewer.site} panel=${bwViewer.panel} zip=${bwViewer.zip}`);
+    const ejBooks = await probeHost('https://ebookjapan.yahoo.co.jp:' + appPort + '/books/716241/A001624701/?bwddDebug=1');
+    check('an ebookjapan /books/ volume page selects no adapter and paints no panel',
+      ejBooks.site === undefined && ejBooks.panel === false && ejBooks.zip === false &&
+      ejBooks.debug === false,
+      `site=${ejBooks.site} panel=${ejBooks.panel} zip=${ejBooks.zip} debug=${ejBooks.debug}`);
+    const ejViewer = await probeHost('https://ebookjapan.yahoo.co.jp:' + appPort + '/viewer/free/A000000001/?bwddDebug=1');
+    check('the ebookjapan viewer still gets the panel',
+      ejViewer.site === 'ebookjapan' && ejViewer.panel === true && ejViewer.zip === true,
+      `site=${ejViewer.site} panel=${ejViewer.panel} zip=${ejViewer.zip}`);
+  }
+
+  // The panel's own form controls are self-sufficient: a store stylesheet aimed
+  // at generic input/select elements must not move them. The hostile sheet is
+  // proved live on a plain host input in the same page, so the comparison cannot
+  // pass by the sheet simply not matching anything.
+  {
+    const HOSTILE = `
+      html body input[type="text"], html body input:not([type]), html body select, html body textarea {
+        height: 54px;
+        min-height: 54px;
+        line-height: 3.2;
+        padding: 14px 18px;
+        margin: 9px 0;
+        box-sizing: content-box;
+        background: #fde68a;
+        color: #fde68a;
+        border: 4px dotted #dc2626;
+        border-radius: 0;
+        font-family: "Comic Sans MS", cursive;
+        font-size: 21px;
+        appearance: textfield;
+        -webkit-appearance: textfield;
+      }`;
+    const PROPS = ['height','minHeight','lineHeight','paddingTop','paddingBottom','paddingLeft','paddingRight',
+      'boxSizing','backgroundColor','color','borderTopWidth','borderTopStyle','borderTopColor',
+      'fontFamily','fontSize','fontStyle','fontWeight','appearance','width'];
+    async function controlStyles(hostile) {
+      const p = await browser.newPage();
+      p.on('pageerror', e => console.log('[pageerror]', String(e).slice(0,180)));
+      await p.evaluateOnNewDocument(() => { try { localStorage.clear(); } catch (e) {} });
+      await p.goto(APP);
+      if (hostile) {
+        await p.evaluate(() => {
+          const probe = document.createElement('input');
+          probe.type = 'text';
+          probe.id = 'hostile-probe';
+          document.body.appendChild(probe);
+        });
+        await p.addStyleTag({ content: hostile });
+      }
+      await p.addScriptTag({ content: src.replace("'http://127.0.0.1:62642'", "'http://127.0.0.1:" + UP + "'") });
+      await sleep(700);
+      const out = await p.evaluate((props) => {
+        const read = (sel) => {
+          const el = document.querySelector(sel);
+          if (!el) return null;
+          const cs = getComputedStyle(el);
+          const o = {};
+          for (const k of props) o[k] = cs[k];
+          return o;
+        };
+        // The palette is light or dark depending on the environment, so read
+        // the tokens the panel actually resolved instead of hard-coding either.
+        let tokens = null;
+        const root = document.querySelector('#bwdd-root');
+        if (root) {
+          const probe = document.createElement('span');
+          probe.style.cssText = 'position:absolute;background:var(--bwdd-bg);' +
+            'color:var(--bwdd-root-fg);border:1px solid var(--bwdd-border-strong)';
+          root.appendChild(probe);
+          const ps = getComputedStyle(probe);
+          tokens = { bg: ps.backgroundColor, fg: ps.color, border: ps.borderTopColor };
+          probe.remove();
+        }
+        return { name: read('#bwdd-archive-name'), fmt: read('#bwdd-image-format'),
+                 probe: read('#hostile-probe'), tokens };
+      }, PROPS);
+      await p.close();
+      return out;
+    }
+    const clean = await controlStyles(null);
+    const hostile = await controlStyles(HOSTILE);
+
+    check('the archive-name field has a real, bounded height',
+      !!clean.name && parseFloat(clean.name.height) > 20 && parseFloat(clean.name.height) < 34,
+      `height=${clean.name && clean.name.height}`);
+    check('the field is border-box, 12px, and wears the panel colours and border',
+      !!clean.name && !!clean.tokens && clean.name.boxSizing === 'border-box' &&
+        clean.name.fontSize === '12px' &&
+        clean.name.borderTopWidth === '1px' && clean.name.borderTopStyle === 'solid' &&
+        clean.name.backgroundColor === clean.tokens.bg && clean.name.color === clean.tokens.fg &&
+        clean.name.borderTopColor === clean.tokens.border,
+      JSON.stringify(clean.name));
+    check('a text input does not keep the platform appearance',
+      !!clean.name && clean.name.appearance === 'none', `appearance=${clean.name && clean.name.appearance}`);
+    check('the hostile stylesheet is live on a plain host input',
+      !!hostile.probe && hostile.probe.backgroundColor === 'rgb(253, 230, 138)' &&
+        parseFloat(hostile.probe.height) >= 54 && /Comic Sans/i.test(hostile.probe.fontFamily),
+      JSON.stringify(hostile.probe));
+    check('the hostile stylesheet cannot move the archive-name field',
+      JSON.stringify(clean.name) === JSON.stringify(hostile.name),
+      `clean=${JSON.stringify(clean.name)} hostile=${JSON.stringify(hostile.name)}`);
+    check('the same reset holds the panel selects and the other text input',
+      !!clean.fmt && !!hostile.fmt && !!clean.tokens &&
+        JSON.stringify(clean.fmt) === JSON.stringify(hostile.fmt) &&
+        clean.fmt.boxSizing === 'border-box' && clean.fmt.fontSize === '12px' &&
+        clean.fmt.backgroundColor === clean.tokens.bg,
+      `hostile=${JSON.stringify(hostile.fmt)}`);
   }
 
   await browser.close(); appSrv.close(); bridge.close();

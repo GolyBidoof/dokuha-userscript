@@ -1,6 +1,3 @@
-    // =====================================================================
-    // 8. Mokuro bridge client
-    // =====================================================================
     const MOKURO_BRIDGE_URL = (() => {
         const defaultUrl = 'http://127.0.0.1:62642';
         try {
@@ -16,7 +13,6 @@
         return defaultUrl;
     })();
     const MOKURO_BRIDGE_START_URL = 'bw-mokuro-bridge://start';
-    // Shown (via the run's catch-all) when the bridge cannot be reached.
     const MOKURO_BRIDGE_OFFLINE_MSG =
         'The Mokuro Bridge app is not running.\n\n' +
         'Get and start mokuro-bridge (github.com/GolyBidoof/mokuro-bridge) — its ' +
@@ -94,6 +90,32 @@
         }
         return await fetchWithTimeout(url, { method: 'POST', body: formData }, timeoutMs);
     }
+    // A rejected write answers with a JSON {"detail": ...} (or, on a validation
+    // error, {"detail": [{msg}]}) before any NDJSON stream exists. Reading it is
+    // what turns "closed stream without completing" into the bridge's own reason:
+    // an unknown upload account, a session already finalizing, a page conflict.
+    function bridgeHttpError(status, detail, action) {
+        const text = typeof detail === 'string' ? detail.trim() : '';
+        const err = new Error('Mokuro bridge ' + action + ' failed (HTTP ' + status + ')' +
+            (text ? ': ' + text : ''));
+        err.status = status;
+        err.detail = text;
+        return err;
+    }
+    async function bridgeErrorDetail(res) {
+        const text = await res.text().catch(() => '');
+        try {
+            const detail = (JSON.parse(text) || {}).detail;
+            if (typeof detail === 'string') return detail;
+            if (Array.isArray(detail)) {
+                return detail.map(d => (d && (d.msg || d.message)) || '').filter(Boolean).join('; ');
+            }
+        } catch (e) { /* not JSON: fall through to the raw body */ }
+        return String(text || '').trim().slice(0, 300);
+    }
+    async function bridgeError(res, action) {
+        return bridgeHttpError(res.status, await bridgeErrorDetail(res), action);
+    }
     async function bridgeHealth() {
         try {
             const r = await mokuroBridgeGet(MOKURO_BRIDGE_URL + '/health', 2000);
@@ -108,7 +130,6 @@
             return bridgeEverReachable && bridgeConsecFail < BRIDGE_FAIL_LIMIT;
         }
     }
-    // Cached /health payload (upload backends, output dir, version…).
     let bridgeInfo = null;
     async function refreshBridgeInfo() {
         try {
@@ -117,7 +138,6 @@
         } catch (e) {}
         return null;
     }
-    // --- Generic upload-method support (mokuro-bridge >= 0.3) ---
     // The bridge exposes GET /upload-methods listing every method plus the
     // default; we pick the first configured one (or 'local') and remember its
     // folder. Falls back to /health mega_configured on older bridges.
@@ -155,7 +175,6 @@
         if (info && info.mega_configured) return { method: 'mega', folder: info.mega_library_root || null, label: 'MEGA' };
         return { method: 'local', folder: info && info.output_dir || null, label: 'Local' };
     }
-    // Final decision for a run: the panel's pick wins, else the bridge default.
     async function resolveUploadChoice(ui) {
         const plan = await mokuroUploadPlan().catch(() => ({ method: null, folder: null, label: null }));
         let method = plan.method, folder = plan.folder;
@@ -187,7 +206,7 @@
         }
         const start = Date.now();
         while (Date.now() - start < timeoutMs) {
-            await new Promise(r => setTimeout(r, 600));
+            await backgroundDelay(600);
             if (await bridgeHealth()) return true;
         }
         return false;
@@ -205,9 +224,9 @@
                     if (!h.busy) return true;
                 }
             } catch (e) {}
-            await new Promise(res => setTimeout(res, 1000));
+            await backgroundDelay(1000);
         }
-        return false;   // still busy after the timeout, caller decides
+        return false;
     }
 
     function bridgeSessionPath(sessionId, suffix) {
@@ -219,19 +238,48 @@
         const fd = new FormData();
         fd.append('title', title || 'manga');
         const res = await mokuroBridgePost(MOKURO_BRIDGE_URL + '/session/start', 15000, fd);
-        const d = await res.json().catch(() => ({}));
-        if (!res.ok) throw new Error(d.detail || 'HTTP ' + res.status);
-        return d;
+        if (!res.ok) throw await bridgeError(res, 'session start');
+        return await res.json().catch(() => ({}));
     }
+    // Outcomes of one page push:
+    //   200 + already_present:true
+    //        the bridge already held these exact bytes (idempotent retry).
+    //   409 "already has completed OCR" / "already queued or present"
+    //        the page is already in the volume, from bytes that were captured
+    //        before a restart. The bridge docs call this a cache hit, not a
+    //        failure: the volume stays complete either way. Reported as
+    //        { cached: true } so the run does not count a spurious error.
+    //   409 "currently being OCR'd" / "being ingested"
+    //        transient: another request still owns the page. Retried with
+    //        backoff, and surfaced only if it never clears.
+    //   any other 4xx/5xx
+    //        a real conflict (e.g. a filename stem collision) or a bridge
+    //        problem, thrown with the bridge's own detail.
+    const PAGE_PUSH_RETRIES = 4;
     async function mokuroStreamPage(sessionId, blob, filename, pageNum) {
         const fd = new FormData();
         fd.append('page', blob, filename);
         fd.append('filename', filename);
         fd.append('page_num', String(pageNum));
-        const res = await mokuroBridgePost(bridgeSessionPath(sessionId, '/page'), 60000, fd);
-        const d = await res.json().catch(() => ({}));
-        if (!res.ok) throw new Error(d.detail || 'HTTP ' + res.status);
-        return d;
+        const url = bridgeSessionPath(sessionId, '/page');
+        for (let attempt = 0; ; attempt++) {
+            const res = await mokuroBridgePost(url, 60000, fd);
+            if (res.ok) {
+                const d = await res.json().catch(() => ({}));
+                if (d && d.already_present) d.cached = true;
+                return d;
+            }
+            const detail = await bridgeErrorDetail(res);
+            if (res.status === 409 && /already has completed OCR|already queued or present/i.test(detail)) {
+                return { ok: true, cached: true, already_present: true, detail: detail };
+            }
+            if (res.status === 409 && /currently being (OCR'd|ingested)/i.test(detail) &&
+                attempt < PAGE_PUSH_RETRIES) {
+                await backgroundDelay(250 * (attempt + 1));
+                continue;
+            }
+            throw bridgeHttpError(res.status, detail, 'page ' + pageNum + ' upload');
+        }
     }
     // Early cover upload: push the first page to the destination as
     // <title>.webp immediately, before OCR finishes, so the user sees upload
@@ -242,9 +290,8 @@
         if (opts.method) fd.append('upload_method', opts.method);
         if (opts.method === 'local' && opts.localDir) fd.append('local_dir', opts.localDir);
         const res = await mokuroBridgePost(bridgeSessionPath(sessionId, '/cover'), 120000, fd);
-        const d = await res.json().catch(() => ({}));
-        if (!res.ok) throw new Error((d && d.detail) || 'HTTP ' + res.status);
-        return d;
+        if (!res.ok) throw await bridgeError(res, 'cover upload');
+        return await res.json().catch(() => ({}));
     }
     async function mokuroStatus(sessionId) {
         try {
@@ -314,21 +361,32 @@
                 }
             }
             if (msg.stage === 'done') finalResult = msg;
-            if (msg.stage === 'error') throw new Error(msg.message || 'Mokuro bridge pipeline error');
+            if (msg.stage === 'error') {
+                // The bridge's error frames carry a machine-readable status
+                // (ocr_failed, ocr_cache_invalid, finalize_error, ...). Keep it on
+                // the Error so callers can tell an OCR failure from a transport one.
+                const err = new Error(msg.message || 'Mokuro bridge pipeline error');
+                err.status = msg.status || 'bridge_error';
+                throw err;
+            }
         }
         return {
             processLine,
-            // Terminal bookkeeping every caller has always relied on.
             finish() {
-                if (!finalResult) throw new Error('Mokuro bridge closed stream without completing.');
+                // A stream that ends without `done` is a truncated upload, never a
+                // success: the volume may be half-transferred.
+                if (!finalResult) throw new Error('Mokuro bridge ended the finalize stream without a terminal done frame.');
+                // A done frame with status=partial_upload means the volume files
+                // arrived but the series index did not. The result is kept (the
+                // files are usable), flagged so the caller can surface it instead
+                // of reporting a clean success.
+                if (finalResult.status === 'partial_upload') finalResult.partialUpload = true;
                 if (uploadUrls.length) finalResult.uploadUrls = uploadUrls;
                 if (storedUrl) finalResult.storedUrl = storedUrl;
                 return finalResult;
             },
         };
     }
-    // Reads the bridge's finalize NDJSON stream (page fetch; has res.body).
-    //   onStage(stage, msg)  , every frame
     //   onUpload(ev), live upload progress {file, percent, speed, currentBytes,
     //     totalBytes, method, remotePath}. The bridge streams one file at a time
     //     with that file's own bytes, so the caller must accumulate across
@@ -341,9 +399,11 @@
         let buffer = '';
         // Force-flush a partially-buffered line if nothing arrives for a while:
         // a slow upload's trailing NDJSON line (no newline yet) would otherwise
-        // sit in `buffer`, making the bar look stuck.
+        // sit in `buffer`, making the bar look stuck. Scheduled in a worker so
+        // the flush keeps its cadence in a background tab, where a main-thread
+        // timer is clamped to 1/s and then to ~1/min.
         let lastLineAt = Date.now();
-        const flushTimer = setInterval(() => {
+        const flushTimer = setBackgroundInterval(() => {
             if (!buffer.trim() || Date.now() - lastLineAt < 4000) return;
             const lines = buffer.split('\n');
             buffer = lines.pop() || '';
@@ -367,7 +427,7 @@
         } finally {
             // An error frame or a reader failure must not leave the flush
             // interval (or the stream reader) alive in a Puppeteer page.
-            clearInterval(flushTimer);
+            clearBackgroundInterval(flushTimer);
             try { if (reader.cancel) await reader.cancel(); } catch (e) {}
         }
     }
@@ -389,8 +449,8 @@
     // is known before it uploads; the k/N and size totals are kept after
     // completion rather than blanking the bar.
     function makeUploadBarUpdater(bar) {
-        const order = [];              // file names in first-seen (upload) order
-        const byName = new Map();      // name -> {cur, tot}
+        const order = [];
+        const byName = new Map();
         const rec = (name) => {
             let r = byName.get(name);
             if (!r) { r = { cur: 0, tot: 0 }; byName.set(name, r); order.push(name); }
@@ -446,7 +506,6 @@
         // True once any file has been registered (used to avoid clobbering
         // early-cover progress when the finalize phase reuses this feed).
         feed.hasAny = function hasAny() { return order.length > 0; };
-        // Summary accessors: keep the final k/N and total size readable.
         feed.summary = function summary() {
             let sumCur = 0, sumTot = 0, d = 0;
             for (const n of order) {
@@ -458,12 +517,16 @@
         };
         return feed;
     }
-    // Ask the bridge to finalize + store a volume.
-    //   opts.method   , upload_method id ('local' | 'mega' | 'drive' | 'onedrive' | 'webdav');
-    //                   null/omitted → let the bridge decide (env default).
-    //   opts.localDir , when method is 'local', write output to this folder.
-    //   opts.forceMega, legacy fallback: when the bridge rejects upload_method,
-    //                   retry once with upload_to_mega=true (old bridges).
+    //   opts.method     upload_method id (an account alias: local, mega-work,
+    //                   drive-other-email, ...); null lets the bridge use its
+    //                   sticky default.
+    //   opts.localDir   local_dir, only when the resolved method is local.
+    //   opts.overwrite  fail (bridge default) | skip | overwrite. Sent only when
+    //                   the caller asks for a policy; a first run keeps the
+    //                   bridge's safe "fail" so an existing destination file is
+    //                   reported, not silently replaced.
+    //   opts.forceMega  legacy: send upload_to_mega=true instead of upload_method
+    //                   (only when no method is known, i.e. very old bridges).
     // Protocol: github.com/GolyBidoof/mokuro-bridge.
     async function mokuroFinalize(sessionId, opts = {}, onStage, onUpload) {
         const method = opts.method || null;
@@ -475,16 +538,17 @@
             fd.append('upload_to_mega', 'true');
         }
         fd.append('delete_after_upload', 'true');
+        // Only the three policies bridge 0.9 documents are accepted, so a typo
+        // falls back to the safe default instead of reaching the provider layer.
+        const overwrite = typeof opts.overwrite === 'string' ? opts.overwrite.trim() : '';
+        if (/^(fail|skip|overwrite)$/.test(overwrite)) fd.append('overwrite', overwrite);
         const url = bridgeSessionPath(sessionId, '/finalize');
-        let res = await mokuroBridgePost(url, 3600000, fd);
-        // Legacy fallback: if the new bridge rejects an unknown upload_method
-        // (error frame), retry once with the old upload_to_mega flag.
-        if (method && !res.ok) {
-            const fd2 = new FormData();
-            fd2.append('upload_to_mega', method === 'local' ? 'false' : 'true');
-            fd2.append('delete_after_upload', 'true');
-            res = await mokuroBridgePost(url, 3600000, fd2);
-        }
+        const res = await mokuroBridgePost(url, 3600000, fd);
+        // Rejections (unknown upload account, session already finalizing) come
+        // back as JSON before the stream starts. Never retry them blindly: the
+        // old upload_to_mega fallback turned an unknown account into an upload to
+        // MEGA, which is the wrong destination, and re-sent a 409.
+        if (!res.ok) throw await bridgeError(res, 'finalize');
         // The page fetch has a real ReadableStream body, so BookWalker/CMOA keep
         // the live streaming reader; the GM response has none, so its whole NDJSON
         // body is parsed in one pass through the same sink.
@@ -493,8 +557,6 @@
         }
         return readNdjsonText(await res.text(), onStage, onUpload);
     }
-    // Where the post-OCR "Open Reader Mokuro" button points: the reader URL the
-    // bridge reported when its done frame carries one, otherwise the reader home.
     function readerJumpUrl(result) {
         const u = result && result.reader_url;
         if (typeof u === 'string' && /^https?:\/\//i.test(u.trim())) return u.trim();

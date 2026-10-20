@@ -1,21 +1,46 @@
-    // -----------------------------------------------------------------
-    // Page cache (IndexedDB)
-    // -----------------------------------------------------------------
     let pageDB = null;
+    let pageDBPromise = null;
     function openPageDB() {
-        return new Promise((resolve, reject) => {
-            if (pageDB) return resolve(pageDB);
-            try {
-                const req = indexedDB.open('bwdd-pages-v2', 1);
-                req.onupgradeneeded = () => {
-                    const db = req.result;
-                    if (!db.objectStoreNames.contains('pages')) db.createObjectStore('pages');
-                };
-                req.onsuccess = () => { pageDB = req.result; resolve(pageDB); };
-                req.onerror = () => reject(req.error);
-            } catch (e) { reject(e); }
+        // A run starts every one of its page attempts at once, so a per-call open
+        // made a 200-page volume ask IndexedDB for 200 connections before the
+        // first page left the gate. Share the single in-flight open instead:
+        // every caller waits on the promise the first caller already created.
+        if (pageDB) return Promise.resolve(pageDB);
+        if (pageDBPromise) return pageDBPromise;
+        pageDBPromise = new Promise((resolve, reject) => {
+            let req;
+            try { req = indexedDB.open('bwdd-pages-v2', 1); } catch (e) { reject(e); return; }
+            req.onupgradeneeded = () => {
+                const db = req.result;
+                if (!db.objectStoreNames.contains('pages')) db.createObjectStore('pages');
+            };
+            req.onsuccess = () => { pageDB = req.result; resolve(pageDB); };
+            req.onerror = () => reject(req.error);
+            // An open blocked by another tab's upgrade fires only this event; a
+            // caller parked on a promise that never settles is a stalled page.
+            req.onblocked = () => reject(new Error('page cache open blocked'));
+        });
+        pageDBPromise.catch(() => { pageDBPromise = null; });
+        return pageDBPromise;
+    }
+    // Resolves to null when `p` has not answered within `ms`, and never rejects,
+    // so a caller can treat "no answer in time" exactly like "no cached page".
+    function withDeadline(p, ms) {
+        return new Promise((resolve) => {
+            let done = false;
+            const timer = setTimeout(() => { if (!done) { done = true; resolve(null); } }, ms);
+            p.then(
+                (v) => { if (!done) { done = true; clearTimeout(timer); resolve(v); } },
+                () => { if (!done) { done = true; clearTimeout(timer); resolve(null); } },
+            );
         });
     }
+    // The cache read sits in front of every fetch, so it must never be able to
+    // hold one. The healthy path answers in single-digit milliseconds; this only
+    // fires when the store is wedged behind a write burst or a prune, and losing
+    // a cache hit there costs one re-fetch - far less than the alternative,
+    // which is a page that never starts and a run that never reaches its ZIP.
+    const PAGE_CACHE_READ_TIMEOUT_MS = 1000;
     // Entries are {blob, ts, crc}: ts enforces the TTL and the size cap keeps the
     // cache from eating the browser's disk. Keys include the codec and quality so
     // a format change cannot reuse the wrong output blob or CRC.
@@ -26,7 +51,11 @@
     let pageCachePruneTimer = null;
     let pageCachePruneInFlight = null;
     let pageCachePruneRequested = false;
-    let lastPageCachePruneAt = 0;
+    // Starts the interval clock at load. Left at 0, the very first `put` of a run
+    // scheduled a full-store cursor scan immediately, in the middle of the fetch
+    // burst it then blocked behind its readwrite transaction. The first prune is
+    // wanted for a stale cache, but it can wait one interval to get it.
+    let lastPageCachePruneAt = Date.now();
     function schedulePageCachePrune(delayMs) {
         // Headless automation intentionally does not keep a page-cache
         // housekeeping timer alive between Puppeteer runs.
@@ -72,20 +101,37 @@
                 tx.objectStore('pages').put(record, key);
                 tx.oncomplete = () => res(true);
                 tx.onerror = () => rej(tx.error);
+                tx.onabort = () => rej(tx.error || new Error('page cache put aborted'));
             });
             schedulePageCachePrune();
             return true;
         } catch (e) { return false; }
     }
+    function readCachedRecord(db, key) {
+        return new Promise((res) => {
+            let settled = false;
+            const finish = (v) => { if (!settled) { settled = true; res(v); } };
+            let tx;
+            try { tx = db.transaction('pages', 'readonly'); }
+            catch (e) { finish(null); return; }
+            // A request's own error is not the only way a read can end: an
+            // aborted transaction fires neither `onsuccess` nor `onerror`, and
+            // without these the promise - and the page awaiting it - would hang
+            // for the life of the tab.
+            tx.onabort = () => finish(null);
+            tx.onerror = () => finish(null);
+            try {
+                const rq = tx.objectStore('pages').get(key);
+                rq.onsuccess = () => finish(rq.result || null);
+                rq.onerror = () => finish(null);
+            } catch (e) { finish(null); }
+        });
+    }
     async function getCachedPage(cid, index) {
         try {
-            const db = await openPageDB();
-            const v = await new Promise((res) => {
-                const tx = db.transaction('pages', 'readonly');
-                const rq = tx.objectStore('pages').get(pageCacheKey(cid, index));
-                rq.onsuccess = () => res(rq.result || null);
-                rq.onerror = () => res(null);
-            });
+            const db = await withDeadline(openPageDB(), PAGE_CACHE_READ_TIMEOUT_MS);
+            if (!db) return null;
+            const v = await withDeadline(readCachedRecord(db, pageCacheKey(cid, index)), PAGE_CACHE_READ_TIMEOUT_MS);
             if (v && v.blob) {
                 if (Number.isInteger(v.crc)) cachedPageCrc.set(v.blob, v.crc);
                 return v.blob;

@@ -1,13 +1,3 @@
-    // =====================================================================
-    // ebookjapan — page detection, the viewer URL, and the book manifest
-    // =====================================================================
-    // Ported from the standalone ebookjapan userscript, which had this working
-    // against live volumes. What it answers:
-    //
-    //   ebjParseTarget(href)   the volume code and the viewer path
-    //   ebjResolveCodes(spec)  cheap: the code and, when the page has it, a title
-    //   ebjResolvePages(...)   the real thing: session payloads, the book's own
-    //                          manifest, the page list and the canvas box
     //
     // ebjResolvePages also records the session payloads and the open_param
     // arguments in ebjState, because a Web Worker has to install its own copy of
@@ -19,9 +9,9 @@
         get cid() { return ebjState.code || ''; },
         code: '',
         fileId: '',
-        payload: null,      // { sessionId, code, fileId, openPayload, drmPayload }
+        payload: null,
         params: null,       // the open_param arguments those payloads were opened with
-        book: null,         // { name, title, code, pages, canvas, direction, autograph }
+        book: null,
         running: false,
     };
 
@@ -142,7 +132,7 @@
         // in the wasm module's own memory, and shuffle() traps with a bare
         // "unreachable" when it is not there — a panic that names no cause and
         // stops every page at once.
-        ebjAutographImg = null;   // a new book means a new overlay
+        ebjAutographImg = null;
         ebjState.payload = { sessionId: open.session_id, code: drm.code, fileId: drm.file_id,
                          openPayload: open.payload, drmPayload: drm.payload };
 
@@ -225,7 +215,6 @@
         };
     }
 
-    /** ebookjapan's viewer is the only page this adapter owns. */
     // A breadcrumb the instant this script is evaluated, before any adapter
     // logic. If the attribute below never appears, Tampermonkey did not run the
     // script at all (wrong URL, stale install, script disabled) — which looks

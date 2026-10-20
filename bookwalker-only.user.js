@@ -1,24 +1,27 @@
 // ==UserScript==
 // @name         BookWalker Native Downloader
 // @namespace    http://tampermonkey.net/
-// @version      2.0.0
+// @version      3.0.0
 // @description  Saves a book from the BookWalker viewer as a ZIP or CBZ of full-resolution page images, fetched from the CDN and unscrambled offline. Optional Japanese OCR through mokuro-bridge, with upload to MEGA, Google Drive or OneDrive.
 // @author       GolyBidoof
-// @homepageURL  https://github.com/GolyBidoof/bookwalker-ebookjapan-cmoa-native-downloader
-// @supportURL   https://github.com/GolyBidoof/bookwalker-ebookjapan-cmoa-native-downloader/issues
-// @updateURL    https://github.com/GolyBidoof/bookwalker-ebookjapan-cmoa-native-downloader/releases/latest/download/bookwalker-only.user.js
-// @downloadURL  https://github.com/GolyBidoof/bookwalker-ebookjapan-cmoa-native-downloader/releases/latest/download/bookwalker-only.user.js
+// @homepageURL  https://github.com/GolyBidoof/dokuha-userscript
+// @supportURL   https://github.com/GolyBidoof/dokuha-userscript/issues
+// @updateURL    https://github.com/GolyBidoof/dokuha-userscript/releases/latest/download/bookwalker-only.user.js
+// @downloadURL  https://github.com/GolyBidoof/dokuha-userscript/releases/latest/download/bookwalker-only.user.js
 // @match        https://viewer.bookwalker.jp/*
 // @match        https://viewer-trial.bookwalker.jp/*
 // @match        https://viewer-ptrial.bookwalker.jp/*
 // @match        https://viewer-subscription.bookwalker.jp/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=bookwalker.jp
 // @grant        GM_xmlhttpRequest
+// @grant        unsafeWindow
 // @connect      learnnatively.com
 // @connect      manga-kotoba.com
 // @connect      bookwalker.jp
 // @connect      bw-bv-epubs.bookwalker.jp
 // @connect      *.bookwalker.jp
+// @connect      127.0.0.1
+// @connect      localhost
 // @run-at       document-end
 // @license      MIT
 //
@@ -53,61 +56,52 @@
 //   falls back to a public CORS proxy (or hides), and the store links cannot be
 //   resolved, so they are simply not shown.
 // ==/UserScript==
+// Comment-stripped build. Annotated source, tests and explanations: https://github.com/GolyBidoof/dokuha-userscript
+
 (function () {
     'use strict';
 
-    // Derived from the installed metadata, not a hardcoded copy: a pinned literal
-    // silently goes stale across releases, so the panel reports an old version no
-    // matter which build is actually running.
     const BWDD_VERSION = (() => {
         try {
             const v = (typeof GM_info !== 'undefined') && GM_info.script && GM_info.script.version;
             if (v) return v;
-        } catch (e) { /* not in a userscript manager (e.g. injected in a test) */ }
-        return '2.0.0';   // the single source of truth: build.mjs substitutes this into @version
+        } catch (e) { }
+        return '3.0.0';
     })();
-    // Debug-only: internals on window.* are exposed only when the page URL
-    // carries ?bwddDebug=1, so page scripts cannot reach mutable script state by
-    // default. It lives in the shared core because the core itself logs through
-    // it.
+
     const BWDD_DEBUG = (() => {
         try { return new URLSearchParams(location.search).has('bwddDebug'); } catch (e) { return false; }
     })();
     const BWDD_AUTHOR = 'GolyBidoof';
-    const BWDD_REPO_URL = 'https://github.com/GolyBidoof/bookwalker-ebookjapan-cmoa-native-downloader';
+    const BWDD_SCRIPT_NAME = 'dokuha-userscript';
+    const BWDD_REPO_URL = 'https://github.com/GolyBidoof/dokuha-userscript';
 
-    // =====================================================================
-    // 1. Capture the viewer's own network responses (browser data reuse)
-    // =====================================================================
     const state = {
         cid: (new URLSearchParams(location.search)).get('cid') || '',
         fileBases: {},
-        auth: null,        // {hti, cfg, bid, uuid, pfCd, Policy, Signature, Key-Pair-Id}
-        baseUrl: null,     // e.g. https://bw-bv-epubs.bookwalker.jp/3_product/<cid>/1/<pid>/
-        cti: null,         // title
-        configBody: null,  // encrypted configuration_pack.json text
+        auth: null,
+        baseUrl: null,
+        cti: null,
+        configBody: null,
         configFromUrl: null
     };
-    // Headless auth refreshes must correlate like one browser session. Do not
-    // mint a new BID on every retry/endpoint call, but never consult browser
-    // storage in this mode.
+
     let headlessBid = null;
 
-    // Shared protocol/presentation constants (single source of truth).
     const AUTH_PARAM_KEYS = ['hti', 'cfg', 'bid', 'uuid', 'pfCd', 'Policy', 'Signature', 'Key-Pair-Id'];
 
-    // Headless automation is deliberately a page-level opt-in.  Keeping the
-    // check in one helper means the normal panel path never has to know about
-    // it, while a Puppeteer caller can inject the flag before the script runs.
+    function debugRealm() {
+        try {
+            return (typeof unsafeWindow !== 'undefined' && unsafeWindow) || window;
+        } catch (e) { return window; }
+    }
+
     function isHeadlessPage() {
         try {
             return window.__BWDD_HEADLESS__ === true || !!window.__BWDD_CLI__;
         } catch (e) { return false; }
     }
 
-    // Error messages from fetch failures can echo a request URL. Keep signed CDN
-    // query parameters and URL credentials out of page logs even in headed mode;
-    // this is deliberately independent of the CLI's queue sanitization.
     function safeLogText(value) {
         let text = String(value == null ? '' : value);
         text = text.replace(/https?:\/\/[^\s"'<>]+/gi, match => {
@@ -131,7 +125,7 @@
         );
     }
 
-    const automationMemory = {
+const automationMemory = {
         status: {
             state: 'idle', status: 'idle', ok: false, mode: null, cid: '', title: '',
             total: 0, pageCount: 0, sessionId: null, safeTitle: null,
@@ -182,7 +176,7 @@
                 options.onProgress(Object.assign({}, event, {
                     errors: Array.isArray(event.errors) ? event.errors.slice() : undefined
                 }));
-            } catch (e) { /* a consumer callback must never break a download */ }
+            } catch (e) { }
         }
         try {
             if (typeof window.__bwddProgress === 'function') {
@@ -190,7 +184,7 @@
                     errors: Array.isArray(event.errors) ? event.errors.slice() : undefined
                 }));
             }
-        } catch (e) { /* the page-level hook is best effort */ }
+        } catch (e) { }
     }
     function newAutomationResult(mode, cid, deferredFinalize) {
         return {
@@ -319,18 +313,8 @@
         window.__bwddAutomation = api;
     }
 
-    // A property of the archiver rather than of either store's reader, so the
-    // core owns it.
     const JPEG_QUALITY = 0.92;
-    //   localStorage.bwddImageFormat  = 'jpeg' | 'webp' | 'lossless' | 'png'
-    //   localStorage.bwddImageQuality = 0.85      (0-1, lossy formats only)
-    // The CDN already hands us a lossy JPEG, so re-encoding is a second
-    // generation. Measured on a 1600x2400 manga page (bytes / encode ms):
-    // jpeg 0.92 0.94 MB / 14 (default), jpeg 0.85 0.79 / 13, webp 0.92 0.75 / 180,
-    // webp lossless 0.18 / 47 (bit-exact), png 0.69 / 15. On photo pages lossless
-    // costs far more (webp lossless 3.4 MB / 592 ms), so it stays a choice rather
-    // than a default. image/jxl and image/avif are not encodable here:
-    // convertToBlob silently returns PNG for both.
+
     function resolveImageCodec() {
         let fmt = 'jpeg', quality = JPEG_QUALITY;
         try {
@@ -345,25 +329,20 @@
                 : (!isHeadlessPage() ? localStorage.getItem('bwddImageQuality') : null);
             const qv = parseFloat(raw);
             if (isFinite(qv) && qv > 0 && qv <= 1) quality = qv;
-        } catch (e) { /* opaque origin, or storage disabled, keep the defaults */ }
-        // 'lossless' is WebP at quality 1, which is bit-exact; browsers without a
-        // WebP encoder fall back to PNG, which is lossless too. Either way the
-        // lossless setting really is lossless.
+        } catch (e) { }
+
         if (fmt === 'lossless') return { fmt, type: 'image/webp', quality: 1, ext: 'webp', lossless: true };
         if (fmt === 'webp') return { fmt, type: 'image/webp', quality, ext: 'webp', lossless: false };
         if (fmt === 'png') return { fmt, type: 'image/png', quality, ext: 'png', lossless: true };
         return { fmt: 'jpeg', type: 'image/jpeg', quality, ext: 'jpg', lossless: false };
     }
-    // Mutable: the panel changes it, and the next download must pick it up without
-    // a page reload, so nothing may cache this at load time.
+
     let IMAGE_CODEC = resolveImageCodec();
     function refreshImageCodec() {
         IMAGE_CODEC = resolveImageCodec();
         return IMAGE_CODEC;
     }
-    // BookWalker-only helper: locate the viewer's own NFBR engine object, which
-    // holds the signed auth the capture hooks read. BWDD_DEBUG itself lives in
-    // the shared core now.
+
     function findInNFBR(win) {
         const out = { auth: null, baseUrl: null, config: null, cti: null };
         if (!win || !win.NFBR) return out;
@@ -424,44 +403,57 @@
         } catch (e) { if (BWDD_DEBUG) console.warn('[bwdd] findInNFBR:', safeLogText(e && e.message)); }
         return out;
     }
-    // -----------------------------------------------------------------
-    // Page cache (IndexedDB)
-    // -----------------------------------------------------------------
-    let pageDB = null;
+
+let pageDB = null;
+    let pageDBPromise = null;
     function openPageDB() {
-        return new Promise((resolve, reject) => {
-            if (pageDB) return resolve(pageDB);
-            try {
-                const req = indexedDB.open('bwdd-pages-v2', 1);
-                req.onupgradeneeded = () => {
-                    const db = req.result;
-                    if (!db.objectStoreNames.contains('pages')) db.createObjectStore('pages');
-                };
-                req.onsuccess = () => { pageDB = req.result; resolve(pageDB); };
-                req.onerror = () => reject(req.error);
-            } catch (e) { reject(e); }
+
+        if (pageDB) return Promise.resolve(pageDB);
+        if (pageDBPromise) return pageDBPromise;
+        pageDBPromise = new Promise((resolve, reject) => {
+            let req;
+            try { req = indexedDB.open('bwdd-pages-v2', 1); } catch (e) { reject(e); return; }
+            req.onupgradeneeded = () => {
+                const db = req.result;
+                if (!db.objectStoreNames.contains('pages')) db.createObjectStore('pages');
+            };
+            req.onsuccess = () => { pageDB = req.result; resolve(pageDB); };
+            req.onerror = () => reject(req.error);
+
+            req.onblocked = () => reject(new Error('page cache open blocked'));
+        });
+        pageDBPromise.catch(() => { pageDBPromise = null; });
+        return pageDBPromise;
+    }
+
+    function withDeadline(p, ms) {
+        return new Promise((resolve) => {
+            let done = false;
+            const timer = setTimeout(() => { if (!done) { done = true; resolve(null); } }, ms);
+            p.then(
+                (v) => { if (!done) { done = true; clearTimeout(timer); resolve(v); } },
+                () => { if (!done) { done = true; clearTimeout(timer); resolve(null); } },
+            );
         });
     }
-    // Entries are {blob, ts, crc}: ts enforces the TTL and the size cap keeps the
-    // cache from eating the browser's disk. Keys include the codec and quality so
-    // a format change cannot reuse the wrong output blob or CRC.
+
+    const PAGE_CACHE_READ_TIMEOUT_MS = 1000;
+
     const PAGE_CACHE_TTL_MS = 20 * 60 * 1000;
-    const PAGE_CACHE_MAX_ENTRIES = 4000;        // safety cap (~3 GB at 700 KB/page)
+    const PAGE_CACHE_MAX_ENTRIES = 4000;
     const PAGE_CACHE_PRUNE_INTERVAL_MS = 30 * 1000;
     const cachedPageCrc = new WeakMap();
     let pageCachePruneTimer = null;
     let pageCachePruneInFlight = null;
     let pageCachePruneRequested = false;
-    let lastPageCachePruneAt = 0;
+
+    let lastPageCachePruneAt = Date.now();
     function schedulePageCachePrune(delayMs) {
-        // Headless automation intentionally does not keep a page-cache
-        // housekeeping timer alive between Puppeteer runs.
+
         if (isHeadlessPage()) return;
-        // A full cursor scan after every put turns a 300-page run into hundreds
-        // of overlapping O(cache-size) scans. Keep at most one periodic prune.
+
         if (pageCachePruneInFlight) {
-            // A write that arrived while the cursor was walking would otherwise
-            // leave no future trigger once that walk finishes.
+
             pageCachePruneRequested = true;
             return;
         }
@@ -498,20 +490,34 @@
                 tx.objectStore('pages').put(record, key);
                 tx.oncomplete = () => res(true);
                 tx.onerror = () => rej(tx.error);
+                tx.onabort = () => rej(tx.error || new Error('page cache put aborted'));
             });
             schedulePageCachePrune();
             return true;
         } catch (e) { return false; }
     }
+    function readCachedRecord(db, key) {
+        return new Promise((res) => {
+            let settled = false;
+            const finish = (v) => { if (!settled) { settled = true; res(v); } };
+            let tx;
+            try { tx = db.transaction('pages', 'readonly'); }
+            catch (e) { finish(null); return; }
+
+            tx.onabort = () => finish(null);
+            tx.onerror = () => finish(null);
+            try {
+                const rq = tx.objectStore('pages').get(key);
+                rq.onsuccess = () => finish(rq.result || null);
+                rq.onerror = () => finish(null);
+            } catch (e) { finish(null); }
+        });
+    }
     async function getCachedPage(cid, index) {
         try {
-            const db = await openPageDB();
-            const v = await new Promise((res) => {
-                const tx = db.transaction('pages', 'readonly');
-                const rq = tx.objectStore('pages').get(pageCacheKey(cid, index));
-                rq.onsuccess = () => res(rq.result || null);
-                rq.onerror = () => res(null);
-            });
+            const db = await withDeadline(openPageDB(), PAGE_CACHE_READ_TIMEOUT_MS);
+            if (!db) return null;
+            const v = await withDeadline(readCachedRecord(db, pageCacheKey(cid, index)), PAGE_CACHE_READ_TIMEOUT_MS);
             if (v && v.blob) {
                 if (Number.isInteger(v.crc)) cachedPageCrc.set(v.blob, v.crc);
                 return v.blob;
@@ -587,6 +593,132 @@
         } catch (e) { return false; }
     }
 
+    const TICKER_HELLO_MS = 1500;
+    const tickerSource = [
+        'const timers = new Map();',
+        'onmessage = function (e) {',
+        '    const d = e.data || {};',
+        '    if (d.op === "start") {',
+        '        const previous = timers.get(d.id);',
+        '        if (previous !== undefined) clearInterval(previous);',
+        '        timers.set(d.id, setInterval(function () { postMessage(d.id); }, d.ms));',
+        '    } else if (d.op === "stop") {',
+        '        const t = timers.get(d.id);',
+        '        if (t !== undefined) clearInterval(t);',
+        '        timers.delete(d.id);',
+        '    }',
+        '};',
+        'postMessage("ready");',
+    ].join('\n');
+
+    const tickers = new Map();
+    let tickerRelay = null;
+    let tickerRelayReady = false;
+    let tickerHelloTimer = null;
+    let tickerSeq = 0;
+
+    function tickerRun(rec) {
+        if (rec.stopped) return;
+        try { rec.fn(); } catch (e) {}
+    }
+
+    function tickerFallback(rec) {
+        if (rec.stopped || rec.fallbackId !== null) return;
+        rec.fallbackId = setInterval(() => tickerRun(rec), rec.ms);
+    }
+    function tickerRelayFailed() {
+        if (tickerHelloTimer) { clearTimeout(tickerHelloTimer); tickerHelloTimer = null; }
+        if (tickerRelay) { try { tickerRelay.terminate(); } catch (e) {} }
+        tickerRelay = false;
+        tickerRelayReady = false;
+        for (const rec of tickers.values()) tickerFallback(rec);
+    }
+    function ensureTickerRelay() {
+        if (tickerRelay !== null) return tickerRelay;
+        if (typeof Worker !== 'function' || typeof Blob !== 'function' ||
+            typeof URL === 'undefined' || typeof URL.createObjectURL !== 'function') {
+            tickerRelay = false;
+            return false;
+        }
+        let worker = null;
+        try {
+            const url = URL.createObjectURL(new Blob([tickerSource], { type: 'text/javascript' }));
+            try { worker = new Worker(url); } finally { URL.revokeObjectURL(url); }
+        } catch (e) {
+            tickerRelay = false;
+            return false;
+        }
+        worker.onmessage = (ev) => {
+            if (typeof ev.data === 'string') {
+                if (ev.data !== 'ready') return;
+                tickerRelayReady = true;
+                if (tickerHelloTimer) { clearTimeout(tickerHelloTimer); tickerHelloTimer = null; }
+
+                for (const rec of tickers.values()) {
+                    if (rec.fallbackId !== null) { clearInterval(rec.fallbackId); rec.fallbackId = null; }
+                }
+                return;
+            }
+            const rec = tickers.get(ev.data);
+            if (rec) tickerRun(rec);
+        };
+
+        worker.onerror = () => tickerRelayFailed();
+        tickerRelay = worker;
+
+        tickerHelloTimer = setTimeout(() => { if (!tickerRelayReady) tickerRelayFailed(); }, TICKER_HELLO_MS);
+        return worker;
+    }
+    function setBackgroundInterval(fn, ms) {
+        if (typeof fn !== 'function') throw new TypeError('setBackgroundInterval needs a function');
+        const delay = Math.max(16, Number(ms) || 0);
+        const id = ++tickerSeq;
+        const rec = { id, fn, ms: delay, fallbackId: null, stopped: false };
+        tickers.set(id, rec);
+        const relay = ensureTickerRelay();
+        if (relay) {
+            try { relay.postMessage({ op: 'start', id, ms: delay }); }
+            catch (e) { tickerRelayFailed(); }
+        }
+
+        if (!tickerRelayReady) tickerFallback(rec);
+        return id;
+    }
+    function clearBackgroundInterval(id) {
+        const rec = tickers.get(id);
+        if (!rec) return;
+        rec.stopped = true;
+        tickers.delete(id);
+        if (rec.fallbackId !== null) { clearInterval(rec.fallbackId); rec.fallbackId = null; }
+
+        if (tickerRelay) {
+            try { tickerRelay.postMessage({ op: 'stop', id }); } catch (e) {}
+        }
+    }
+
+    function backgroundDelay(ms) {
+        return new Promise(resolve => {
+            const id = setBackgroundInterval(() => { clearBackgroundInterval(id); resolve(); }, ms);
+        });
+    }
+
+    let taskYieldPorts = null;
+    function yieldToTasks() {
+        if (typeof MessageChannel !== 'function') return new Promise(r => setTimeout(r, 0));
+        if (!taskYieldPorts) {
+            const ports = { channel: new MessageChannel(), waiters: [] };
+            taskYieldPorts = ports;
+            ports.channel.port1.onmessage = () => {
+                const next = ports.waiters.shift();
+                if (next) next();
+            };
+        }
+        return new Promise(resolve => {
+            taskYieldPorts.waiters.push(resolve);
+            taskYieldPorts.channel.port2.postMessage(0);
+        });
+    }
+
     function apiOriginFromUrl(url) {
         try {
             const m = url.match(/^(https?:\/\/[^/]+)/);
@@ -606,12 +738,6 @@
         try { return window.location.origin; } catch (e) { return ''; }
     }
 
-    // Single reader for captured API/config responses, used by both the
-    // fetch and XHR hooks below so the two capture paths can never classify an
-    // endpoint differently (they once duplicated this and drifted). Handles:
-    //   /browserWebApi/c | /trial-page/c  → full auth reply (auth_info + url)
-    //   /browserWebApi/pb                 → incremental auth_info (policy refresh)
-    //   configuration_pack.json           → encrypted manifest text (best dir wins)
     function absorbApiResponse(url, text) {
         try {
             if (url.includes('/browserWebApi/c') || url.includes('/trial-page/c')) {
@@ -623,8 +749,7 @@
                 recordApiBase(url);
                 const d = JSON.parse(text);
                 if (d.auth_info) {
-                    // pb rotates the CloudFront policy; a changed signature
-                    // resets the request-count budget.
+
                     const before = authPolicySig();
                     state.auth = Object.assign({}, state.auth || {}, d.auth_info);
                     if (authPolicySig() !== before) resetAuthBudget();
@@ -639,9 +764,6 @@
         } catch (e) {}
     }
 
-    // Hooks. Headless callers can defer these wrappers until the automation
-    // run starts; some viewer builds keep their document-start loader alive
-    // when a fetch wrapper is installed before their own bootstrap finishes.
     let networkCaptureInstalled = false;
     function installNetworkCapture() {
         if (networkCaptureInstalled) return;
@@ -679,34 +801,9 @@
             return false;
         }
     }
-    // NOTE: the install call lives in this site's adapter (install()), so the
-    // entry point can decide per page which store's capture to bring up.
 
-    // =====================================================================
-    // 2. Crypto: decrypt configuration_pack.json
-    // =====================================================================
-    //
-    // The viewer's configuration_pack.json is a custom envelope:
-    //   { "version":"1.0", "data":"<custom-base64 payload>" }
-    // Decoding is a fixed pipeline: custom base64 (A8j) -> a byte-keyed
-    // key schedule (A3b / B0p / A7L / A6I / A2F / B0L / tB0l, an RC4 variant)
-    // -> UTF-8 JSON of the page manifest. The first 128 chars of the payload
-    // are three 32-byte keys (key1/key2/key3) later used to derive per-page
-    // descramble seeds (section 3) and image filename tokens (section 4).
-    //
-    // NOTE: identifiers like A8j, A3b, B0p, v4..v9 are the original names
-    // from the minified viewer, preserved verbatim because this port is
-    // validated byte-for-byte against live HAR data and the bookworm
-    // offline client. Renaming them would risk silent drift; the
-    // pipeline below is annotated instead.
-    // =====================================================================
-
-    // Used by the key-schedule shuffles below.
     function arraySwap(arr, a, b) { const t = arr[a]; arr[a] = arr[b]; arr[b] = t; }
 
-    // --- Custom base64 lookup tables (4 chars -> 3 bytes) ---
-    // BookWalker's base64 alphabet is the standard A-Z a-z 0-9 + / set, but
-    // the decode uses shifted bit masks per byte position (v5..v9).
     const ARR1 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'.split('');
     const ARR2 = ARR1.map(c => c.charCodeAt(0));
     const v4 = [], v5 = [], v6 = [], v7 = [], v8 = [], v9 = [], vak = [];
@@ -717,9 +814,6 @@
     }
     const A8f = [v4, v5, v6, v7, v8, v9, vak];
 
-    // Decode the custom base64 payload between dataOffset..dataEndOffset.
-    // Returns [decodedBytes, decodedLength, key1, key2, key3] where the keys
-    // are the first 128 chars split into three 32-byte registers.
     function A8j(content, dataOffset, dataEndOffset) {
         const arrayLength = 32, keyDataLength = 128;
         const payloadOffset = dataOffset + keyDataLength;
@@ -923,10 +1017,8 @@
         const [content, clen] = st;
         return [new TextDecoder('utf-8').decode(content.slice(0, clen))];
     }
-    // =====================================================================
-    // 3. Tile shuffle & descramble arithmetic (A9p)
-    // =====================================================================
-    const B2Y_TRIPLES = JSON.parse('[[1,3,10],[1,5,16],[1,5,19],[1,9,29],[1,11,6],[1,11,16],[1,19,3],[1,21,20],[1,27,27],[2,5,15],[2,5,21],[2,7,7],[2,7,9],[2,7,25],[2,9,15],[2,15,17],[2,15,25],[2,21,9],[3,1,14],[3,3,26],[3,3,28],[3,3,29],[3,5,20],[3,5,22],[3,5,25],[3,7,29],[3,13,7],[3,23,25],[3,25,24],[3,27,11],[4,3,17],[4,3,27],[4,5,15],[5,3,21],[5,7,22],[5,9,7],[5,9,28],[5,9,31],[5,13,6],[5,15,17],[5,17,13],[5,21,12],[5,27,8],[5,27,21],[5,27,25],[5,27,28],[6,1,11],[6,3,17],[6,17,9],[6,21,7],[6,21,13],[7,1,9],[7,1,18],[7,1,25],[7,13,25],[7,17,21],[7,25,12],[7,25,20],[8,7,23],[8,9,23],[9,5,14],[9,5,25],[9,11,19],[9,21,16],[10,9,21],[10,9,25],[11,7,12],[11,7,16],[11,17,13],[11,21,13],[12,9,23],[13,3,17],[13,3,27],[13,5,19],[13,17,15],[14,1,15],[14,13,15],[15,1,29],[17,15,20],[17,15,23],[17,15,26]]');
+
+const B2Y_TRIPLES = JSON.parse('[[1,3,10],[1,5,16],[1,5,19],[1,9,29],[1,11,6],[1,11,16],[1,19,3],[1,21,20],[1,27,27],[2,5,15],[2,5,21],[2,7,7],[2,7,9],[2,7,25],[2,9,15],[2,15,17],[2,15,25],[2,21,9],[3,1,14],[3,3,26],[3,3,28],[3,3,29],[3,5,20],[3,5,22],[3,5,25],[3,7,29],[3,13,7],[3,23,25],[3,25,24],[3,27,11],[4,3,17],[4,3,27],[4,5,15],[5,3,21],[5,7,22],[5,9,7],[5,9,28],[5,9,31],[5,13,6],[5,15,17],[5,17,13],[5,21,12],[5,27,8],[5,27,21],[5,27,25],[5,27,28],[6,1,11],[6,3,17],[6,17,9],[6,21,7],[6,21,13],[7,1,9],[7,1,18],[7,1,25],[7,13,25],[7,17,21],[7,25,12],[7,25,20],[8,7,23],[8,9,23],[9,5,14],[9,5,25],[9,11,19],[9,21,16],[10,9,21],[10,9,25],[11,7,12],[11,7,16],[11,17,13],[11,21,13],[12,9,23],[13,3,17],[13,3,27],[13,5,19],[13,17,15],[14,1,15],[14,13,15],[15,1,29],[17,15,20],[17,15,23],[17,15,26]]');
     const XSHIFT = [
         (p1, p2, p3, p4) => { p1 ^= p1 << p2; p1 ^= p1 >>> p3; p1 ^= p1 << p4; return p1; },
         (p1, p2, p3, p4) => { p1 ^= p1 << p4; p1 ^= p1 >>> p3; p1 ^= p1 << p2; return p1; },
@@ -1143,10 +1235,7 @@
         };
     }
 
-    // =====================================================================
-    // 4. Page image filename token
-    // =====================================================================
-    function v_jdf(filename) {
+function v_jdf(filename) {
         const n = parseInt(filename, 10);
         if (!isNaN(n) && n >= 0 && n <= 1152921504606847000) {
             const h = n.toString(16);
@@ -1208,10 +1297,7 @@
         return pageId + '/' + v_jdf(fname) + v_ndf(v_hdf(k1, k2, k3), pageId, fname) + '.jpeg';
     }
 
-    // =====================================================================
-    // 5. Auth helpers
-    // =====================================================================
-    function isPublicBootstrapPage() {
+function isPublicBootstrapPage() {
         try { return !!(window.__BWDD_CLI__ && window.__BWDD_CLI__.publicBootstrap); } catch (_) { return false; }
     }
     function isPublicFreeBootstrapPage() {
@@ -1224,11 +1310,7 @@
         return m ? decodeURIComponent(m[1]) : '';
     }
     function generatedBid() {
-        // The native viewer mints this value client-side and persists it under
-        // localStorage['NFBR.Global/BrowserId']; the observed shape is
-        // <epoch-ms><8 digits>NFBR and the server accepts a self-minted one
-        // (verified against /trial-page/c with status 200). When the viewer
-        // engine has not run yet, mint the same shape instead of refusing.
+
         if (!headlessBid) {
             headlessBid = (state.auth && state.auth.bid) ||
                 (Date.now() + '' + Math.floor(Math.random() * 1e8) + 'NFBR');
@@ -1249,10 +1331,7 @@
         return p.toString();
     }
 
-    // =====================================================================
-    // 6. Worker Pool & Descramble Engine
-    // =====================================================================
-    function buildWorkerSource() {
+function buildWorkerSource() {
         const deps = [
             'const AUTH_PARAM_KEYS = ' + JSON.stringify(AUTH_PARAM_KEYS) + ';',
             'const B2Y_TRIPLES = ' + JSON.stringify(B2Y_TRIPLES) + ';',
@@ -1275,16 +1354,14 @@
         return deps.join('\n');
     }
 
-    const WORKER_BATCH_SIZE = 2;
+const WORKER_BATCH_SIZE = 2;
 
     function workerBatchSize(type) {
-        // JPEG is the default and benefits from two overlapping codec jobs.
-        // Lossless WebP/PNG encoders have much higher peak memory/CPU cost, so
-        // keep a conservative single-page queue for those formats.
+
         return type === 'image/jpeg' ? WORKER_BATCH_SIZE : 1;
     }
 
-    function workerMain() {
+function workerMain() {
         let crcTable = null;
         async function crcForZip(blob) {
             if (!crcTable) {
@@ -1342,10 +1419,7 @@
                 const needsScale = !!(S && S.Width && S.Height && (W !== S.Width || H !== S.Height));
                 const needsTiles = !seeds.noDescramble;
                 if (!needsTiles && !needsScale && outType === 'image/jpeg' && blob.type === 'image/jpeg') {
-                    // Nothing has to change about this page. Decoding and
-                    // re-encoding it costs ~57ms on a 1600x2400 scan (measured)
-                    // to produce a slightly worse copy of the bytes we already
-                    // hold, so hand the original straight back.
+
                     if (bmp.close) bmp.close();
                     const unchanged = { id, blob };
                     if (needCrc) unchanged.crc = await crcForZip(blob);
@@ -1354,12 +1428,7 @@
                 const canvas = new OffscreenCanvas(W, H);
                 const ctx = canvas.getContext('2d');
                 if (needsTiles) {
-                    // Blit each tile straight from the decoded bitmap into its
-                    // destination rect. The previous version pulled the whole
-                    // frame back with getImageData, copied the tiles in JS and
-                    // pushed it back with putImageData, about 46MB of avoidable
-                    // memory traffic per page, which is what stopped the decoder
-                    // keeping up with the fetcher. Measured 2.08x on 14 cores.
+
                     for (const t of A9p(seeds, W, H)) {
                         ctx.drawImage(bmp, t.destX, t.destY, t.width, t.height,
                             t.srcX, t.srcY, t.width, t.height);
@@ -1391,10 +1460,7 @@
         self.onmessage = async (ev) => {
             const isBatch = Array.isArray(ev.data.jobs);
             const jobs = isBatch ? ev.data.jobs : [ev.data];
-            // processPage allocates an independent bitmap/canvas per item, so
-            // Promise.all overlaps codec work without sharing mutable surfaces.
-            // Acknowledge each result as soon as it finishes: if a sibling hangs,
-            // the pool can commit this page and time out only the unfinished one.
+
             if (!isBatch) {
                 self.postMessage(await processPage(ev.data));
                 return;
@@ -1406,7 +1472,7 @@
         };
     }
 
-    function workerPoolSize() {
+function workerPoolSize() {
         let cores = 8;
         try { cores = navigator.hardwareConcurrency || 8; } catch (e) {}
         return Math.min(Math.max(4, cores), 16);
@@ -1421,17 +1487,12 @@
         let nextBatchId = 1;
         let pumpScheduled = false;
 
-        // The job envelope belongs to the site module: BookWalker ships its own
-        // relPath/seeds/q shape, ebookjapan ships page geometry and session
-        // material. A site that supplies no builder keeps the original shape.
         const messageFor = typeof buildMessage === 'function' ? buildMessage : function (job) {
             const message = {
                 id: job.id, relPath: job.relPath, seeds: job.seeds,
                 q: job.q, fmt: job.fmt, needCrc: !!job.needCrc, timeoutMs: jobTimeoutMs,
             };
-            // The main-thread prefetcher already downloaded this page, so pass
-            // the Blob (structured-cloneable, unlike an ArrayBuffer) instead of
-            // re-fetching through the six-socket origin.
+
             if (job.blob) message.blob = job.blob;
             else {
                 message.auth = job.auth;
@@ -1443,6 +1504,15 @@
             const timer = timers.get(id);
             if (timer) clearTimeout(timer);
             timers.delete(id);
+        }
+
+        function transfersFor(jobs) {
+            const out = [];
+            for (const job of jobs) {
+                if (!job || !Array.isArray(job.transfer)) continue;
+                for (const item of job.transfer) if (item) out.push(item);
+            }
+            return out;
         }
         function replaceWorker(w) {
             const idx = workers.indexOf(w);
@@ -1475,8 +1545,7 @@
             w.batchId = null;
             const recycle = w.hadTimeout;
             w.hadTimeout = false;
-            // A timed-out page may still own native codec work. Preserve every
-            // sibling that did finish, but never reuse that worker.
+
             if (recycle) replaceWorker(w);
             pump();
         }
@@ -1523,7 +1592,7 @@
                     timers.set(job.id, setTimeout(() => timeoutJob(w, job.id), jobTimeoutMs));
                 }
                 try {
-                    w.postMessage({ batchId, jobs: jobs.map(messageFor) });
+                    w.postMessage({ batchId, jobs: jobs.map(messageFor) }, transfersFor(jobs));
                 } catch (e) {
                     for (const job of jobs) {
                         clearJobTimer(job.id);
@@ -1536,8 +1605,7 @@
                     retry = true;
                 }
             }
-            // A failed structured clone leaves this worker idle. Revisit the
-            // queue once so one bad job cannot stall every page behind it.
+
             if (retry) schedulePump();
         }
         function schedulePump() {
@@ -1549,8 +1617,7 @@
             });
         }
         return {
-            // Coalesce synchronous submissions: pumping on every submit would
-            // defeat batching before the second page ever reached the queue.
+
             submit(job) { queue.push(job); schedulePump(); },
             terminate() {
                 queue.length = 0;
@@ -1565,8 +1632,7 @@
     function detectWorkers() {
         try {
             if (typeof Worker === 'undefined' || typeof OffscreenCanvas === 'undefined') return false;
-            // The worker source belongs to a site module, so a build without
-            // one simply has no worker pool rather than a broken reference.
+
             if (typeof buildWorkerSource !== 'function') return false;
             const src = buildWorkerSource();
             const url = URL.createObjectURL(new Blob([src], { type: 'text/javascript' }));
@@ -1577,8 +1643,35 @@
         } catch (e) { return false; }
     }
 
+    function canSpawnBlobWorker(timeoutMs) {
+        return new Promise(resolve => {
+            if (typeof Worker === 'undefined') { resolve(false); return; }
+            let url = null, w = null, done = false;
+            const finish = ok => {
+                if (done) return;
+                done = true;
+                if (w) { try { w.terminate(); } catch (e) {} }
+                if (url) { try { URL.revokeObjectURL(url); } catch (e) {} }
+                resolve(ok);
+            };
+            try {
+                url = URL.createObjectURL(new Blob(['self.postMessage(1);'], { type: 'text/javascript' }));
+                w = new Worker(url);
+            } catch (e) { finish(false); return; }
+            w.onmessage = () => finish(true);
+            w.onerror = () => finish(false);
+            setTimeout(() => finish(false), timeoutMs || 1500);
+        });
+    }
+
     async function fetchWithTimeout(url, opts, ms) {
         const ctrl = new AbortController();
+        const external = opts && opts.signal;
+        const onExternalAbort = () => { try { ctrl.abort(); } catch (e) {} };
+        if (external) {
+            if (external.aborted) onExternalAbort();
+            else { try { external.addEventListener('abort', onExternalAbort, { once: true }); } catch (e) {} }
+        }
         let timer = setTimeout(() => ctrl.abort(), ms);
         let cleared = false;
         const clear = () => {
@@ -1586,6 +1679,7 @@
             cleared = true;
             clearTimeout(timer);
             timer = null;
+            if (external) { try { external.removeEventListener('abort', onExternalAbort); } catch (e) {} }
         };
         try {
             const res = await fetch(url, Object.assign({}, opts, { signal: ctrl.signal }));
@@ -1617,26 +1711,29 @@
         try { if (res && res._bwddClearTimeout) res._bwddClearTimeout(); } catch (e) {}
     }
 
-    // Chrome allows 6 concurrent HTTP/1.1 connections per origin (scheme + host
-    // + PORT), and the CDN is a single HTTP/1.1 host, so the page alone is pinned
-    // at 6. Extra lanes: `gm` (Tampermonkey's own pool) and `px:N` (a local helper
-    // port; each is a separate origin and the script bounds the fan-out).
     const PROXY_HOST = 'http://127.0.0.1:';
     const PROXY_BASE_PORT = 7010;
-    // Each localhost port is a separate HTTP/1.1 origin. Chromium's normal
-    // group limit is 6 per origin; it is not a 300-socket global cap. Keep a
-    // finite bridge fan-out so a misconfigured helper cannot create unbounded
-    // work, while allowing a bridge that exposes more ports to use them.
+
     const PROXY_MAX_PORTS = 64;
-    // A failing port is parked, not deleted: a wide burst can fail every port at
-    // once, and deleting them collapses the run onto the 6-socket page lane.
+
     const PROXY_ERROR_PARK = 12;
     const PROXY_PARK_MAX = 5;
     const PROXY_PARK_MS = 4000;
+    const PROXY_RETIRE_MS = 90000;
     let gmUsable = (typeof GM_xmlhttpRequest === 'function');
+
+    let proxyRealmBlocked = false;
     const proxyPorts = [];
     const proxyPortSources = new Map();
-    const retiredProxyPorts = new Set();
+
+    const retiredProxyPorts = new Map();
+    function proxyRetireMs() {
+        try {
+            const v = Number(window.__bwddProxyRetireMs);
+            if (isFinite(v) && v >= 0) return v;
+        } catch (e) {}
+        return PROXY_RETIRE_MS;
+    }
 
     const laneStats = {};
     function addLane(name) {
@@ -1651,20 +1748,11 @@
     addLane('page');
     addLane('gm');
 
-    // Chrome keys its socket pool by *site*, so a subdomain of a host we can
-    // already reach buys nothing; "host." (trailing dot) is a distinct host and
-    // gets its own pool. The signed policy covers a path wildcard, so the dot
-    // cannot break the signature, but whether CloudFront serves it is not
-    // knowable in advance, so the lane self-verifies on a real page and a
-    // rejection costs one request.
     let dotLaneEnabled = false;
     function dottedUrl(url) {
-        // Dot the HOSTNAME only: appending it to the authority would give
-        // "host:8443." and corrupt the port. The rest of
-        // the URL is left byte-identical so the signed query is untouched.
-        //   https://a.example.com:8443/x -> https://a.example.com.:8443/x
+
         return url.replace(/^(https?:\/\/)([^/?#:]+)(:\d+)?/, (m, scheme, hostname, port) => {
-            if (hostname.endsWith('.') || /^[\d.]+$/.test(hostname)) return m; // already dotted / an IP
+            if (hostname.endsWith('.') || /^[\d.]+$/.test(hostname)) return m;
             return scheme + hostname + '.' + (port || '');
         });
     }
@@ -1673,6 +1761,8 @@
         try {
             const res = await fetchWithTimeout(dottedUrl(probeUrl), { credentials: 'omit' }, 8000);
             if (res && res.ok) {
+
+                await releaseResponse(res);
                 dotLaneEnabled = true;
                 addLane('dot');
                 const dottedHost = (dottedUrl(probeUrl).match(/^https?:\/\/([^/?#]+)/) || [])[1] || '';
@@ -1682,6 +1772,7 @@
                 }
                 return true;
             }
+            await releaseResponse(res);
             if (BWDD_DEBUG) {
                 console.info('[bwdd] trailing-dot lane off (probe returned HTTP ' +
                     (res && res.status) + ')');
@@ -1692,12 +1783,6 @@
         return false;
     }
 
-    // HTTP/2 edge-mirror lane (self-verifying, strictly opt-in). The CDN answers
-    // "http/1.1 only" over ALPN, which is what makes the 6-socket cap bind; a host
-    // speaking HTTP/2 multiplexes many streams over one connection (measured: 100
-    // concurrent, ~8.9x the direct path). It is the only route past the cap with
-    // nothing running locally, but it sends the signed URL through whoever runs
-    // the mirror, so it stays opt-in. See bw-edge-mirror.js.
     let edgeUrl = '';
     let edgeToken = '';
     let edgeLaneEnabled = false;
@@ -1747,7 +1832,6 @@
     }
 
     function edgeUrlFor(url) {
-        // Same path and signed query, different front-end.
         return edgeUrl + url.replace(/^https?:\/\/[^/]+/, '');
     }
 
@@ -1761,26 +1845,36 @@
             if (onlineOnly && !proxyPortOnline(p)) continue;
             const st = laneStats['px:' + p];
             if (st && st.parkUntil > now) continue;
-            out.push({ name: 'px:' + p, kind: 'proxy', port: p });
+            out.push({
+                name: 'px:' + p, kind: 'proxy', port: p,
+                pathUpstream: proxyPortUsesPathUpstream(p),
+            });
         }
         return out;
     }
-    // Six everywhere except the edge mirror, which multiplexes many streams over
-    // one HTTP/2 connection, so it should absorb proportionally more traffic.
+
     function laneCapacity(L) {
         return L && L.kind === 'edge' ? 100 : 6;
     }
-    // Sizes the prefetch window: a small multiple of the real socket capacity.
+
+    const CHROMIUM_SOCKETS_PER_PROCESS = 256;
+    const CONTROL_PLANE_SOCKET_RESERVE = 16;
+    const MAX_DATA_PLANE_SOCKETS = CHROMIUM_SOCKETS_PER_PROCESS - CONTROL_PLANE_SOCKET_RESERVE;
+
     function fetchSocketBudget(onlineOnly) {
+        let n = 0;
+        for (const L of allLanes(onlineOnly)) n += laneCapacity(L);
+        n = Math.min(n, MAX_DATA_PLANE_SOCKETS);
+        return n;
+    }
+
+    function rawSocketBudget(onlineOnly) {
         let n = 0;
         for (const L of allLanes(onlineOnly)) n += laneCapacity(L);
         return n;
     }
 
-    // NOTE: named gmBlobFetch, not gmFetch, the stats section further down
-    // already declares a `gmFetch` in this same scope, and a duplicate function
-    // declaration hoists with the *last* one winning for the whole scope.
-    function gmBlobFetch(url, timeoutMs) {
+    function gmBlobFetch(url, timeoutMs, headers) {
         return new Promise((resolve, reject) => {
             let settled = false;
             const fail = (msg) => {
@@ -1792,6 +1886,7 @@
                 GM_xmlhttpRequest({
                     method: 'GET',
                     url,
+                    headers: headers || undefined,
                     timeout: timeoutMs || 45000,
                     responseType: 'blob',
                     onload: (r) => {
@@ -1801,7 +1896,8 @@
                         if (body instanceof ArrayBuffer) body = new Blob([body], { type: 'image/jpeg' });
                         if (!(body instanceof Blob)) { fail('GM_xhr: no blob body'); return; }
                         const ok = r.status >= 200 && r.status < 300;
-                        resolve({ ok, status: r.status, blob: async () => body, _lane: 'gm' });
+                        resolve({ ok, status: r.status, blob: async () => body,
+                            headers: gmHeaderShim(r.responseHeaders), _lane: 'gm' });
                     },
                     onerror: () => fail('GM_xhr: request failed'),
                     ontimeout: () => fail('GM_xhr: timeout'),
@@ -1811,12 +1907,40 @@
         });
     }
 
-    // Which hosts the bridge's proxy ports will fetch: it rewrites the request
-    // onto x-bwdd-upstream and refuses any host outside its own allowlist, so a
-    // port is only usable for a CDN the bridge accepts ("*" = generic). A bridge
-    // too old to advertise the list is assumed to serve only the BookWalker CDN,
-    // which keeps an existing setup working without aiming a CMOA path at a host
-    // that would answer from the wrong CDN.
+    function gmHeaderShim(raw) {
+        const text = String(raw || '');
+        return {
+            get(name) {
+                const want = String(name || '').toLowerCase();
+                for (const line of text.split(/\r?\n/)) {
+                    const ix = line.indexOf(':');
+                    if (ix === -1) continue;
+                    if (line.slice(0, ix).trim().toLowerCase() === want) return line.slice(ix + 1).trim();
+                }
+                return null;
+            },
+        };
+    }
+
+    async function loopbackJson(url, timeoutMs) {
+        if (!proxyRealmBlocked) {
+            try {
+                const r = await fetchWithTimeout(url, { credentials: 'omit', cache: 'no-store' }, timeoutMs);
+                if (r.ok) return await r.json();
+            } catch (e) { }
+        }
+
+        if (typeof GM_xmlhttpRequest !== 'function') return null;
+        try {
+            const res = await gmBlobFetch(url, timeoutMs || 2500);
+            if (!res || !res.ok) return null;
+            const blob = await res.blob();
+            const j = JSON.parse(await blob.text());
+            proxyRealmBlocked = true;
+            return j;
+        } catch (e) { return null; }
+    }
+
     let proxyUpstreamPatterns = ['bw-bv-epubs.bookwalker.jp'];
     let proxyDefaultHost = 'bw-bv-epubs.bookwalker.jp';
     function setProxyUpstreams(list, defaultUpstream) {
@@ -1865,8 +1989,22 @@
         return n;
     }
 
-    function addProxyPorts(list, source) {
+    const PATH_UPSTREAM_PREFIX = '/_bwdd/';
+    const pathUpstreamSources = new Set();
+
+    function proxyPortUsesPathUpstream(port) {
+        const sources = proxyPortSources.get(port);
+        if (!sources) return false;
+        for (const source of sources) {
+            if (pathUpstreamSources.has(source)) return true;
+        }
+        return false;
+    }
+
+    function addProxyPorts(list, source, options) {
         const key = source || 'legacy';
+        if (options && options.pathUpstream) pathUpstreamSources.add(key);
+        else pathUpstreamSources.delete(key);
         const advertised = new Set();
         for (const raw of (Array.isArray(list) ? list : [])) {
             const port = parseInt(raw, 10);
@@ -1882,7 +2020,13 @@
         }
         pruneProxyPorts();
         for (const port of advertised) {
-            if (retiredProxyPorts.has(port)) continue;
+            if (retiredProxyPorts.has(port)) {
+                if (retiredProxyPorts.get(port) > Date.now()) continue;
+
+                retiredProxyPorts.delete(port);
+                const st = laneStats['px:' + port];
+                if (st) { st.parks = 0; st.errors = 0; st.parkUntil = 0; }
+            }
             if (!proxyPorts.includes(port) && activeProxyPortCount() < PROXY_MAX_PORTS) {
                 proxyPorts.push(port);
                 addLane('px:' + port);
@@ -1906,6 +2050,7 @@
     }
 
     function clearProxySource(source) {
+        pathUpstreamSources.delete(source);
         for (const [port, sources] of proxyPortSources) {
             sources.delete(source);
             if (!sources.size) proxyPortSources.delete(port);
@@ -1913,81 +2058,77 @@
         pruneProxyPorts();
     }
 
-    // mokuro-bridge doubles as an accelerator: it serves the CDN on extra
-    // localhost ports (each its own 6-socket origin) advertised in /health, so a
-    // user already running it for OCR gets those lanes with no setup.
-    // Downloading never *depends* on it, no bridge simply means no lanes.
     async function probeBridgeFetchProxy() {
+
+        const j = await loopbackJson(MOKURO_BRIDGE_URL + '/health', 2500);
+
+        if (!j) return;
         clearProxySource('bridge');
-        try {
-            const r = await fetchWithTimeout(MOKURO_BRIDGE_URL + '/health',
-                { cache: 'no-store' }, 2500);
-            if (!r.ok) return;
-            const j = await r.json();
-            if (j && (j.fetchUpstreams || j.upstream)) {
-                setProxyUpstreams(j.fetchUpstreams, j.upstream);
-            }
-            if (j && Array.isArray(j.fetchProxyPorts) && j.fetchProxyPorts.length) {
-                addProxyPorts(j.fetchProxyPorts, 'bridge');
-            }
-        } catch (e) { /* bridge not running */ }
+        if (j.fetchUpstreams || j.upstream) {
+            setProxyUpstreams(j.fetchUpstreams, j.upstream);
+        }
+        if (Array.isArray(j.fetchProxyPorts) && j.fetchProxyPorts.length) {
+
+            addProxyPorts(j.fetchProxyPorts, 'bridge', { pathUpstream: !!j.fetchPathUpstream });
+        }
     }
 
-    // Discover the optional local fetch proxy. If the helper is not running this
-    // is one failed request to a closed local port and the run proceeds on the
-    // page + gm lanes exactly as before. If it had to move off 7010 (port in use),
-    // point the script at it with `window.__bwddProxyBasePort = 7100;`.
     async function probeFetchProxy() {
         return await discoverProxyPorts();
     }
 
-    // Re-run discovery so the panel's pre-flight indicator lights up bridge ports
-    // that started *after* the page loaded; source ownership and retirement decide
-    // which lanes remain selectable.
+    let discoveryInFlight = null;
+
     async function discoverProxyPorts() {
-        clearProxySource('helper');
+        if (discoveryInFlight) return await discoveryInFlight;
+        discoveryInFlight = discoverProxyPortsOnce();
+        try { return await discoveryInFlight; }
+        finally { discoveryInFlight = null; }
+    }
+
+    async function discoverProxyPortsOnce() {
         let basePort = PROXY_BASE_PORT;
         try {
             if (typeof window !== 'undefined' && window.__bwddProxyBasePort) {
                 basePort = parseInt(window.__bwddProxyBasePort, 10) || PROXY_BASE_PORT;
             }
         } catch (e) {}
-        try {
-            const r = await fetchWithTimeout(PROXY_HOST + basePort + '/__bwdd_health',
-                { credentials: 'omit', cache: 'no-store' }, 800);
-            if (r.ok) {
-                const j = await r.json();
-                if (j && j.bwddFetchProxy) {
-                    if (Array.isArray(j.upstreams) && j.upstreams.length) setProxyUpstreams(j.upstreams);
-                    addProxyPorts(
-                        Array.isArray(j.portList) && j.portList.length
-                            ? j.portList
-                            : Array.from(
-                                { length: Math.min(PROXY_MAX_PORTS, j.ports || 1) },
-                                (_, i) => basePort + i),
-                        'helper'
-                    );
-                }
+
+        const helper = (async () => {
+            const j = await loopbackJson(PROXY_HOST + basePort + '/__bwdd_health', 800);
+            if (j && j.bwddFetchProxy) {
+                clearProxySource('helper');
+                if (Array.isArray(j.upstreams) && j.upstreams.length) setProxyUpstreams(j.upstreams);
+                addProxyPorts(
+                    Array.isArray(j.portList) && j.portList.length
+                        ? j.portList
+                        : Array.from(
+                            { length: Math.min(PROXY_MAX_PORTS, j.ports || 1) },
+                            (_, i) => basePort + i),
+                    'helper',
+                    { pathUpstream: !!j.pathUpstream }
+                );
             }
-        } catch (e) { /* helper not running */ }
-        await probeBridgeFetchProxy();
+        })();
+        await Promise.all([helper, probeBridgeFetchProxy()]);
         return proxyPorts;
     }
 
-    // Last known bridge reachability, mirrored out of buildUI's poll, for the
-    // bridge/OCR status shown in the panel; the per-port source map decides which
-    // discovered proxy lanes are usable now.
     let laneBridgeOnline = false;
 
     function capabilitySummary() {
         const lanes = allLanes(true);
         const ports = lanes.filter(l => l.kind === 'proxy').length;
         const sockets = fetchSocketBudget(true);
+        const rawSockets = rawSocketBudget(true);
         const offlineSockets = 6 + (gmUsable ? 6 : 0) + (dotLaneEnabled ? 6 : 0) +
             (edgeLaneEnabled ? 100 : 0);
         return {
             ports,
             sockets,
+            rawSockets,
+
+            socketsClamped: rawSockets > sockets,
             withoutBridge: offlineSockets,
             effectiveSockets: sockets,
             workers: workerPoolSize(),
@@ -1998,14 +2139,8 @@
         };
     }
 
-    // Least-*utilised* lane wins (in-flight divided by capacity), so the 6-socket
-    // lanes fill up while the edge mirror keeps absorbing work; the tie-break
-    // rotates so even a low-concurrency run touches every lane.
     let laneRR = 0;
-    // allowProxy=false keeps a request off the local fetch-proxy lanes: they are
-    // not transparent forwarders, so a port advertised for one store's CDN would
-    // answer every other store's path from the wrong host (a 404 at best). A
-    // caller fetching a CDN the proxy was not configured for must opt out.
+
     function pickLane(allowProxy) {
         let lanes = allLanes(true);
         if (allowProxy === false) {
@@ -2024,17 +2159,17 @@
     }
 
     function proxyUrlFor(port, url) {
-        // Same path + signed query, different origin.
         return PROXY_HOST + port + url.replace(/^https?:\/\/[^/]+/, '');
     }
 
-    // A failing lane is parked (helper port) or retired rather than deleted
-    // outright: a wide burst can fail every lane at once, and dropping them
-    // collapses the run onto the page lane.
+    function proxyPathUrlFor(port, host, url) {
+        return PROXY_HOST + port + PATH_UPSTREAM_PREFIX + host + url.replace(/^https?:\/\/[^/?#]+/, '');
+    }
+
     function laneRetireLimit(lane) {
         if (lane.kind === 'gm') return 5;
         if (lane.kind === 'proxy') return PROXY_ERROR_PARK;
-        return 8;   // edge, dot
+        return 8;
     }
 
     function retireLane(lane, err) {
@@ -2056,49 +2191,89 @@
                 const ix = proxyPorts.indexOf(lane.port);
                 if (ix !== -1) proxyPorts.splice(ix, 1);
                 proxyPortSources.delete(lane.port);
-                retiredProxyPorts.add(lane.port);
+                retiredProxyPorts.set(lane.port, Date.now() + proxyRetireMs());
                 console.warn('[bwdd] fetch proxy port ' + lane.port + ' retired after repeated parks');
             }
         }
     }
 
-    async function laneAttempt(lane, url, timeoutMs) {
+    async function laneAttempt(lane, url, timeoutMs, signal) {
         const to = timeoutMs || 45000;
         if (lane.kind === 'gm') return await gmBlobFetch(url, to);
         if (lane.kind === 'edge') {
             const opts = { credentials: 'omit' };
             if (edgeToken) opts.headers = { 'x-bwdd-token': edgeToken };
-            return await fetchWithTimeout(edgeUrlFor(url), opts, to);
+            return await fetchWithTimeout(edgeUrlFor(url), Object.assign({ signal: signal }, opts), to);
         }
         if (lane.kind === 'dot') {
-            return await fetchWithTimeout(dottedUrl(url), { credentials: 'omit' }, to);
+            return await fetchWithTimeout(dottedUrl(url), { credentials: 'omit', signal: signal }, to);
         }
         if (lane.kind === 'proxy') {
-            // The proxy carries only path + query, so it must be told which CDN
-            // the bytes come from. The bridge rejects any host outside its
-            // allowlist with a JSON 403, which laneFetch treats as a lane failure
-            // rather than an answer from the CDN. A request for the CDN the
-            // bridge already defaults to sends no header (so no CORS preflight);
-            // only a different CDN names itself, which lets one bridge serve
-            // several stores without a second instance.
+
             const opts = { credentials: 'omit' };
             const host = hostOf(url);
-            if (host && host !== proxyDefaultHost) opts.headers = { 'x-bwdd-upstream': host };
-            const res = await fetchWithTimeout(proxyUrlFor(lane.port, url), opts, to);
-            if (res.status === 403) {
-                const ct = res.headers && res.headers.get && res.headers.get('content-type');
-                if (ct && ct.indexOf('application/json') !== -1) {
-                    await releaseResponse(res);
-                    throw new Error('fetch proxy refused host ' + host);
+
+            let target = proxyUrlFor(lane.port, url);
+            if (host && lane.pathUpstream) target = proxyPathUrlFor(lane.port, host, url);
+            else if (host && host !== proxyDefaultHost) opts.headers = { 'x-bwdd-upstream': host };
+
+            const gmHeaders = (host && !lane.pathUpstream) ? { 'x-bwdd-upstream': host } : null;
+            const viaGm = async () => await gmProxyRequest(target, host, to, gmHeaders);
+            if (proxyRealmBlocked) return await viaGm();
+            try {
+                if (signal) opts.signal = signal;
+                const res = await fetchWithTimeout(target, opts, to);
+                if (res.status === 403) {
+                    const ct = res.headers && res.headers.get && res.headers.get('content-type');
+                    if (ct && ct.indexOf('application/json') !== -1) {
+                        await releaseResponse(res);
+                        throw new Error('fetch proxy refused host ' + host);
+                    }
                 }
+                if (res.status >= 500 && res.status <= 504) {
+                    await releaseResponse(res);
+                    throw new Error('fetch proxy transport error ' + res.status);
+                }
+                return res;
+            } catch (e) {
+
+                const gm = await viaGm();
+                if (!gm) throw e;
+                proxyRealmBlocked = true;
+                console.warn('[bwdd] this page\u2019s CSP refuses http:// loopback \u2014 ' +
+                    'the accelerator now rides GM_xmlhttpRequest');
+                return gm;
             }
-            if (res.status >= 500 && res.status <= 504) {
-                await releaseResponse(res);
-                throw new Error('fetch proxy transport error ' + res.status);
-            }
-            return res;
         }
-        return await fetchWithTimeout(url, { credentials: 'omit' }, to);
+        return await fetchWithTimeout(url, { credentials: 'omit', signal: signal }, to);
+    }
+
+    function resetProxyRealmFlag() { proxyRealmBlocked = false; }
+
+    let gmProxyLastNote = '';
+    function gmProxyNote(why) {
+        if (why === gmProxyLastNote) return;
+        gmProxyLastNote = why;
+        console.warn('[bwdd] fetch proxy lane unusable: ' + why);
+    }
+
+    async function gmProxyRequest(target, host, timeoutMs, headers) {
+        if (typeof GM_xmlhttpRequest !== 'function') return null;
+        let gm;
+        try { gm = await gmBlobFetch(target, timeoutMs, headers); }
+        catch (e) {
+            gmProxyNote('unreachable: ' + safeLogText((e && e.message) || e));
+            return null;
+        }
+        if (!gm.ok) gmProxyNote('HTTP ' + gm.status + ' for host ' + (host || '(default)'));
+        const ct = gm.headers && gm.headers.get && gm.headers.get('content-type');
+        if (gm.status === 403 && ct && ct.indexOf('application/json') !== -1) {
+            throw new Error('fetch proxy refused host ' + host);
+        }
+        if (gm.status >= 500 && gm.status <= 504) {
+            throw new Error('fetch proxy transport error ' + gm.status);
+        }
+        return gm;
     }
 
     function tagLane(res, name) {
@@ -2108,12 +2283,22 @@
 
     async function laneFetch(url, timeoutMs, opts) {
         const lane = pickLane(opts && opts.allowProxy);
-        const st = laneStats[lane.name];
         const isPage = lane.kind === 'page';
+        const signal = opts && opts.signal;
+        try {
+            return await laneAttemptRated(lane, url, timeoutMs, signal);
+        } catch (e) {
+            if (isPage) throw e;
+        }
+        return await onPageLane(url, timeoutMs, signal);
+    }
+
+    async function laneAttemptRated(lane, url, timeoutMs, signal) {
+        const st = laneStats[lane.name];
         const countsNonOk = lane.kind === 'edge' || lane.kind === 'dot';
         st.inflight++;
         try {
-            const res = await laneAttempt(lane, url, timeoutMs);
+            const res = await laneAttempt(lane, url, timeoutMs, signal);
             if (res && res.status >= 500 && res.status <= 504 &&
                 (lane.kind === 'edge' || lane.kind === 'dot' || lane.kind === 'gm')) {
                 await releaseResponse(res);
@@ -2123,18 +2308,39 @@
             else if (countsNonOk && ++st.errors >= laneRetireLimit(lane)) retireLane(lane, null);
             return tagLane(res, lane.name);
         } catch (e) {
-            if (isPage) throw e;
             if (++st.errors >= laneRetireLimit(lane)) retireLane(lane, e);
+            throw e;
         } finally {
             st.inflight--;
         }
-        return await onPageLane(url, timeoutMs);
     }
 
-    async function onPageLane(url, timeoutMs) {
+    function proxyLaneAvailable() {
+        return allLanes(true).some(L => L.kind === 'proxy');
+    }
+
+    async function proxyLaneFetch(url, timeoutMs) {
+
+        if (!proxyCanServe(hostOf(url))) return null;
+        const px = allLanes(true).filter(L => L.kind === 'proxy');
+        if (!px.length) return null;
+
+        const n = px.length;
+        let best = px[0], bestScore = Infinity;
+        for (let i = 0; i < n; i++) {
+            const L = px[(laneRR + i) % n];
+            const score = laneStats[L.name].inflight / laneCapacity(L);
+            if (score < bestScore) { bestScore = score; best = L; }
+        }
+        laneRR = (laneRR + 1) % n;
+        try { return await laneAttemptRated(best, url, timeoutMs); }
+        catch (e) { return null; }
+    }
+
+    async function onPageLane(url, timeoutMs, signal) {
         laneStats.page.inflight++;
         try {
-            return tagLane(await fetchWithTimeout(url, { credentials: 'omit' }, timeoutMs || 45000), 'page');
+            return tagLane(await fetchWithTimeout(url, { credentials: 'omit', signal: signal }, timeoutMs || 45000), 'page');
         } finally {
             laneStats.page.inflight--;
         }
@@ -2145,10 +2351,6 @@
         s.done++; s.ms += ms; s.bytes += (bytes || 0);
     }
 
-    // Deliberately no per-lane pages/sec: a lane has no wall-clock window of its
-    // own, so dividing pages by *summed request time* just reports 1/latency (a
-    // real run printed 0.7/s per lane while the batch did 15 pages/s, ~21 requests
-    // in flight). Share plus mean latency shows whether a lane is pulling weight.
     function laneSummary() {
         const out = {};
         let total = 0;
@@ -2165,10 +2367,7 @@
         }
         return out;
     }
-    // Collapse concurrent requests for the same key onto one promise: retry rounds
-    // and duplicated manifest entries legitimately ask for the same page twice
-    // otherwise. The entry is dropped as soon as it settles, so a later retry
-    // round can still re-fetch a page that genuinely failed.
+
     function dedupeInflight(map, key, start) {
         let p = map.get(key);
         if (!p) {
@@ -2180,10 +2379,8 @@
         return p;
     }
 
+async function decodeBlobMain(blob, seeds, q, fmt) {
 
-    async function decodeBlobMain(blob, seeds, q, fmt) {
-        // Same approach as workerMain: blit tiles straight from the decoded
-        // bitmap instead of round-tripping the frame through getImageData.
         const codec = fmt ? { type: fmt, ext: IMAGE_CODEC.ext } : IMAGE_CODEC;
         const bmp = await createImageBitmap(blob);
         const W = bmp.width, H = bmp.height;
@@ -2218,7 +2415,7 @@
             outCanvas.toBlob(b => b ? res2(b) : rej(new Error('toBlob')), codec.type, q));
     }
 
-    let rateLimitCooldownUntil = 0;
+let rateLimitCooldownUntil = 0;
     let consecutiveBlocks = 0;
     function corsLikeError(e, status) {
         if (status === 429 || status === 503) return true;
@@ -2249,19 +2446,15 @@
     const REQS_PER_POLICY_RENEW = 100;
     function authRequestBudgetExhausted() { return reqsSinceAuth >= REQS_PER_POLICY_RENEW; }
     function resetAuthBudget() { reqsSinceAuth = 0; }
-    function cdnBaseCandidates(fileKey, relPath) {
+
+function cdnBaseCandidates(fileKey, relPath) {
         const out = [];
         const add = (u) => { if (u && out.indexOf(u) === -1) out.push(u); };
         if (fileKey && state.fileBases && state.fileBases[fileKey]) add(state.fileBases[fileKey]);
         if (state.baseUrl) {
             const m = state.baseUrl.match(/^(.*?\/SVGA\/)(?:[^/]+\/)?$/);
             if (m) {
-                // Pick the variant this rel actually lives in FIRST. Captures:
-                // cover/front-matter/shared pages sit under SVGA/shared while
-                // the body pages sit under SVGA/normal_default, a mismatched
-                // first guess 403s and (in the old code) stalled the whole run
-                // on breaker cooldowns. Guessing right means the first probe
-                // usually 200s.
+
                 const isShared = /(^|\/)shared\//.test(relPath || '');
                 const variants = isShared ? ['shared', 'normal_default'] : ['normal_default', 'shared'];
                 for (const v of variants) add(m[1] + v + '/');
@@ -2277,23 +2470,15 @@
             try {
                 const res = await cdnFetch((attempt) => {
                     const base = bases[bi] + relPath + '?' + authQuery(state.auth);
-                    // Only retries carry a cache-buster, so the first attempt
-                    // stays byte-identical to what the viewer itself requests.
+
                     return attempt > 0 ? base + '&_bwr=' + attempt + '-' + Date.now().toString(36) : base;
                 }, timeoutMs || 45000);
-                // Remember which base dir actually served this page family so
-                // later pages skip the probe chain entirely (state.fileBases is
-                // reset per run in resetRunState).
+
                 if (fileKey && state.fileBases && !state.fileBases[fileKey]) state.fileBases[fileKey] = bases[bi];
                 return res;
             } catch (e) {
                 lastErr = e;
-                // 403 with a still-valid policy = this base-dir guess does not
-                // host the file (wrong SVGA variant). That is NOT a rate limit:
-                // move to the next candidate immediately, no breaker, no auth
-                // churn. (Genuinely expired policies are retried inside
-                // cdnFetch, and prefetchOne rotates auth when every candidate
-                // path-denies.)
+
                 if (e && e.pathDenied) continue;
                 if (breakerOpen()) {
                     await waitOutCooldown();
@@ -2306,12 +2491,7 @@
 
     async function cdnFetch(urlBuilder, timeoutMs) {
         await waitOutCooldown();
-        // Policy-clock renewal: every /browserWebApi/pb response mints a
-        // CloudFront policy whose DateLessThan is ~60 s out (verified on all
-        // live captures), and no capture shows a per-policy *request* quota on
-        // valid paths. Refresh when the current policy is about to lapse OR the
-        // legacy request-count budget trips; count alone was refreshing far too
-        // eagerly during 128-wide bursts.
+
         if ((!authLooksFresh() || reqsSinceAuth >= REQS_PER_POLICY_RENEW) && authRefreshPromise === null) {
             try {
                 const before = authPolicySig();
@@ -2334,25 +2514,13 @@
             }
             lastStatus = status; lastErr = err;
             if (status === 403) {
-                // A 403 while the policy still has runway is a PATH denial: this
-                // base-dir guess does not host the file (captures show the same
-                // token 200s under .../SVGA/shared while bare .../SVGA 403s
-                // forever). Refreshing auth cannot fix a wrong path and must not
-                // trip the global breaker, so signal pathDenied. Only a lapsed
-                // policy is rotated and retried first.
+
                 if (!authLooksFresh() && attempt < 2) {
                     const before = authPolicySig();
                     try { await refreshAuthBest(); } catch (e2) {}
                     if (authPolicySig() !== before) { reqsSinceAuth = 0; continue; }
                 }
-                // A fresh policy that still 403s is usually BookWalker's cached S3
-                // error page for one object, per-URL and transient (in a
-                // 308-request capture every 403 cleared on a plain retry), not a
-                // path denial. One jittered retry before concluding the path
-                // is wrong, so one bad edge entry cannot cost a whole page. The
-                // retry carries a cache-buster: the signed policy's Resource is
-                // a path wildcard, so the query string is not part of the
-                // signature and the extra param cannot invalidate it.
+
                 if (attempt === 0) {
                     await sleepMs(120 + Math.random() * 240);
                     continue;
@@ -2377,11 +2545,13 @@
         e4.status = lastStatus;
         throw e4;
     }
-    function effectiveBurst(base) {
+
+function effectiveBurst(base) {
         if (consecutiveBlocks === 0) return base;
         return Math.max(4, Math.floor(base / (consecutiveBlocks + 1)));
     }
-    function authPolicySig() {
+
+function authPolicySig() {
         try { return (state.auth && state.auth['Policy'] || '') + '|' + (state.auth && state.auth['Signature'] || ''); }
         catch (e) { return ''; }
     }
@@ -2393,15 +2563,6 @@
         return await decodeBlobMain(blob, seeds, q, fmt);
     }
 
-    // =====================================================================
-    // 7. Manga stats bridge (manga-kotoba + LearnNatively)
-    // =====================================================================
-    // Cross-origin fetch for the stats bridges. Neither site is usable with a
-    // plain page fetch: learnnatively.com sends no CORS headers, and
-    // manga-kotoba.com stopped reflecting the Origin (a bare fetch now fails with
-    // "No 'Access-Control-Allow-Origin' header"). GM_xmlhttpRequest bypasses CORS
-    // but only if the user accepted the permission; otherwise it falls back to a
-    // public CORS proxy so the cards still work.
     const CORS_PROXIES = [
         'https://corsproxy.io/?url=',
         'https://api.allorigins.win/raw?url=',
@@ -2417,10 +2578,9 @@
                         ontimeout: () => reject(new Error('GM_xhr: Timeout')),
                     });
                 });
-            } catch (e) { /* fall through to proxies */ }
+            } catch (e) { }
         }
-        // Bounded like the other two paths: without a signal a host that accepts
-        // the connection and never answers leaves the card pending forever.
+
         try {
             const ctrl = new AbortController();
             const timer = setTimeout(() => ctrl.abort(), timeoutMs);
@@ -2428,7 +2588,7 @@
                 const r = await fetch(url, { credentials: 'omit', signal: ctrl.signal });
                 return { status: r.status, text: await r.text() };
             } finally { clearTimeout(timer); }
-        } catch (e) { /* fall through to proxies */ }
+        } catch (e) { }
         for (const proxy of CORS_PROXIES) {
             try {
                 const ctrl = new AbortController();
@@ -2438,12 +2598,20 @@
                     r = await fetch(proxy + encodeURIComponent(url), { signal: ctrl.signal });
                     if (r.ok) return { status: r.status, text: await r.text() };
                 } finally { clearTimeout(timer); }
-            } catch (e) { /* try next proxy */ }
+            } catch (e) { }
         }
         throw new Error('fetch failed: ' + url.slice(0, 80));
     }
     function extractVolumeNumber(title) {
         const t = String(title || '');
+
+        const tail = t.match(/[（(]?\s*([0-9０-９]{1,4})\s*[）)]?\s*[巻話]?\s*$/);
+        if (tail) {
+            const digits = tail[1].replace(/[０-９]/g, c => String.fromCharCode(c.charCodeAt(0) - 0xFEE0));
+            return parseInt(digits, 10);
+        }
+        const kanjiTail = t.match(/([一二三四五六七八九十百]+)\s*[巻話]\s*$/);
+        if (kanjiTail) return kanjiNum(kanjiTail[1]);
         const full = t.match(/([0-9０-９]+)/);
         if (full) {
             const digits = full[1].replace(/[０-９]/g, c => String.fromCharCode(c.charCodeAt(0) - 0xFEE0));
@@ -2502,12 +2670,7 @@
             if (!links) return null;
             const norm = (x) => String(x || '').replace(/[\s　\u30fb・:：()（）]/g, '').toLowerCase();
             const target = norm(usedTitle);
-            // manga-kotoba's /series/ results wrap an entire card in the anchor,
-            // so anchor.textContent is far broader than the series name: scoring
-            // the whole anchor made a spin-off listed before the base series win
-            // merely by *containing* the name (幸色のワンルーム　外伝　正壊の名探偵
-            // beat 幸色のワンルーム). Match the card's own Japanese title, and
-            // break substring ties toward the closest (shortest) title.
+
             const titleOf = (a) => {
                 const h = a.querySelector('.japanese-title, .series-title, h3');
                 if (h) { const x = (h.textContent || '').trim(); if (x) return x; }
@@ -2562,7 +2725,8 @@
             cur = cur
                 .replace(/[\s　]*(文庫版|新装版|完全版|愛蔵版|廉価版|普及版|電子版|特装版|限定版|豪華版|分冊版|合本版|オンデマンド版|デジタル版|単行本版|ノベルズ版|ペーパーバック版)[\s　]*$/u, '')
                 .replace(/[\s　]*[(（]*(文庫|新装|完全|愛蔵|廉価|普及)[)）]*[\s　]*$/u, '')
-                .replace(/[\s　]*第?[一二三四五六七八九十百0-9０-９]*[巻話版編]?[\s　]*$/u, '')
+
+                .replace(/[\s　]*第?[0-9０-９一二三四五六七八九十百]+[巻話版編]?[\s　]*$/u, '')
                 .trim();
             push(cur);
             if (cur === before) break;
@@ -2593,8 +2757,8 @@
             const first = items[0];
             const sid = first.series_id.replace(/-/g, '').slice(0, 10);
             let volUrl = null, volTitle = null, level = null;
-            let matchedNo = null;      // which volume the resolved link actually is
-            let fallbackNearest = null; // nearest available volume when exact not found
+            let matchedNo = null;
+            let fallbackNearest = null;
             try {
                 const shtml = (await gmFetch('https://learnnatively.com/series/' + sid + '/')).text;
                 const sdoc = new DOMParser().parseFromString(shtml, 'text/html');
@@ -2603,7 +2767,7 @@
                     const parent = a.closest('.item, .subitems > div, li, div') || a;
                     const notice = parent.querySelector('.item-type-notice');
                     const numMatch = (notice ? notice.textContent : '') + ' ' + (a.getAttribute('title') || a.textContent);
-                    // Book #N (series page) is authoritative; fall back to title patterns
+
                     const m = numMatch.match(/Book\s*#?\s*(\d+)/i) || numMatch.match(/第?\s*(\d+)\s*巻/) ||
                              numMatch.match(/(\d+)\s*$/) || numMatch.match(/[（(]?([0-9０-９]{1,3})[）)]/);
                     const an = m ? parseInt(m[1].replace(/[０-９]/g, c => String.fromCharCode(c.charCodeAt(0) - 0xFEE0)), 10) : NaN;
@@ -2614,7 +2778,7 @@
                         break;
                     }
                     if (!isNaN(an)) {
-                        // nearest volume at or below the current one, as a fallback
+
                         if (!fallbackNearest || (an > fallbackNearest.an && an <= volumeNum) ||
                             (an <= volumeNum && (fallbackNearest.an > volumeNum || an > fallbackNearest.an))) {
                             fallbackNearest = { an, href: a.getAttribute('href'), title: a.getAttribute('title') || a.textContent.trim() };
@@ -2637,17 +2801,14 @@
             const lvlFromRating = first.rating ? first.rating.lvl : null;
             const tmpFlag = first.rating ? !!(first.rating.temporary || first.rating.always_temporary) : false;
             const bookUrl = volUrl ? 'https://learnnatively.com' + volUrl : ('https://learnnatively.com' + first.url);
-            // enriched from the search API response, no extra fetch needed
+
             const rd = first.review_data || {};
             const badges = [];
             if (first.wanikani) badges.push('WK');
             if (first.book_club) badges.push('BC');
-            // reading/finished counts still come from the book page
+
             const meta = await fetchLnBookMeta(bookUrl);
-            // Label the card with the *resolved* book (volTitle/matchedNo), not
-            // the raw first search hit: the API ranks by popularity, so for
-            // 幸色のワンルーム it returns "幸色のワンルーム 1" even when the
-            // resolved book is volume 3, and the card read "… 1".
+
             return Object.assign({
                 seriesUrl: 'https://learnnatively.com/series/' + sid + '/',
                 bookUrl,
@@ -2693,9 +2854,7 @@
             return out;
         } catch (e) { return null; }
     }
-    // Fire both catalog lookups at once and render each card as soon as its own
-    // lookup resolves, so a slow or missing site only delays its own card. Both
-    // lookups swallow their failures and resolve to null, which renders nothing.
+
     function fetchAndRenderStats(statsEl, seriesTitle, volumeNum) {
         if (!statsEl || !seriesTitle) return;
         lookupMangaKotoba(seriesTitle, volumeNum)
@@ -2706,7 +2865,6 @@
             .catch(e => { if (BWDD_DEBUG) console.warn('[bwdd] LearnNatively lookup error:', safeLogText(e && e.message)); });
     }
 
-    // Card helpers (accessible: real links, labelled pills, dl rows)
     function el(tag, cls, text) {
         const n = document.createElement(tag);
         if (cls) n.className = cls;
@@ -2730,7 +2888,7 @@
         if (!container) return null;
         const old = container.querySelector('.bwdd-card[data-card="' + key + '"]');
         if (old) old.remove();
-        // buildFn may legitimately return null when there is nothing to show.
+
         const card = buildFn();
         if (!card) return null;
         card.dataset.card = key;
@@ -2751,7 +2909,7 @@
         card.appendChild(el('h3', null, kicker));
         return card;
     }
-    // Single lookup: [pill bg, JLPT hint]. Darkened for ≥4.5:1 white-text contrast.
+
     function levelInfo(level) {
         const l = Number(level);
         if (isNaN(l)) return ['#5b21b6', ''];
@@ -2800,10 +2958,9 @@
         const head = el('div', 'bwdd-ln-head');
         if (meta.childElementCount) head.appendChild(meta);
         if (ln.title) {
-            // If the title already carries the volume number ("…」 1", "…（２）",
-            // "…1巻"), don't repeat it as "· Vol. N".
+
             const titleHasVol = ln.volume != null && (() => {
-                // normalize full-width digits so （２） and 2 both match
+
                 const t = String(ln.title).replace(/[０-９]/g, c => String.fromCharCode(c.charCodeAt(0) - 0xFEE0));
                 return new RegExp('(^|[^0-9])' + ln.volume + '([^0-9]|$)').test(t) ||
                        new RegExp('[（(]' + ln.volume + '[）)]').test(t);
@@ -2815,7 +2972,6 @@
         if (head.childElementCount) card.appendChild(head);
         const bits = [];
         if (ln.avgRating != null) {
-            // Label the count: ratings when present, otherwise reviews.
             if (ln.ratings != null) {
                 bits.push(`★ ${Number(ln.avgRating).toFixed(1)} · ${Number(ln.ratings).toLocaleString()} ratings`);
             } else if (ln.reviews != null) {
@@ -2903,10 +3059,7 @@
         });
     }
 
-    // =====================================================================
-    // 8. Mokuro bridge client
-    // =====================================================================
-    const MOKURO_BRIDGE_URL = (() => {
+const MOKURO_BRIDGE_URL = (() => {
         const defaultUrl = 'http://127.0.0.1:62642';
         try {
             const marker = window.__BWDD_CLI__;
@@ -2917,40 +3070,23 @@
                     return parsed.toString().replace(/\/+$/, '');
                 }
             }
-        } catch (_) { /* malformed marker: retain the local default */ }
+        } catch (_) { }
         return defaultUrl;
     })();
     const MOKURO_BRIDGE_START_URL = 'bw-mokuro-bridge://start';
-    // Shown (via the run's catch-all) when the bridge cannot be reached.
     const MOKURO_BRIDGE_OFFLINE_MSG =
         'The Mokuro Bridge app is not running.\n\n' +
         'Get and start mokuro-bridge (github.com/GolyBidoof/mokuro-bridge) — its ' +
         'README shows the start command for your OS (macOS/Linux: ./run.sh from ' +
         'its folder), then click “Save and run through Mokuro” again.';
 
-    // Hysteresis so a single dropped /health probe (or a slow response during
-    // a heavy upload) can't flip the UI to "offline" and hide the bars. The
-    // dot/message only go grey after BRIDGE_FAIL_LIMIT consecutive failures.
     const BRIDGE_FAIL_LIMIT = 3;
     let bridgeConsecFail = 0;
-    // Strictly "did the last probe actually answer". bridgeHealth() below is
-    // deliberately sticky so the OCR button does not flap on one missed poll,
-    // but the pre-flight socket readout must not promise ports that are not
-    // reachable this instant, so it reads this instead.
+
     let bridgeReachableNow = false;
-    // Misses are only forgiven once the bridge has actually answered at least
-    // once. Without this a cold page load with no bridge advertises "online" for
-    // the first BRIDGE_FAIL_LIMIT polls, contradicting the socket readout.
+
     let bridgeEverReachable = false;
-    // One CSP-proof GET against the local bridge, shaped like a fetch Response
-    // so every caller keeps its `r.ok` / `r.status` / `r.json()` / `r.text()`
-    // code unchanged. ebookjapan serves `connect-src 'self' https: wss:` (no
-    // plain http:/ws:), so a page fetch to http://127.0.0.1:62642 is refused
-    // there while the same request is fine on BookWalker/CMOA. GM_xmlhttpRequest
-    // is issued by the userscript manager and is exempt from the page CSP, so it
-    // is tried first whenever the manager grants it, with the page fetch as the
-    // fallback. GM hands back the whole body at once, so this helper covers the
-    // read-only GET endpoints; mokuroBridgePost does the multipart writes.
+
     async function mokuroBridgeGet(url, timeoutMs = 5000) {
         if (typeof GM_xmlhttpRequest === 'function') {
             const gm = await new Promise((resolve, reject) => {
@@ -2973,11 +3109,7 @@
         }
         return await fetchWithTimeout(url, { cache: 'no-store' }, timeoutMs);
     }
-    // POST twin of mokuroBridgeGet for the multipart write endpoints
-    // (session/start, session/<id>/page, session/<id>/cover, finalize): same
-    // contract, GM_xmlhttpRequest first for the same CSP reason, fetchWithTimeout
-    // otherwise. The FormData goes over as `data` with no Content-Type set by
-    // hand, so Tampermonkey encodes the multipart body and boundary itself.
+
     async function mokuroBridgePost(url, timeoutMs, formData) {
         if (typeof GM_xmlhttpRequest === 'function') {
             const gm = await new Promise((resolve, reject) => {
@@ -2999,6 +3131,29 @@
         }
         return await fetchWithTimeout(url, { method: 'POST', body: formData }, timeoutMs);
     }
+
+    function bridgeHttpError(status, detail, action) {
+        const text = typeof detail === 'string' ? detail.trim() : '';
+        const err = new Error('Mokuro bridge ' + action + ' failed (HTTP ' + status + ')' +
+            (text ? ': ' + text : ''));
+        err.status = status;
+        err.detail = text;
+        return err;
+    }
+    async function bridgeErrorDetail(res) {
+        const text = await res.text().catch(() => '');
+        try {
+            const detail = (JSON.parse(text) || {}).detail;
+            if (typeof detail === 'string') return detail;
+            if (Array.isArray(detail)) {
+                return detail.map(d => (d && (d.msg || d.message)) || '').filter(Boolean).join('; ');
+            }
+        } catch (e) { }
+        return String(text || '').trim().slice(0, 300);
+    }
+    async function bridgeError(res, action) {
+        return bridgeHttpError(res.status, await bridgeErrorDetail(res), action);
+    }
     async function bridgeHealth() {
         try {
             const r = await mokuroBridgeGet(MOKURO_BRIDGE_URL + '/health', 2000);
@@ -3013,7 +3168,6 @@
             return bridgeEverReachable && bridgeConsecFail < BRIDGE_FAIL_LIMIT;
         }
     }
-    // Cached /health payload (upload backends, output dir, version…).
     let bridgeInfo = null;
     async function refreshBridgeInfo() {
         try {
@@ -3022,10 +3176,7 @@
         } catch (e) {}
         return null;
     }
-    // --- Generic upload-method support (mokuro-bridge >= 0.3) ---
-    // The bridge exposes GET /upload-methods listing every method plus the
-    // default; we pick the first configured one (or 'local') and remember its
-    // folder. Falls back to /health mega_configured on older bridges.
+
     let uploadMethods = null;
     async function fetchUploadMethods() {
         try {
@@ -3034,12 +3185,7 @@
         } catch (e) {}
         return null;
     }
-    // Resolve which upload method + destination folder to use:
-    // { method, folder, label }. The bridge's sticky default is reported only
-    // when it is actually usable: "local" is always configured, so picking the
-    // first *configured* method would always say "saving locally", while an
-    // unconfigured default (e.g. drive not set up) must not be advertised as
-    // the destination.
+
     async function mokuroUploadPlan() {
         const methods = uploadMethods || await fetchUploadMethods();
         if (methods && Array.isArray(methods.methods)) {
@@ -3055,12 +3201,11 @@
                 list[0];
             if (picked) return { method: picked.id, folder: picked.current_folder || null, label: picked.name || picked.id };
         }
-        // older bridge: only /health
+
         const info = bridgeInfo || await refreshBridgeInfo();
         if (info && info.mega_configured) return { method: 'mega', folder: info.mega_library_root || null, label: 'MEGA' };
         return { method: 'local', folder: info && info.output_dir || null, label: 'Local' };
     }
-    // Final decision for a run: the panel's pick wins, else the bridge default.
     async function resolveUploadChoice(ui) {
         const plan = await mokuroUploadPlan().catch(() => ({ method: null, folder: null, label: null }));
         let method = plan.method, folder = plan.folder;
@@ -3074,10 +3219,7 @@
 
     async function ensureBridgeRunning(timeoutMs = 15000) {
         if (await bridgeHealth()) return true;
-        // The extension adapter owns bridge discovery and startup. Never click
-        // the custom protocol from an automation page: that creates a browser
-        // permission prompt and turns a local bridge outage into a surprising
-        // UI side effect. The caller receives the same clear offline error.
+
         let bridgeManaged = false;
         try { bridgeManaged = !!(window.__BWDD_CLI__ && window.__BWDD_CLI__.bridgeManaged); } catch (e) {}
         if (!bridgeManaged) {
@@ -3092,14 +3234,12 @@
         }
         const start = Date.now();
         while (Date.now() - start < timeoutMs) {
-            await new Promise(r => setTimeout(r, 600));
+            await backgroundDelay(600);
             if (await bridgeHealth()) return true;
         }
         return false;
     }
-    // Wait for the bridge to report idle (busy=false, which also covers
-    // ocr_queue_depth > 0) before starting a capture, so a new run cannot
-    // interleave with OCR/upload work already in flight.
+
     async function waitForBridgeIdle(timeoutMs = 30000) {
         const start = Date.now();
         while (Date.now() - start < timeoutMs) {
@@ -3110,9 +3250,9 @@
                     if (!h.busy) return true;
                 }
             } catch (e) {}
-            await new Promise(res => setTimeout(res, 1000));
+            await backgroundDelay(1000);
         }
-        return false;   // still busy after the timeout, caller decides
+        return false;
     }
 
     function bridgeSessionPath(sessionId, suffix) {
@@ -3124,32 +3264,45 @@
         const fd = new FormData();
         fd.append('title', title || 'manga');
         const res = await mokuroBridgePost(MOKURO_BRIDGE_URL + '/session/start', 15000, fd);
-        const d = await res.json().catch(() => ({}));
-        if (!res.ok) throw new Error(d.detail || 'HTTP ' + res.status);
-        return d;
+        if (!res.ok) throw await bridgeError(res, 'session start');
+        return await res.json().catch(() => ({}));
     }
+
+    const PAGE_PUSH_RETRIES = 4;
     async function mokuroStreamPage(sessionId, blob, filename, pageNum) {
         const fd = new FormData();
         fd.append('page', blob, filename);
         fd.append('filename', filename);
         fd.append('page_num', String(pageNum));
-        const res = await mokuroBridgePost(bridgeSessionPath(sessionId, '/page'), 60000, fd);
-        const d = await res.json().catch(() => ({}));
-        if (!res.ok) throw new Error(d.detail || 'HTTP ' + res.status);
-        return d;
+        const url = bridgeSessionPath(sessionId, '/page');
+        for (let attempt = 0; ; attempt++) {
+            const res = await mokuroBridgePost(url, 60000, fd);
+            if (res.ok) {
+                const d = await res.json().catch(() => ({}));
+                if (d && d.already_present) d.cached = true;
+                return d;
+            }
+            const detail = await bridgeErrorDetail(res);
+            if (res.status === 409 && /already has completed OCR|already queued or present/i.test(detail)) {
+                return { ok: true, cached: true, already_present: true, detail: detail };
+            }
+            if (res.status === 409 && /currently being (OCR'd|ingested)/i.test(detail) &&
+                attempt < PAGE_PUSH_RETRIES) {
+                await backgroundDelay(250 * (attempt + 1));
+                continue;
+            }
+            throw bridgeHttpError(res.status, detail, 'page ' + pageNum + ' upload');
+        }
     }
-    // Early cover upload: push the first page to the destination as
-    // <title>.webp immediately, before OCR finishes, so the user sees upload
-    // activity at once. {method, localDir} must match the run's destination.
+
     async function mokuroUploadCover(sessionId, blob, opts = {}) {
         const fd = new FormData();
         fd.append('cover', blob, 'cover.jpg');
         if (opts.method) fd.append('upload_method', opts.method);
         if (opts.method === 'local' && opts.localDir) fd.append('local_dir', opts.localDir);
         const res = await mokuroBridgePost(bridgeSessionPath(sessionId, '/cover'), 120000, fd);
-        const d = await res.json().catch(() => ({}));
-        if (!res.ok) throw new Error((d && d.detail) || 'HTTP ' + res.status);
-        return d;
+        if (!res.ok) throw await bridgeError(res, 'cover upload');
+        return await res.json().catch(() => ({}));
     }
     async function mokuroStatus(sessionId) {
         try {
@@ -3158,13 +3311,9 @@
             return await res.json();
         } catch (e) { return null; }
     }
-    // Frames of the bridge's finalize NDJSON, shared so the live streaming
-    // reader and the buffered GM fallback emit exactly the same callbacks for
-    // exactly the same frames.
+
     function makeNdjsonSink(onStage, onUpload) {
-        // Collect per-file storage URLs the bridge reports (upload_file's third
-        // value, and/or done.uploads[]). Deduped, exposed as
-        //   uploadUrls: [{file, url}]   storedUrl: first http(s).
+
         const uploadUrls = [];
         let storedUrl = null;
         let finalResult = null;
@@ -3179,9 +3328,7 @@
                 seen.add(key);
                 if (uploadUrls.some(e => e.file === f && e.url === u)) return;
                 uploadUrls.push({ file: f, url: u });
-                // Prefer the .cbz (the volume archive itself) for the "Open
-                // stored file" action; the cover .webp uploads first, so
-                // without this preference the button would point at an image.
+
                 if (/^https?:\/\//i.test(u)) {
                     if (!storedUrl || /\.cbz$/i.test(f)) storedUrl = u;
                 }
@@ -3219,36 +3366,36 @@
                 }
             }
             if (msg.stage === 'done') finalResult = msg;
-            if (msg.stage === 'error') throw new Error(msg.message || 'Mokuro bridge pipeline error');
+            if (msg.stage === 'error') {
+
+                const err = new Error(msg.message || 'Mokuro bridge pipeline error');
+                err.status = msg.status || 'bridge_error';
+                throw err;
+            }
         }
         return {
             processLine,
-            // Terminal bookkeeping every caller has always relied on.
             finish() {
-                if (!finalResult) throw new Error('Mokuro bridge closed stream without completing.');
+
+                if (!finalResult) throw new Error('Mokuro bridge ended the finalize stream without a terminal done frame.');
+
+                if (finalResult.status === 'partial_upload') finalResult.partialUpload = true;
                 if (uploadUrls.length) finalResult.uploadUrls = uploadUrls;
                 if (storedUrl) finalResult.storedUrl = storedUrl;
                 return finalResult;
             },
         };
     }
-    // Reads the bridge's finalize NDJSON stream (page fetch; has res.body).
-    //   onStage(stage, msg)  , every frame
-    //   onUpload(ev), live upload progress {file, percent, speed, currentBytes,
-    //     totalBytes, method, remotePath}. The bridge streams one file at a time
-    //     with that file's own bytes, so the caller must accumulate across
-    //     files: use makeUploadBarUpdater() below.
+
     async function readNdjsonStream(res, onStage, onUpload) {
         if (!res.body) throw new Error('No streaming response body from bridge');
         const reader = res.body.getReader();
         const decoder = new TextDecoder();
         const sink = makeNdjsonSink(onStage, onUpload);
         let buffer = '';
-        // Force-flush a partially-buffered line if nothing arrives for a while:
-        // a slow upload's trailing NDJSON line (no newline yet) would otherwise
-        // sit in `buffer`, making the bar look stuck.
+
         let lastLineAt = Date.now();
-        const flushTimer = setInterval(() => {
+        const flushTimer = setBackgroundInterval(() => {
             if (!buffer.trim() || Date.now() - lastLineAt < 4000) return;
             const lines = buffer.split('\n');
             buffer = lines.pop() || '';
@@ -3265,44 +3412,33 @@
                 buffer = lines.pop() || '';
                 for (const line of lines) { sink.processLine(line); }
             }
-            // The tail goes through the same sink as every split line, so a
-            // trailing frame without its newline still reaches onUpload.
+
             if (buffer.trim()) { sink.processLine(buffer); }
             return sink.finish();
         } finally {
-            // An error frame or a reader failure must not leave the flush
-            // interval (or the stream reader) alive in a Puppeteer page.
-            clearInterval(flushTimer);
+
+            clearBackgroundInterval(flushTimer);
             try { if (reader.cancel) await reader.cancel(); } catch (e) {}
         }
     }
-    // Buffered twin of readNdjsonStream for the GM path, where the whole
-    // responseText arrives at once: every line goes through the same sink, so
-    // onStage/onUpload see the same frames, just in one burst.
+
     function readNdjsonText(text, onStage, onUpload) {
         const sink = makeNdjsonSink(onStage, onUpload);
         const lines = String(text == null ? '' : text).split('\n');
         for (const line of lines) { sink.processLine(line); }
         return sink.finish();
     }
-    // Multi-file upload progress for the Store/Upload bar. Tracks a list of
-    // files in upload order (seeded up front from the bridge's "upload" frame
-    // `files:` list, then fed live per-file progress). The label reads
-    //   "1/3 · 62% · 65.0 MB / 104.8 MB · 5.1 MiB/s"
-    // i.e. file k of N · overall % · bytes · speed, no file name clutter. The
-    // fill is the byte-weighted overall %, monotonic because every file's total
-    // is known before it uploads; the k/N and size totals are kept after
-    // completion rather than blanking the bar.
+
     function makeUploadBarUpdater(bar) {
-        const order = [];              // file names in first-seen (upload) order
-        const byName = new Map();      // name -> {cur, tot}
+        const order = [];
+        const byName = new Map();
         const rec = (name) => {
             let r = byName.get(name);
             if (!r) { r = { cur: 0, tot: 0 }; byName.set(name, r); order.push(name); }
             return r;
         };
-        let seeded = false;            // full plan announced by the bridge
-        let done = 0;                  // files fully uploaded (tot>0 && cur>=tot)
+        let seeded = false;
+        let done = 0;
         const feed = function onUploadFrame(ev) {
             if (!bar) return;
             bar.wrap.style.display = 'flex';
@@ -3325,8 +3461,7 @@
             else overall = 0;
             let parts = [];
             if (seeded && order.length > 0) {
-                // Always show k/N against the full plan: k = files fully done,
-                // never a premature "1/3" just because one file was announced.
+
                 parts.push(Math.min(done, order.length) + '/' + order.length);
             }
             parts.push(overall.toFixed(0) + '%');
@@ -3335,9 +3470,7 @@
             if (ev.speed && overall < 100) parts.push(ev.speed);
             setBar(bar, overall, parts.join(' · '));
         };
-        // Pre-register the whole upload plan from the initial "upload" frame
-        // ({file, total_bytes}[]): a full denominator up front keeps the overall
-        // % honest and makes k/N always count against N.
+
         feed.seed = function seed(list) {
             if (!Array.isArray(list)) return;
             for (const it of list) {
@@ -3348,10 +3481,8 @@
             }
             if (list.length) seeded = true;
         };
-        // True once any file has been registered (used to avoid clobbering
-        // early-cover progress when the finalize phase reuses this feed).
+
         feed.hasAny = function hasAny() { return order.length > 0; };
-        // Summary accessors: keep the final k/N and total size readable.
         feed.summary = function summary() {
             let sumCur = 0, sumTot = 0, d = 0;
             for (const n of order) {
@@ -3363,13 +3494,7 @@
         };
         return feed;
     }
-    // Ask the bridge to finalize + store a volume.
-    //   opts.method   , upload_method id ('local' | 'mega' | 'drive' | 'onedrive' | 'webdav');
-    //                   null/omitted → let the bridge decide (env default).
-    //   opts.localDir , when method is 'local', write output to this folder.
-    //   opts.forceMega, legacy fallback: when the bridge rejects upload_method,
-    //                   retry once with upload_to_mega=true (old bridges).
-    // Protocol: github.com/GolyBidoof/mokuro-bridge.
+
     async function mokuroFinalize(sessionId, opts = {}, onStage, onUpload) {
         const method = opts.method || null;
         const fd = new FormData();
@@ -3380,48 +3505,29 @@
             fd.append('upload_to_mega', 'true');
         }
         fd.append('delete_after_upload', 'true');
+
+        const overwrite = typeof opts.overwrite === 'string' ? opts.overwrite.trim() : '';
+        if (/^(fail|skip|overwrite)$/.test(overwrite)) fd.append('overwrite', overwrite);
         const url = bridgeSessionPath(sessionId, '/finalize');
-        let res = await mokuroBridgePost(url, 3600000, fd);
-        // Legacy fallback: if the new bridge rejects an unknown upload_method
-        // (error frame), retry once with the old upload_to_mega flag.
-        if (method && !res.ok) {
-            const fd2 = new FormData();
-            fd2.append('upload_to_mega', method === 'local' ? 'false' : 'true');
-            fd2.append('delete_after_upload', 'true');
-            res = await mokuroBridgePost(url, 3600000, fd2);
-        }
-        // The page fetch has a real ReadableStream body, so BookWalker/CMOA keep
-        // the live streaming reader; the GM response has none, so its whole NDJSON
-        // body is parsed in one pass through the same sink.
+        const res = await mokuroBridgePost(url, 3600000, fd);
+
+        if (!res.ok) throw await bridgeError(res, 'finalize');
+
         if (res.body && typeof res.body.getReader === 'function') {
             return readNdjsonStream(res, onStage, onUpload);
         }
         return readNdjsonText(await res.text(), onStage, onUpload);
     }
-    // Where the post-OCR "Open Reader Mokuro" button points: the reader URL the
-    // bridge reported when its done frame carries one, otherwise the reader home.
     function readerJumpUrl(result) {
         const u = result && result.reader_url;
         if (typeof u === 'string' && /^https?:\/\//i.test(u.trim())) return u.trim();
         return 'https://reader.mokuro.app/';
     }
 
-    // =====================================================================
-    // 10. "all-in-one downloader" pointer (single-store builds only)
-    // =====================================================================
-    // Whoever runs this build already chose one store and is the person most
-    // likely to want the other two, so a single-store artifact puts a small
-    // link in the panel header; the combined build, "Omnimanga Native
-    // Downloader", omits this module entirely (it would point at itself). The
-    // artifact file name also lives in src/targets.json ("both"), and
-    // tests/test_artifacts.js fails if the two ever disagree, so renaming the
-    // combined script cannot silently break this.
-    const BWDD_UNIFIED_OUT = 'omnimanga-native-downloader.user.js';
-    // The GreasyFork install page rather than the release asset: it shows the
-    // version and the install button, and it is where the script is reviewed.
-    const BWDD_UNIFIED_URL = 'https://greasyfork.org/en/scripts/597313-omnimanga-native-downloader';
+    const BWDD_UNIFIED_OUT = 'dokuha-userscript.user.js';
 
-    // Styling travels with the feature: a build without this module ships none.
+    const BWDD_UNIFIED_URL = 'https://greasyfork.org/en/scripts/597313-dokuha-userscript';
+
     const UNIFIED_CSS = `
 .bwdd-unified {
   display: inline-flex; align-items: center;
@@ -3445,26 +3551,22 @@
         } catch (e) {}
     }
 
-    // Returns the header link, or null when there is nothing to point at.
     function unifiedDownloaderLink() {
         mountUnifiedStyles();
-        // 115px at 10px, which is the most the header row can take before the
-        // version line starts to ellipsis; see the header budget in the tests.
+
         const a = el('a', 'bwdd-unified', 'all-in-one downloader');
         a.href = BWDD_UNIFIED_URL;
         a.target = '_blank';
         a.rel = 'noopener noreferrer';
         const tip = 'This build handles one store. One all-in-one downloader covers BookWalker, '
-            + 'CMOA and ebookjapan in a single script (' + BWDD_UNIFIED_OUT + ') - get it here: '
+            + 'ebookjapan, CMOA, Kindle and k-manga in a single script (' + BWDD_UNIFIED_OUT + ') - get it here: '
             + BWDD_UNIFIED_URL;
         a.title = tip;
         a.setAttribute('aria-label', tip);
         return a;
     }
-    // =====================================================================
-    // 11. Naming, messages and ZIP base name
-    // =====================================================================
-    function cleanTitle(t) {
+
+function cleanTitle(t) {
         if (!t) return '';
         let s = String(t).replace(/^【[^】]*】\s*/g, '').trim();
         s = s.replace(/[\\/:*?"<>|\x00-\x1f]/g, '').trim();
@@ -3492,42 +3594,27 @@
         const volumeTitle = (series + ' ' + (volNum != null ? volNum : '')).trim();
         return { series, volNum, volumeTitle };
     }
-    // ── Cross-platform (Windows / Linux / macOS) output naming ────────────
-    // Everything the user saves to disk must also be legal on Windows, the
-    // worst case. cleanTitle() above already drops the characters Windows
-    // forbids in file names (\/:*?"<>| plus C0 controls); fsSafePath() covers
-    // the rules that only bite there: trailing dots/spaces (NTFS strips them
-    // silently, so a name that is only dots fails), reserved device names
-    // (CON, PRN, NUL, COM1–9, LPT1–9), and a length cap of 190 code points so
-    // the whole extraction path stays inside the legacy 260-char limit.
-    // Linux/macOS tolerate all of this output unchanged.
+
     const BWDD_RESERVED_DEVICE = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9]|conin\$|conout\$)(?:\..*)?$/i;
     function fsSafePath(name) {
         let s = cleanTitle(name);
         if (!s) return '';
-        // Strip trailing ASCII dots/spaces (Windows drops them on create).
+
         s = s.replace(/[. ]+$/, '').trim();
         if (!s || s === '.' || s === '..') return '';
-        if (BWDD_RESERVED_DEVICE.test(s)) s = '_' + s;   // CON → _CON
+        if (BWDD_RESERVED_DEVICE.test(s)) s = '_' + s;
         const cps = Array.from(s);
         if (cps.length > 190) s = cps.slice(0, 190).join('').replace(/[. ]+$/, '');
         return s;
     }
-    // Default archive/output name for the current book: the volume's own
-    // displayed title (series + volume kept in the store's own format, e.g.
-    // "…1巻", "（１）"), with store labels in 【…】 removed wherever they sit.
-    // cleanTitle() only strips a *leading* 【…】 group, so a mid/suffix label
-    // like "…1巻【無料お試し版】" would leak, and splitSeriesVolume() normalizes
-    // digits ("1巻"→"1") for the stat lookups, losing the store's format.
+
     function archiveDefaultName(rawTitle) {
         let s = String(rawTitle || '').trim();
-        s = s.replace(/【[^】]*】/g, ' ');       // drop 【…】 groups, keep word separation
-        s = s.replace(/[ \t　]+/g, ' ').trim();  // tidy the whitespace the removal leaves behind
+        s = s.replace(/【[^】]*】/g, ' ');
+        s = s.replace(/[ \t　]+/g, ' ').trim();
         return fsSafePath(s);
     }
-    // ZIPs are flat: every page sits at the archive root as page-NNNN.jpg, which
-    // is what manga readers expect. The series→volume nesting the bridge builds
-    // for OCR/upload runs happens bridge-side from the session title.
+
     function zipBaseName(sv, fallbackTitle) {
         return fsSafePath(sv && sv.series) || fsSafePath(fallbackTitle) || 'book';
     }
@@ -3536,8 +3623,7 @@
         if (n < 1048576) return (n / 1024).toFixed(1) + ' KB';
         return (n / 1048576).toFixed(1) + ' MB';
     }
-    // Outcome messages shared by the trial and full download/OCR pipelines,
-    // so the two code paths can never drift apart in wording again.
+
     function msgZipSaved(n, size, secs) {
         return 'ZIP saved: ' + n + ' pages (' + size + ') in ' + secs + 's.';
     }
@@ -3555,19 +3641,20 @@
     function msgStoredLocal(p) { return 'Stored locally to: ' + p; }
     function msgUploadedTo(label, p) { return 'Uploaded to ' + label + ' → ' + p; }
 
-    // Best filesystem/destination path the bridge reported for a finished
-    // volume (output_dir for local forks, staging/remote_path otherwise).
+    function msgPartialUpload(result) {
+        const detail = result && typeof result.message === 'string' ? result.message.trim() : '';
+        return 'The volume files reached the destination, but the bridge could not finish the upload' +
+            (detail ? ': ' + detail : '.');
+    }
+
     function storedPathOf(result) {
         return (result && (result.output_dir || result.staging || result.remote_path)) || null;
     }
-    // Short user-facing label for an upload-method id ('mega' → 'MEGA'…).
     function methodShortLabel(method) {
         const t = { mega: 'MEGA', drive: 'Google Drive', onedrive: 'OneDrive', webdav: 'WebDAV', local: 'Local' };
         return (t && t[method]) || method || '';
     }
-    // The WebDAV base URL as reported by the bridge (/upload-methods extras or
-    // /health upload_methods), used to rebuild direct file URLs, since WebDAV
-    // has no share-link concept to attach to upload frames.
+
     function webdavBaseUrl() {
         const lists = [];
         if (uploadMethods && Array.isArray(uploadMethods.methods)) lists.push(uploadMethods.methods);
@@ -3579,10 +3666,6 @@
         }
         return '';
     }
-    // Best openable per-file target for a finished OCR run: the http(s) links the
-    // bridge attached (uploadUrls / uploads[].url), else a rebuilt direct WebDAV
-    // URL (base + remote_path/<volume>.cbz). .cbz is preferred over .mokuro /
-    // .webp. Returns {file, url} or null.
     function storedOpenTarget(result) {
         if (!result) return null;
         const cands = [];
@@ -3616,7 +3699,8 @@
         }
         return null;
     }
-    let __crcTable = null;
+
+let __crcTable = null;
     function crc32Bytes(buf) {
         if (!__crcTable) {
             __crcTable = new Int32Array(256);
@@ -3698,13 +3782,13 @@
             const size = ent.blob.size;
             let crc = Number.isInteger(ent.crc) ? (ent.crc >>> 0) : null;
             if (crc === null) crc = crc32Bytes(await ent.blob.arrayBuffer());
-            // Worker already read the page for its CRC: keep the original Blob as
-            // the part rather than a second full-size ArrayBuffer per page.
+
             parts.push(localHeader(nameB, crc, size, dos), ent.blob);
             centralParts.push(centralEntry(nameB, crc, size, dos, offset));
             offset += 30 + nameB.length + size;
             if (onProgress) onProgress(i + 1, ordered.length);
-            if ((i & 15) === 15) await new Promise(r => setTimeout(r, 0));
+
+            if ((i & 15) === 15) await yieldToTasks();
         }
         const cd = new Blob(centralParts);
         const cdBytes = new Uint8Array(await cd.arrayBuffer());
@@ -3720,24 +3804,10 @@
         return new Blob(parts, { type: 'application/zip' });
     }
 
-    // =====================================================================
-    // 12. Stylesheet Injection
-    // =====================================================================
-    // 12a. Light/dark scheme detection (environment / browser / OS)
-    // =====================================================================
-    // Real detection of the current color scheme, not a styling guess: we ask
-    // the platform through prefers-color-scheme, which reflects the OS "dark
-    // mode" toggle, the browser's own theme and any per-site override, and make
-    // that decision the single authority - <html data-bwdd-theme> mirrors it,
-    // bwddTheme gives the script a live value and onChange() subscribers, and
-    // the dark palette <style> created in injectStyles() is gated on it, so the
-    // theme follows the environment instead of relying on the page honouring a
-    // media query. A 'change' listener keeps it in sync while the viewer is
-    // already open, no reload needed.
     const bwddTheme = (() => {
-        let scheme = 'light';          // resolved value: 'dark' | 'light'
+        let scheme = 'light';
         let started = false;
-        let styleEl = null;            // dark-palette <style> gated by detection
+        let styleEl = null;
         const subscribers = [];
 
         function mql(pref) {
@@ -3747,9 +3817,7 @@
             } catch (e) { return null; }
         }
         function readScheme() {
-            // 'dark' wins; an explicit 'light' wins over nothing; anything
-            // else (unsupported browser, "no-preference") resolves to light,
-            // matching the script's default styling.
+
             const dark = mql('dark');
             if (dark && dark.matches) return 'dark';
             const light = mql('light');
@@ -3763,11 +3831,7 @@
             for (const fn of subscribers) { try { fn(scheme); } catch (e) {} }
         }
         function gateStyle() {
-            // The dark-palette <style> is in the document only while the
-            // environment reports dark: attaching/removing the element is the most
-            // widely supported gate (no reliance on CSSOM .disabled semantics) and
-            // costs nothing - light mode has no dark sheet, dark mode appends one
-            // after the base sheet.
+
             if (!styleEl) return;
             const host = (typeof document !== 'undefined' && (document.head || document.documentElement)) || null;
             if (!host) return;
@@ -3798,7 +3862,7 @@
                     if (!mq) return;
                     const fn = () => onMediaChange();
                     if (typeof mq.addEventListener === 'function') mq.addEventListener('change', fn);
-                    else if (typeof mq.addListener === 'function') mq.addListener(fn);   // legacy Safari
+                    else if (typeof mq.addListener === 'function') mq.addListener(fn);
                 };
                 attach(dark); attach(light);
                 if (BWDD_DEBUG) { try { console.info('[bwdd] light/dark scheme:', scheme); } catch (e) {} }
@@ -3906,6 +3970,11 @@
   transition: height 0.2s ease, opacity 0.15s ease, width 0.25s ease, transform 0.25s ease;
 }
 #bwdd-root * { box-sizing: border-box; }
+/* A store page's own font rules land directly on the panel's divs, so a leaf
+   rule like .bwdd-btn { font-family: inherit } picks up the shop's font
+   (Meiryo on CMOA) instead of ours. Make the whole subtree inherit from
+   #bwdd-root; the only deliberate exception is monospace for code/pre. */
+#bwdd-root *:not(code):not(pre):not(kbd):not(samp) { font-family: inherit; }
 #bwdd-root.collapsed { height: auto !important; max-height: none !important; }
 #bwdd-root.collapsed .bwdd-body { display: none; }
 #bwdd-root.bwdd-stats-visible { width: 640px; }   /* two-column width, once there is a stats column to show */
@@ -3970,6 +4039,18 @@
 .bwdd-gh svg { width: 12px; height: 12px; fill: currentColor; display: block; }
 .bwdd-gh:hover { color: var(--bwdd-link); background: var(--bwdd-link-hover-bg); }
 .bwdd-gh:focus-visible { outline: 2px solid var(--bwdd-link); outline-offset: 1px; }
+/* The shared script mark: a small, quiet link home beside the version line. */
+.bwdd-mark {
+  flex-shrink: 0;
+  white-space: nowrap;
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--bwdd-text-muted);
+  text-decoration: none;
+  padding: 0 2px;
+}
+.bwdd-mark:hover { color: var(--bwdd-link); text-decoration: underline; }
+.bwdd-mark:focus-visible { outline: 2px solid var(--bwdd-link); outline-offset: 1px; }
 .bwdd-head-controls { display: flex; align-items: center; gap: 2px; flex-shrink: 0; }
 .bwdd-ctrl-btn {
   background: transparent;
@@ -4435,16 +4516,47 @@
 .bwdd-fmt-summary:focus-visible { outline: 2px solid var(--bwdd-link); outline-offset: 1px; }
 .bwdd-fmt[open] > .bwdd-fmt-summary { margin-bottom: 2px; }
 
-.bwdd-dest-select, .bwdd-dest-input {
-  font: 12px inherit;
+/* The panel's own form controls must look the same on every store. A shop's
+   stylesheet lands on bare input/select/textarea elements, and exactly which
+   properties it touches differs per store, so this is a scoped reset rather
+   than a list tuned to one leak: every property a host page realistically sets
+   is pinned once for the whole panel subtree. The #bwdd-root prefix outranks a
+   page selector that is an element, a class, or an element plus an attribute,
+   so a host rule only wins with !important, which no store stylesheet uses for
+   generic form controls. The prefix is also what keeps the reset off the host
+   page's own fields. */
+#bwdd-root input,
+#bwdd-root select,
+#bwdd-root textarea {
+  box-sizing: border-box;
+  height: auto;
+  min-height: 0;
+  max-height: none;
+  margin: 0;
   padding: 5px 7px;
   border: 1px solid var(--bwdd-border-strong);
   border-radius: 6px;
   background: var(--bwdd-bg);
   color: var(--bwdd-root-fg);
+  font-family: inherit;
+  font-size: 12px;
+  font-style: normal;
+  font-weight: 400;
+  line-height: 1.4;
+  letter-spacing: normal;
+  text-transform: none;
+  text-indent: 0;
+  vertical-align: middle;
   width: 100%;
+  appearance: none;
+  -webkit-appearance: none;
 }
-.bwdd-dest-select:focus-visible, .bwdd-dest-input:focus-visible { outline: 2px solid var(--bwdd-link); outline-offset: 1px; }
+/* appearance: none would take the native dropdown affordance with it, and the
+   panel draws no caret of its own, so a select keeps the platform control. */
+#bwdd-root select { appearance: auto; -webkit-appearance: auto; }
+#bwdd-root input:focus-visible,
+#bwdd-root select:focus-visible,
+#bwdd-root textarea:focus-visible { outline: 2px solid var(--bwdd-link); outline-offset: 1px; }
 .bwdd-dest-localdir { display: flex; flex-direction: column; gap: 3px; }
 .bwdd-dest-hint { font-size: 11px; color: var(--bwdd-warn-text); background: var(--bwdd-warn-bg); border: 1px solid var(--bwdd-warn-border); border-radius: 6px; padding: 5px 7px; line-height: 1.4; }
 .bwdd-dest-hint code { font-family: ui-monospace, monospace; font-size: 10px; background: var(--bwdd-warn-code-bg); border-radius: 3px; padding: 0 3px; }
@@ -4457,7 +4569,9 @@
   gap: 6px;
 }
 .bwdd-name .bwdd-dest-label { flex: 0 0 auto; }
-.bwdd-name .bwdd-dest-input { flex: 1 1 auto; width: auto; min-width: 0; padding-top: 4px; padding-bottom: 4px; }
+/* Higher specificity than the subtree reset above, so the name field keeps its
+   compact row sizing (natural width, tighter vertical padding). */
+#bwdd-root .bwdd-name .bwdd-dest-input { flex: 1 1 auto; width: auto; min-width: 0; padding-top: 4px; padding-bottom: 4px; }
 .bwdd-name .bwdd-info-dot {
   flex: 0 0 auto;
   width: 18px;
@@ -4566,9 +4680,9 @@
   gap: 6px;
   margin-top: 6px;
 }
-.bwdd-reader-row > .bwdd-ghost-btn {
-  min-width: 0;
-  width: 100%;
+/* The quiet outline button is a component, not a child of one row. Only the
+   row's own sizing stays scoped there. */
+.bwdd-ghost-btn {
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -4589,12 +4703,16 @@
   cursor: pointer;
   transition: background 0.15s, color 0.15s, border-color 0.15s;
 }
-.bwdd-reader-row > .bwdd-ghost-btn:hover {
+.bwdd-reader-row > .bwdd-ghost-btn {
+  min-width: 0;
+  width: 100%;
+}
+.bwdd-ghost-btn:hover {
   background: var(--bwdd-bg-sunken);
   color: var(--bwdd-link);
   border-color: var(--bwdd-link);
 }
-.bwdd-reader-row > .bwdd-ghost-btn:focus-visible {
+.bwdd-ghost-btn:focus-visible {
   outline: 2px solid var(--bwdd-link);
   outline-offset: 1px;
 }
@@ -4706,16 +4824,6 @@
 `;
         (document.head || document.documentElement).appendChild(css);
 
-        // Dark palette (only active while bwddTheme detects dark, section 12a).
-        // This is a deliberate per-rule remap, not a blanket inversion: the
-        // chrome and surfaces get a dark palette chosen for contrast, and the
-        // LearnNatively / Manga-Kotoba stat cards get brand-matched dark variants
-        // below. The only elements left alone are the Natively difficulty level
-        // rectangles (.bwdd-nlvl-pill), whose semantic colors are set inline and
-        // already read correctly on dark. The rules have no @media wrapper on
-        // purpose: the stylesheet element is attached/removed by
-        // bwddTheme.attachStyle() above, so the environment detection is the one
-        // gate.
         const darkCss = document.createElement('style');
         darkCss.textContent = `
 #bwdd-root {
@@ -4827,24 +4935,24 @@
 .bwdd-edge-tab:hover { background: #60a5fa; }
 .bwdd-edge-tab:focus-visible { outline-color: #60a5fa; }
 /* Quiet reader/stored row (dark), colors come from --bwdd-* tokens */
-.bwdd-reader-row > .bwdd-ghost-btn { background: var(--bwdd-bg); color: var(--bwdd-text-muted); border-color: var(--bwdd-border-strong); }
-.bwdd-reader-row > .bwdd-ghost-btn:hover { background: var(--bwdd-bg-sunken); color: var(--bwdd-link); border-color: var(--bwdd-link); }
+.bwdd-ghost-btn { background: var(--bwdd-bg); color: var(--bwdd-text-muted); border-color: var(--bwdd-border-strong); }
+.bwdd-ghost-btn:hover { background: var(--bwdd-bg-sunken); color: var(--bwdd-link); border-color: var(--bwdd-link); }
 
 `;
         (document.head || document.documentElement).appendChild(darkCss);
-        bwddTheme.attachStyle(darkCss);   // removed from the DOM unless dark is detected
+        bwddTheme.attachStyle(darkCss);
     }
-    const PANEL_POS_KEY = 'bwdd-panel-pos';
+
+const PANEL_POS_KEY = 'bwdd-panel-pos';
     const PANEL_COLLAPSED_KEY = 'bwdd-panel-collapsed';
-    const PANEL_WIDTH_KEY = 'bwdd-panel-width';   // manual resize, if any
-    const PANEL_HEIGHT_KEY = 'bwdd-panel-height';   // manual vertical resize, if any
+    const PANEL_WIDTH_KEY = 'bwdd-panel-width';
+    const PANEL_HEIGHT_KEY = 'bwdd-panel-height';
 
     function buildUI() {
         injectStyles();
         const root = document.createElement('section');
         root.id = 'bwdd-root';
-        // A labelled region, not a modal dialog: the panel never traps focus
-        // or blocks the viewer behind it, and Esc collapses rather than closes.
+
         root.setAttribute('role', 'region');
         root.setAttribute('aria-labelledby', 'bwdd-panel-title');
 
@@ -4875,10 +4983,16 @@
         ghLink.setAttribute('aria-label', 'Open the GitHub repository in a new tab');
         ghLink.title = 'GitHub repository: ' + BWDD_REPO_URL;
         ghLink.innerHTML = '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>';
-        titleSub.append(sub, ghLink);
+        const mark = document.createElement('a');
+        mark.className = 'bwdd-mark';
+        mark.href = BWDD_REPO_URL;
+        mark.target = '_blank';
+        mark.rel = 'noopener noreferrer';
+        mark.textContent = BWDD_SCRIPT_NAME;
+        mark.title = BWDD_SCRIPT_NAME + ' \u2014 the combined downloader: ' + BWDD_REPO_URL;
+        mark.setAttribute('aria-label', 'Open the ' + BWDD_SCRIPT_NAME + ' repository in a new tab');
+        titleSub.append(sub, mark, ghLink);
 
-        // A single-store build also points at the combined script. The module
-        // that defines this is not in every target, so check before calling.
         if (typeof unifiedDownloaderLink === 'function') {
             const unified = unifiedDownloaderLink();
             if (unified) titleSub.appendChild(unified);
@@ -4911,10 +5025,7 @@
         closeBtn.setAttribute('aria-label', 'Close downloader panel');
         closeBtn.setAttribute('title', 'Close panel');
         closeBtn.textContent = '×';
-        // Close tears the panel down completely: it stops the bridge-health poll
-        // and removes the window-level listener + observer, so nothing keeps
-        // hitting 127.0.0.1:62642 or mutating detached DOM after the user closes
-        // the panel. (The edge-tab "flap" is the non-destructive alternative.)
+
         closeBtn.onclick = () => {
             try { if (bridgeTimer) { clearTimeout(bridgeTimer); bridgeTimer = null; } } catch (e) {}
             try { window.removeEventListener('keydown', onPanelKeydown); } catch (e) {}
@@ -4924,8 +5035,6 @@
             try { if (edgeTab) edgeTab.remove(); } catch (e) {}
         };
 
-        // "Flap" control: slides the whole panel off the right edge of the
-        // screen (a small tab on the right edge brings it back).
         const flapBtn = document.createElement('button');
         flapBtn.type = 'button';
         flapBtn.className = 'bwdd-ctrl-btn';
@@ -4936,12 +5045,10 @@
 
         ctrlGroup.append(flapBtn, minBtn, closeBtn);
 
-        // Visible drag grip at the left of the header (the whole header also
-        // drags, this just makes the affordance obvious).
         const dragGrip = document.createElement('span');
         dragGrip.className = 'bwdd-drag-grip';
         dragGrip.setAttribute('aria-hidden', 'true');
-        dragGrip.textContent = '\u283F';   // braille dots: grab handle look
+        dragGrip.textContent = '\u283F';
         head.append(dragGrip, titleGroup, ctrlGroup);
 
         const body = document.createElement('div');
@@ -4959,17 +5066,11 @@
         bridgeRow.title = 'mokuro-bridge: a small local app (github.com/GolyBidoof/mokuro-bridge) that runs mokuro OCR on the downloaded pages and can upload the results.';
         bridgeRow.append(dot, bridgeText);
 
-        // Red alert shown below the bridge row when the bridge runs but mokuro
-        // itself is not installed, the OCR button is unusable in that state.
         const mokuroAlert = document.createElement('div');
         mokuroAlert.className = 'bwdd-mokuro-alert';
         mokuroAlert.style.display = 'none';
         mokuroAlert.setAttribute('role', 'alert');
 
-        // "?" dot beside the bridge status row: opens an infobox under the row.
-        // Popovers open from inside `.bwdd-col-main`, which scrolls and so clips
-        // absolutely positioned children (the bridge one is taller than the
-        // column), so they are fixed to the viewport instead.
         function placePopover(pop, anchor, align) {
             pop.hidden = false;
             const a = anchor.getBoundingClientRect();
@@ -4998,9 +5099,6 @@
         infoTitle.className = 'bwdd-bridge-info-title';
         infoTitle.textContent = 'What is the Mokuro Bridge?';
 
-        // Section 1, the mokuro OCR engine installed on this machine
-        // (version + custom-fork marker), or a red note when it's missing.
-        // Updated from /health on each status tick.
         const mokuroSection = document.createElement('div');
         mokuroSection.className = 'bwdd-bridge-info-section';
         const mokuroSectionHeading = document.createElement('span');
@@ -5032,9 +5130,6 @@
         const divider3 = document.createElement('hr');
         divider3.className = 'bwdd-bridge-info-divider';
 
-        // Section 3, how many connections this run will actually get. Filled by
-        // renderCapabilities() on every bridge poll, so it is accurate whether or
-        // not the bridge is running.
         const connSection = document.createElement('div');
         connSection.className = 'bwdd-bridge-info-section';
         const connHeading = document.createElement('span');
@@ -5062,13 +5157,10 @@
             infoDot.setAttribute('aria-expanded', String(open));
         });
 
-        // Anchor for the bridge status row and its "?" infobox, so the infobox
-        // overlays just below the row instead of pushing content down.
         const bridgeAnchor = document.createElement('div');
         bridgeAnchor.className = 'bwdd-bridge-anchor';
         bridgeAnchor.append(bridgeRow, bridgeInfoPop);
 
-        // Human-readable busy reason from the bridge's /health fields.
         function busyReason(info) {
             if (!info) return '';
             const stage = info.busy_stage;
@@ -5080,23 +5172,19 @@
             return '';
         }
         async function updateBridgeDot() {
-            if (!root.isConnected) return;   // panel closed, skip the tick entirely
+            if (!root.isConnected) return;
             const ok = await bridgeHealth();
             let mokuroMissing = false;
             let mokuroDetailText = '';
             let bridgeBusy = false;
             let bridgeBusyStage = '';
             let bridgeBusyDetail = '';
-            // The bridge answers /health even when mokuro isn't installed
-            // (mokuro_installed:false), so that is "online but unusable for OCR",
-            // not offline.
+
             if (ok && bridgeReachableNow) {
                 const info = await refreshBridgeInfo().catch(() => null);
                 const hasBridgePorts = !!(info && Array.isArray(info.fetchProxyPorts) && info.fetchProxyPorts.length);
                 if (!hasBridgePorts) clearProxySource('bridge');
-                // Take the proxy ports from this same /health payload: re-probing
-                // separately fired two extra requests at a closed port every 10 s,
-                // and the browser logs each refused connection to the console.
+
                 try {
                     if (info && (Array.isArray(info.fetchUpstreams) || info.upstream)) {
                         setProxyUpstreams(info.fetchUpstreams, info.upstream);
@@ -5127,14 +5215,12 @@
             infoMokuro.textContent = mokuroDetailText;
             bridgeOnline = ok && !mokuroMissing;
             if (ok && mokuroMissing) {
-                // Bridge up but no OCR engine: block OCR, show a red alert.
                 dot.className = 'bwdd-indicator-dot offline';
                 mokuroAlert.style.display = 'block';
                 mokuroAlert.textContent = 'Mokuro is not installed on this machine. ' +
                     'OCR cannot run until you install it — e.g. run “pip install mokuro” (or point ' +
                     'the bridge at your mokuro checkout) in the mokuro-bridge folder, then restart the bridge.';
             } else if (ok && bridgeBusy) {
-                // Bridge is working (OCR/upload), amber dot + reason.
                 dot.className = 'bwdd-indicator-dot busy';
                 mokuroAlert.style.display = 'none';
             } else {
@@ -5143,18 +5229,14 @@
             }
             if (ok && bridgeReachableNow && !mokuroMissing) {
                 destWrap.style.display = 'flex';
-                // Refresh the destination list only while idle: mid-run the
-                // dropdown must keep exactly the pick the run started with
-                // (the run reads it again at finalize time).
+
                 if (!runBusy) { try { populateDestMethods(); } catch (e) {} }
                 if (bridgeBusy) {
-                    // While the bridge is busy, say what it's doing instead of
-                    // re-asserting "online" (the dot is already amber).
+
                     bridgeText.textContent = 'Mokuro Bridge busy — ' + (busyReason({ busy: true, busy_stage: bridgeBusyStage, busy_detail: bridgeBusyDetail }) || 'working');
                     bridgeRow.title = 'mokuro-bridge: ' + (bridgeBusyDetail ? bridgeBusyDetail + ' · ' : '') + 'github.com/GolyBidoof/mokuro-bridge';
                 } else {
-                    // Idle: describe the destination from the panel's own pick, so
-                    // the status line cannot contradict what finalize will use.
+
                     try {
                         const hasOptions = !!(destSelect.options && destSelect.options.length);
                         const method = hasOptions ? (destSelect.value || 'local') : 'local';
@@ -5182,12 +5264,9 @@
                     ? 'Mokuro Bridge is online but mokuro is missing — install it to enable OCR'
                     : 'Mokuro Bridge is not found on port 62642 — start it to enable OCR';
             }
-            // OCR button + destination pickers derive from the run lock, so this
-            // periodic tick can never re-enable them mid-run.
+
             setRunLock(runBusy);
-            // Poll fast (1 s) while the bridge is busy - ours or background work
-            // it reports via /health - so the UI notices the moment it goes idle;
-            // otherwise settle to 10 s.
+
             bridgePollFast = !!(bridgeBusy || runBusy);
             laneBridgeOnline = bridgeReachableNow;
             renderCapabilities();
@@ -5205,8 +5284,6 @@
         const statsEl = document.createElement('div');
         statsEl.className = 'bwdd-cards';
 
-        // Run status area: live region so screen readers announce new
-        // outcome/warning messages the moment they land here.
         const details = document.createElement('div');
         details.className = 'bwdd-hint-box';
         details.setAttribute('aria-live', 'polite');
@@ -5225,8 +5302,7 @@
 
             const track = document.createElement('div');
             track.className = 'bwdd-bar-track';
-            // faint background segment (used by the Mokuro bar to show "received
-            // but not yet OCR'd"); stays 0-width for the other bars
+
             const fillBg = document.createElement('div');
             fillBg.className = 'bwdd-bar-fill-bg';
             fillBg.style.width = '0%';
@@ -5249,8 +5325,6 @@
         const barDescramble = mkBar('2. Tile Descramble', 'linear-gradient(90deg, #3b82f6, #1d4ed8)', 'Descramble Progress');
         const barMokuro = mkBar('3. Mokuro Bridge', 'linear-gradient(90deg, #f59e0b, #d97706)', 'OCR Pipeline Progress');
         const barUpload = mkBar('4. Upload', 'linear-gradient(90deg, #8b5cf6, #6d28d9)', 'Upload Progress');
-        // What each bar counts (hover/AT hint; the Mokuro rate reads done/received/total,
-        // and the faint amber underlay is pages the bridge received but hasn't OCR'd yet).
         barDownload.wrap.title = 'Pages fetched from ' + siteLabel() + '\u2019s CDN';
         barDescramble.wrap.title = 'Pages reassembled from their scrambled tiles';
         barMokuro.wrap.title = 'Pages OCR\u2019d / pages received by the bridge / total pages \u2014 faint amber = received but not yet OCR\u2019d';
@@ -5279,13 +5353,6 @@
 
         btnRow.append(btnZip, btnOcr);
 
-        // --- Archive name (above the download buttons) ---------------------
-        // One compact row (label + textbox + "?" tooltip button) that sets the
-        // name of the archive the buttons below generate: the .zip "Save as ZIP"
-        // downloads, or the volume the bridge stores/uploads (.cbz) when OCR
-        // runs. Auto-filled with this book's displayed title and refreshed when
-        // the reader moves to another book, but a name the user typed is never
-        // overwritten; empty = back to the default.
         const nameWrap = document.createElement('div');
         nameWrap.className = 'bwdd-name';
         const nameLabel = document.createElement('label');
@@ -5308,7 +5375,7 @@
         nameInfoDot.setAttribute('aria-controls', 'bwdd-archive-name-pop');
         nameInfoDot.title = 'What this field does';
         nameInfoDot.textContent = '?';
-        // The popover overlays the buttons below rather than taking layout space.
+
         const namePop = document.createElement('div');
         namePop.className = 'bwdd-name-pop';
         namePop.id = 'bwdd-archive-name-pop';
@@ -5322,7 +5389,6 @@
         namePopP3.textContent = 'ZIP pages sit flat inside the archive; OCR uploads still land under the series folder. Invalid file-name characters are stripped.';
         namePop.append(namePopP1, namePopP2, namePopP3);
         nameWrap.append(nameLabel, nameInput, nameInfoDot, namePop);
-        // Click the "?" to toggle the popover; click elsewhere to dismiss it.
         function setArchivePop(open) {
             if (open) placePopover(namePop, nameWrap, 'right');
             else namePop.hidden = true;
@@ -5332,23 +5398,14 @@
             e.stopPropagation();
             setArchivePop(namePop.hidden);
         });
-        // Hoisted declaration so the panel's close button can detach it.
+
         function onNameDocClick(e) {
             if (!namePop.hidden && !nameWrap.contains(e.target)) setArchivePop(false);
         }
         document.addEventListener('click', onNameDocClick);
 
-        // The default the field was last auto-filled with (null = never, or the
-        // user has typed their own name since), so syncArchiveDefault can tell
-        // "still showing the auto default" from "user's own text".
         let archiveAutoDefault = null;
-        // Keep the field's default in sync with the book shown in the reader and
-        // return the effective archive name for the current run (never empty):
-        //   • Empty field → fill with this book's default.
-        //   • Field still holding the previous auto default → swap in the new one.
-        //   • Anything the user typed → never touched.
-        // Self-corrects while the title arrives in stages (document.title first,
-        // then the richer state.cti).
+
         function syncArchiveDefault(rawTitle) {
             const dflt = archiveDefaultName(rawTitle);
             const cur = nameInput.value;
@@ -5366,12 +5423,9 @@
             return dflt || fsSafePath(siteCid() || '') || 'book';
         }
 
-        // --- Upload destination picker (OCR mode) ---
-        // Lets the user choose where mokuro-bridge stores the finished volume, per
-        // request: any configured remote method, or 'local' + a directory.
         const destWrap = document.createElement('div');
         destWrap.className = 'bwdd-dest';
-        destWrap.style.display = 'none';   // shown only while the bridge is running
+        destWrap.style.display = 'none';
         const destLabel = document.createElement('label');
         destLabel.className = 'bwdd-dest-label';
         destLabel.textContent = 'Mokuro output destination';
@@ -5393,9 +5447,7 @@
         localDirInput.className = 'bwdd-dest-input';
         localDirInput.placeholder = 'absolute path on this computer — e.g. C:\\Users\\you\\manga or /home/you/manga';
         localDirInput.title = 'Where mokuro-bridge should write the finished volume. This is a path on the machine running the bridge (your computer).';
-        // A web page cannot read your filesystem path via a folder picker
-        // (showDirectoryPicker yields an opaque handle), so we fill the path from
-        // the bridge's own configured output_dir and let you edit it freely.
+
         const localDirFill = document.createElement('button');
         localDirFill.type = 'button';
         localDirFill.className = 'bwdd-btn-fill';
@@ -5413,23 +5465,16 @@
         destHint.style.display = 'none';
         destWrap.append(destLabel, destSelect, localDirRow, destHint);
 
-        // Which method the user actually picked, kept separate from
-        // destSelect.value because populateDestMethods() rebuilds the dropdown on
-        // every 10s bridge-health tick: a refresh that cannot represent the
-        // current pick must not forget it and fall back to the default forever.
         let userMethod = null;
-        // A value is "usable" only when it maps to a configured, enabled option
-        //, an unconfigured provider is selectable (to read its setup hint) but
-        // must never be restored/seeded as the effective destination.
+
         const hasUsableOption = (v) => v != null && [...destSelect.options]
             .some(o => o.value === v && !o.disabled && !(o.dataset && o.dataset.unconfigured));
 
         async function populateDestMethods() {
             const methods = await fetchUploadMethods().catch(() => null);
-            // A run may have started while this fetch was in flight: never
-            // repopulate (and thereby change) the pick it will finalize with.
+
             if (runBusy) return;
-            const prevValue = destSelect.value;   // keep the user's visible pick
+            const prevValue = destSelect.value;
             destSelect.textContent = '';
             let def = 'local';
             if (methods && Array.isArray(methods.methods) && methods.methods.length) {
@@ -5442,9 +5487,7 @@
                     } else if (m.configured) {
                         opt.textContent = m.name + (m.current_folder ? ' — ' + m.current_folder : '');
                     } else {
-                        // Unconfigured methods stay selectable so the user can read
-                        // about them: choosing one shows the setup hint below and
-                        // disables OCR until the provider is set up.
+
                         opt.textContent = m.name + ' — needs setup';
                         opt.dataset.unconfigured = '1';
                         opt.title = 'Not set up yet — enable it once in the mokuro-bridge terminal (from its folder): python server.py --setup-upload ' + (m.id || '');
@@ -5458,19 +5501,14 @@
                     destSelect.appendChild(opt);
                 }
             }
-            // Seed the remembered method from localStorage on the first
-            // population; later rebuilds preserve the visible pick instead.
+
             if (!userMethod && !prevValue) {
                 try {
                     const saved = localStorage.getItem('bwdd-upload-method');
                     if (saved && hasUsableOption(saved)) userMethod = saved;
                 } catch (e) {}
             }
-            // Pick the value to show after the rebuild:
-            //   1. the current selection, if it still exists (a "needs setup" pick
-            //      must survive a tick so its hint keeps showing),
-            //   2. else the remembered usable method (seeded from localStorage),
-            //   3. else the bridge's usable default, else 'local'.
+
             let picked = null;
             if (prevValue) {
                 const stillThere = [...destSelect.options].some(o => o.value === prevValue);
@@ -5501,15 +5539,11 @@
             updateDestHint();
             refreshOcrButton();
         }
-        // Whether the destination currently chosen in the dropdown is one the
-        // bridge hasn't been set up for yet.
         function selectedNeedsSetup() {
             const o = destSelect.selectedOptions && destSelect.selectedOptions[0];
             return !!(o && o.dataset && o.dataset.unconfigured);
         }
-        // OCR button availability = not busy ∧ bridge online ∧ destination is
-        // actually usable. While a not-yet-configured destination is selected
-        // the button is disabled so a run can't start toward a dead end.
+
         function refreshOcrButton() {
             const blockedBySetup = selectedNeedsSetup();
             btnOcr.disabled = runBusy || !bridgeOnline || blockedBySetup;
@@ -5518,10 +5552,6 @@
                 ? 'This destination is not set up yet — run the command below once, then it will be usable here.'
                 : ((runBusy || bridgeOnline) ? btnOcrTip : 'Start the Mokuro Bridge to enable OCR');
         }
-        // The setup hint is tied to the selection: it appears only when the
-        // chosen destination isn't configured yet (and the OCR button stays
-        // disabled until it is). Once the provider is set up, the next health
-        // tick lists it as configured and the hint disappears.
         function updateDestHint() {
             const selOpt = destSelect.selectedOptions && destSelect.selectedOptions[0];
             if (!selOpt || !selOpt.dataset || !selOpt.dataset.unconfigured) {
@@ -5540,19 +5570,30 @@
         localDirInput.addEventListener('change', () => { try { localStorage.setItem('bwdd-local-dir', localDirInput.value); } catch (e) {} });
         try { const saved = localStorage.getItem('bwdd-local-dir'); if (saved) localDirInput.value = saved; } catch (e) {}
         populateDestMethods();
-        // --- Run-state lock --------------------------------------------------
-        // While a run is in progress the action buttons and the destination
-        // section are disabled: no second download, and no changing the
-        // destination an OCR run re-reads at finalize time.
-        let bridgeOnline = false;   // last known bridge /health result
-        let runBusy = false;        // a download/OCR run is in progress
 
+        let bridgeOnline = false;
+        let runBusy = false;
+
+        let unloadGuardArmed = false;
+        function onBeforeUnload(e) {
+            e.preventDefault();
+
+            e.returnValue = '';
+            return '';
+        }
+        function setUnloadGuard(active) {
+            if (active === unloadGuardArmed) return;
+            unloadGuardArmed = active;
+            try {
+                if (active) window.addEventListener('beforeunload', onBeforeUnload);
+                else window.removeEventListener('beforeunload', onBeforeUnload);
+            } catch (e) {}
+        }
         function setRunLock(busy) {
             runBusy = busy;
+            setUnloadGuard(busy);
             btnZip.disabled = busy;
             btnZip.setAttribute('aria-disabled', String(busy));
-            // OCR availability folds in the destination-setup state too, see
-            // refreshOcrButton (kept in sync on every selection change).
             refreshOcrButton();
             const destLocked = busy || !bridgeOnline;
             destSelect.disabled = destLocked;
@@ -5567,9 +5608,7 @@
                 destWrap.removeAttribute('aria-busy');
                 destWrap.title = '';
             }
-            // Closing or flapping the panel mid-run would orphan the pipeline
-            // (auth timers, OCR polls, the finalize stream) that keeps posting
-            // into a detached DOM, hold both header buttons until it finishes.
+
             closeBtn.disabled = busy;
             flapBtn.disabled = busy;
             if (busy) {
@@ -5581,9 +5620,6 @@
             }
         }
 
-        // Post-run actions, "Open Reader Mokuro" + "Open stored file / Copy path":
-        // one quiet row of secondary (ghost) buttons after a successful OCR run,
-        // each spanning the row when the other has nothing to offer (grid auto-fit).
         const postRunRow = document.createElement('div');
         postRunRow.className = 'bwdd-reader-row';
         postRunRow.style.display = 'none';
@@ -5673,18 +5709,11 @@
             syncPostRunRow();
         }
 
-        // Two-column layout: download & bridge controls on the left, reading stats
-        // on the right. The stats column mounts only once the first card lands in
-        // statsEl; until then the panel is a single controls column.
-        // ---- pre-flight readout ------------------------------------------
-        // These numbers live in the bridge row's "?" popover, not the panel body:
-        // they matter before a run, but not often enough to earn permanent space.
         function renderCapabilities() {
             const c = capabilitySummary();
             connSection.classList.toggle('on', c.bridgeOnline);
             connSection.classList.toggle('off', !c.bridgeOnline);
-            // "no bridge", not "page only": the count can still include the GM and
-            // trailing-dot lanes, so naming just the page lane would be wrong.
+
             const speed = c.bridgeOnline ? c.ports + ' ports'
                 : (c.ports ? 'bridge offline' : 'no bridge');
             connNumbers.textContent = speed + ' · ' + c.effectiveSockets +
@@ -5697,13 +5726,19 @@
                     'this run has up to ' + c.sockets + ' network sockets instead of ' +
                     c.withoutBridge + '. Up to ' + c.decodePages + ' pages decode concurrently; ' +
                     'the fetch window is bounded separately to avoid retaining the whole volume.';
+
+                if (c.socketsClamped) {
+                    explain += ' Those ports would add up to ' + c.rawSockets + ', but the browser ' +
+                        'caps a profile at ' + CHROMIUM_SOCKETS_PER_PROCESS + ' sockets in total, so ' +
+                        'the run uses ' + c.sockets + ' and keeps ' + CONTROL_PLANE_SOCKET_RESERVE +
+                        ' in reserve for the manifest, policy refresh and bridge checks.';
+                }
             } else if (c.ports) {
                 explain = 'mokuro-bridge answered earlier (' + c.ports + ' ports) but is not ' +
                     'reachable now, so this run would use ' + c.effectiveSockets + ' connections. ' +
                     'Restart it to get the extra ports back.';
             } else {
-                // Quote the real count, not "6": the GM and trailing-dot lanes
-                // already add more than the page's own 6.
+
                 explain = 'mokuro-bridge is not running, so this run uses ' + c.effectiveSockets +
                     ' browser connections. Starting it adds its advertised local ports, ' +
                     'worth up to six connections each. Downloads work the same either way.';
@@ -5712,7 +5747,6 @@
                 workerBatchSize(IMAGE_CODEC.type) + ' page each concurrently as they arrive; that number follows your CPU, not the bridge.';
         }
 
-        // ---- page image format (advanced, collapsed) ----------------------
         const fmtDetails = document.createElement('details');
         fmtDetails.className = 'bwdd-fmt';
         const fmtSummary = document.createElement('summary');
@@ -5765,8 +5799,7 @@
                 } catch (e) {}
             }
             const c = refreshImageCodec();
-            // Quality does nothing for the lossless settings, so hide it rather
-            // than offer a control with no effect.
+
             qCtl.row.style.display = c.lossless ? 'none' : 'flex';
             fmtSummary.textContent = 'Image format · ' + FORMAT_LABELS[c.fmt] +
                 (c.lossless ? '' : ' q' + c.quality);
@@ -5776,7 +5809,6 @@
             renderCapabilities();
         }
 
-        // Reflect whatever is already configured (console or a previous visit).
         {
             const wantedFmt = IMAGE_CODEC.fmt;
             if (![...fmtCtl.sel.options].some(o => o.value === wantedFmt)) {
@@ -5812,15 +5844,12 @@
         const colSep = document.createElement('div');
         colSep.className = 'bwdd-col-sep';
 
-        // Mount the stats column (+ separator) and widen the panel to its
-        // two-column size the moment the first card lands.
         function mountStatsColumn() {
             const manual = parseFloat(root.style.width);
             const manualWide = isFinite(manual) && manual >= 620;
             body.append(colSep, colStats);
             root.classList.add('bwdd-stats-visible');
-            // A manual width only sticks once it is wide enough for two columns;
-            // otherwise fall back to the auto two-column width.
+
             if (!manualWide) root.style.width = '';
         }
         let statsMounted = false;
@@ -5831,43 +5860,35 @@
             mountStatsColumn();
         });
         statsObs.observe(statsEl, { childList: true });
-        if (statsEl.childElementCount) { statsMounted = true; mountStatsColumn(); }   // safety net
+        if (statsEl.childElementCount) { statsMounted = true; mountStatsColumn(); }
 
         body.append(colMain);
         root.append(head, body);
         document.documentElement.appendChild(root);
-        // updateBridgeDot() ran above, before root was connected, and bailed at
-        // the `!root.isConnected` guard, so refresh it now instead of waiting for
-        // the first 10 s interval tick.
+
         try { updateBridgeDot(); } catch (e) {}
 
-        // "Flap": slide the whole panel off the right edge of the screen. A
-        // small tab stays docked on the right edge to bring it back.
         const edgeTab = document.createElement('button');
         edgeTab.type = 'button';
         edgeTab.className = 'bwdd-edge-tab';
         edgeTab.setAttribute('aria-label', 'Show the ' + sitePanelTitle() + ' panel');
         edgeTab.title = 'Show the ' + sitePanelTitle() + ' panel';
-        edgeTab.textContent = '\u00AB';   // fancy "<<", pull the panel back in from the right
+        edgeTab.textContent = '\u00AB';
         edgeTab.style.display = 'none';
         document.documentElement.appendChild(edgeTab);
 
         function flapOut() {
-            if (edgeTab.style.display === 'flex') return;   // already away
+            if (edgeTab.style.display === 'flex') return;
             const r = root.getBoundingClientRect();
-            // Push the panel fully past the right edge. Its left/top position is
-            // untouched, so clearing the transform returns it exactly where it was.
+
             const shift = Math.max(24, Math.ceil(window.innerWidth - r.left) + 4);
             root.style.transform = 'translateX(' + shift + 'px)';
             root.classList.add('bwdd-flapped');
             root.setAttribute('aria-hidden', 'true');
-            // inert takes every control out of the tab order / a11y tree, so a
-            // keyboard user can't Tab into invisible controls (aria-hidden
-            // alone does not do that).
+
             root.inert = true;
-            // Anchor the restore tab to the panel's own vertical span, so a
-            // bottom-docked panel leaves its tab near the bottom edge.
-            const tabH = 76;   // .bwdd-edge-tab height
+
+            const tabH = 76;
             const vh = window.innerHeight || document.documentElement.clientHeight || 800;
             const tabTop = Math.max(0, Math.min(r.top + (r.height - tabH) / 2, vh - tabH - 8));
             edgeTab.style.top = tabTop + 'px';
@@ -5881,7 +5902,7 @@
             root.classList.remove('bwdd-flapped');
             root.style.transform = '';
             root.removeAttribute('aria-hidden');
-            root.inert = false;   // restore tab order + focusability
+            root.inert = false;
             edgeTab.style.display = 'none';
             flapBtn.setAttribute('aria-expanded', 'true');
             flapBtn.setAttribute('aria-label', 'Hide the panel to the right edge');
@@ -5890,7 +5911,6 @@
         edgeTab.addEventListener('click', () => flapIn());
         flapBtn.onclick = () => flapOut();
 
-        // --- Manual resize (corner handle) + remembered width -------------
         const resizeHandle = document.createElement('div');
         resizeHandle.className = 'bwdd-resize';
         resizeHandle.setAttribute('aria-hidden', 'true');
@@ -5916,14 +5936,13 @@
             e.preventDefault();
             e.stopPropagation();
             const r = root.getBoundingClientRect();
-            // Anchor by the top-left so the bottom-right corner follows the
-            // pointer while resizing (works for both docked and dragged states).
+
             root.style.left = r.left + 'px';
             root.style.top = r.top + 'px';
             root.style.right = 'auto';
             resizing = true;
             resizeStartX = e.clientX; resizeStartY = e.clientY;
-            resizeStartW = r.width;   resizeStartH = r.height;
+            resizeStartW = r.width; resizeStartH = r.height;
             try { resizeHandle.setPointerCapture(e.pointerId); } catch (err) {}
         });
         resizeHandle.addEventListener('pointermove', (e) => {
@@ -5936,8 +5955,7 @@
             const maxW = Math.max(minW, Math.min(1200, vw - left - 12));
             const w = Math.max(minW, Math.min(maxW, resizeStartW + (e.clientX - resizeStartX)));
             root.style.width = Math.round(w) + 'px';
-            // The panel is top-anchored, so growing downward is what the user
-            // expects; clamp to the viewport too.
+
             const minH = resizeMinH();
             const maxH = Math.max(minH, Math.min(1000, vh - top - 12));
             const h = Math.max(minH, Math.min(maxH, resizeStartH + (e.clientY - resizeStartY)));
@@ -5966,7 +5984,6 @@
         } catch (e) {}
         try { if (localStorage.getItem(PANEL_COLLAPSED_KEY) === '1') setCollapsed(true); } catch (e) {}
 
-        // Draggable Functionality (pointer + keyboard; Esc collapses)
         let dragging = false;
         let dragPointerId = null;
         let pos = { x: 0, y: 0 };
@@ -5983,8 +6000,7 @@
             root.style.top = clampPanelY(clientY - pos.y) + 'px';
             root.style.right = 'auto';
         }
-        // Pointer events cover mouse, touch and pen (with capture so the drag keeps
-        // tracking even when the pointer leaves the header).
+
         head.addEventListener('pointerdown', (e) => {
             if (e.pointerType === 'mouse' && e.button !== 0) return;
             if (e.target.closest('button, a')) return;
@@ -6012,19 +6028,12 @@
             dragging = false;
             dragPointerId = null;
         });
-        // The panel deliberately does NOT capture arrow keys: the viewer uses
-        // Left/Right to flip pages, so arrow handling must never be eaten or
-        // preventDefault'ed while the panel holds focus. Reposition by dragging the
-        // header, resize with the corner grip.
 
-        // Keyboard shortcut: Escape toggles collapse. Named so the close button can
-        // remove it: a closed panel must not keep a window-level listener alive.
         function onPanelKeydown(e) {
             if (e.key !== 'Escape') return;
-            // An open archive-name popover is closed by Esc first, then a second
-            // Esc collapses the panel as usual.
+
             if (!namePop.hidden) { setArchivePop(false); return; }
-            // don't hijack Esc while the user is typing in a form control
+
             const t = e.target;
             if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable)) return;
             if (document.contains(root) && !e.defaultPrevented) {
@@ -6033,15 +6042,12 @@
         }
         window.addEventListener('keydown', onPanelKeydown);
 
-        // Exposed last: this names elements (fmtCtl/qCtl) created further down, so
-        // publishing it any earlier hits the TDZ and exports nothing.
         if (BWDD_DEBUG) {
             try {
                 window.__bwddUI = Object.assign(window.__bwddUI || {}, {
                     populateDestMethods, onDestChange,
                     renderCapabilities, capabilitySummary, workerPoolSize, discoverProxyPorts,
                     fmtSelect: fmtCtl.sel, qSelect: qCtl.sel,
-                    // programmatic control, for tests and console use
                     setImageFormat(fmt, quality) {
                         if (fmt) fmtCtl.sel.value = fmt;
                         if (quality != null) qCtl.sel.value = String(quality);
@@ -6051,12 +6057,9 @@
                 });
             } catch (e) { try { console.error('[bwdd] UI export failed:', safeLogText(e)); } catch (e2) {} }
         }
-        return { root, details, statsEl, barWrap, barDownload, barDescramble, barMokuro, barUpload, btnZip, btnOcr, destSelect, localDirInput, destHint, populateDestMethods, setRunLock, showReaderButton, hideReaderButton, showStoredButton, hideStoredButton, syncArchiveDefault };
+        return { root, details, statsEl, barWrap, barDownload, barDescramble, barMokuro, barUpload, btnZip, btnOcr, btnRow, nameWrap, destSelect, localDirInput, destHint, populateDestMethods, setRunLock, showReaderButton, hideReaderButton, showStoredButton, hideStoredButton, syncArchiveDefault };
     }
 
-    // Three-value Mokuro progress: done / received / total.
-    // fillBg (faint) = pages received by the bridge; fill (solid) = pages
-    // actually OCR'd. No flicker, every update sets all three consistently.
     function updateMokuroBar(bar, done, received, total) {
         if (!bar || !bar.fill) return;
         const t = total || 1;
@@ -6077,9 +6080,7 @@
         bar.fill.setAttribute('aria-valuetext', `${p}% complete`);
         if (text != null) bar.labRate.textContent = text;
     }
-    // Build (but don't insert) the collapsible raw-error block; returns null
-    // when there is nothing to show. Both setRunDetails and the success paths
-    // use it so recovered/retried errors surface without dominating the copy.
+
     function makeTechDetails(rawLines, label) {
         const lines = (rawLines || []).filter(Boolean);
         const capped = lines.slice(0, 15);
@@ -6093,9 +6094,6 @@
         det.append(sum, pre);
         return det;
     }
-    // Show a run outcome in the status area: a plain summary plus (when the
-    // caller has raw per-page error lines) a collapsible "technical details"
-    // block so the raw internals never dominate the message.
     function setRunDetails(el, summary, rawLines) {
         if (!el) return;
         el.textContent = '';
@@ -6103,8 +6101,6 @@
         const det = makeTechDetails(rawLines);
         if (det) el.appendChild(det);
     }
-    // Append diagnostics to an already-set status line (used when a run fully
-    // succeeded but some pages needed retries, nothing silently swallowed).
     function appendRunDetails(el, rawLines, label) {
         if (!el) return;
         const det = makeTechDetails(rawLines, label);
@@ -6118,18 +6114,9 @@
         setBar(ui.barDescramble, 0, '0%');
     }
 
-    // =====================================================================
-    // 13. Orchestration & Token Lifecycle
-    // =====================================================================
-    let authRefreshPromise = null;
+let authRefreshPromise = null;
     let pbCounter = 0;
-    // Refresh the CloudFront auth policy, coalesced so concurrent callers share
-    // one in-flight request. A fresh public viewer must use its native opening
-    // exchange first; rolling renewal uses the viewer's bookmark channel:
-    //   'c' , GET /browserWebApi/c with the params the viewer sends when
-    //          opening a book; a fresh reply replaces auth/baseUrl/cti.
-    //   'pb', POST a reading-position bookmark to the viewer's own
-    //          token-renewal channel; only used after capture starts.
+
     function refreshAuthOnce(mode) {
         if (!authRefreshPromise) {
             authRefreshPromise = (async () => {
@@ -6160,8 +6147,7 @@
                     }, isPublicBootstrapPage() ? 12000 : 20000);
                     d = await res.json();
                     if (d && d.auth_info) {
-                        // pb merges over the current auth; only a changed
-                        // policy/signature resets the request-count budget.
+
                         const before = authPolicySig();
                         state.auth = Object.assign({}, state.auth || {}, d.auth_info);
                         if (authPolicySig() !== before) resetAuthBudget();
@@ -6170,11 +6156,7 @@
                     const cr = Math.floor(Math.random() * 9e18);
                     const u1 = getU1();
                     const bid = getBID();
-                    // The native viewer's opening exchange sends only cid/BID/cr.
-                    // It has no u1 cookie on this route, so u1 is optional and must
-                    // never fail the request closed. (The previous guard returned a
-                    // fabricated status 503 whenever u1 was absent, which is why the
-                    // free-volume capture never reached the server.)
+
                     let url = apiBase() + '/browserWebApi/c?cid=' + encodeURIComponent(state.cid);
                     if (u1) url += '&u1=' + encodeURIComponent(u1);
                     url += '&BID=' + encodeURIComponent(bid) + '&cr=' + cr;
@@ -6188,10 +6170,7 @@
                 }
                 return d;
             })();
-            // Attach both cleanup branches explicitly. A bare finally() returns
-            // a second promise that can become an unhandled rejection when the
-            // refresh request itself fails, even though its caller catches the
-            // original promise.
+
             authRefreshPromise.then(
                 () => { authRefreshPromise = null; },
                 () => { authRefreshPromise = null; }
@@ -6314,12 +6293,13 @@
     }
 
     async function ensureStateFresh() {
-        // The CLI intentionally defers the wrappers until the document-start
-        // viewer bootstrap has passed. Activate them here, before inspecting
-        // resources and issuing explicit auth/manifest refreshes, so later
-        // viewer requests are still captured without wrapping bootstrap itself.
+
         if (shouldDeferNetworkCapture()) {
             try { installNetworkCapture(); } catch (_) {}
+        }
+
+        if (bwHeadlessWanted()) {
+            await bwHeadlessOpenFree(bwHeadlessCid());
         }
         snapshotViewerResources();
         const publicBootstrap = (() => {
@@ -6359,10 +6339,7 @@
                 }
             } catch (e) {}
             if (!state.auth || !state.baseUrl) {
-                // A fresh viewer boot obtains its signed CloudFront policy from
-                // /c. Do not send a synthetic bookmark (and advance a public
-                // reader's position) before that first native auth exchange.
-                // /pb remains the rolling renewal path after capture starts.
+
                 const cFirst = publicBootstrap && (publicBootstrap.route === 'free' || location.hostname.indexOf('trial') === -1);
                 if (cFirst) {
                     try { d = await refreshAuthViaC(); } catch (e) { d = null; }
@@ -6376,11 +6353,7 @@
                         if (e && e.status != null) attemptStatuses.push(String(e.status));
                     }
                 }
-                // v1.5.1 called /c at most once per sequence, and only after /pb
-                // had left us still missing (see the nested guards in its run
-                // loop). When cFirst already made that call above, this would be
-                // a second identical request; && binds tighter than ||, so the
-                // still-missing guard needs its own parentheses to mean that.
+
                 if ((!state.auth || !state.baseUrl) && !cFirst) {
                     try { d = await refreshAuthViaC(); } catch (e) { d = null; }
                     if (d && d.status != null) attemptStatuses.push(String(d.status));
@@ -6414,7 +6387,8 @@
             state.configFromUrl = state.baseUrl;
         }
     }
-    async function uploadCoverEarly(opts) {
+
+async function uploadCoverEarly(opts) {
         const { ui, barUpload, feed, mokuroSessionId, safeTitle, blob } = opts;
         if (!mokuroSessionId || !blob) return null;
         const plan = await resolveUploadChoice(ui).catch(() => ({ method: null, label: null, localDir: null }));
@@ -6422,30 +6396,22 @@
         try {
             barUpload.labName.textContent = '4. ' + (plan.method === 'local' ? 'Store' : 'Upload');
             barUpload.wrap.style.display = 'flex';
-            // Seed the 1-file plan up front so the bar reads "1/1 · 0%" from
-            // the very first moment (no bare "0%" without a file count).
+
             if (feed.seed) feed.seed([{ file: coverName, total_bytes: blob.size }]);
             feed({ file: coverName, currentBytes: 0, totalBytes: blob.size, percent: 0 });
             const res = await mokuroUploadCover(mokuroSessionId, blob, { method: plan.method || null, localDir: plan.localDir });
             feed({ file: res && res.file ? res.file : coverName, currentBytes: res && res.size ? res.size : blob.size, totalBytes: res && res.size ? res.size : blob.size, percent: 100 });
             return res;
         } catch (e) {
-            // A failed early cover must never break the download/OCR run.
+
             if (BWDD_DEBUG) console.warn('[bwdd] Early cover upload skipped:', safeLogText(e && e.message || e));
             return null;
         }
     }
 
-    // Finalize phase shared by the trial and full OCR pipelines (kept in one
-    // place so the two paths can never drift apart again): ask the bridge to
-    // finalize the session (store locally or upload), stream live byte/percent
-    // progress into the Store/Upload bar via the NDJSON frames, and keep the
-    // Mokuro bar polled until the stream closes. Returns { result, plan }.
     async function finalizeOcrSession(mokuroSessionId, ui, barUpload, barMokuro, total, sharedFeed, options = {}) {
         const plan = await resolveUploadChoice(ui).catch(() => ({ method: null, label: null, localDir: null }));
-        // The 4th stage only uploads when the destination is remote, so name the
-        // bar honestly. If the early cover upload already started this feed, keep
-        // the visible progress and just seed the rest.
+
         barUpload.labName.textContent = '4. ' + (plan.method === 'local' ? 'Store' : 'Upload');
         const uploadFeed = sharedFeed || makeUploadBarUpdater(barUpload);
         if (!sharedFeed || !sharedFeed.hasAny || !sharedFeed.hasAny()) {
@@ -6453,14 +6419,17 @@
             setBar(barUpload, 0, '0%');
         }
         const result = await new Promise((resolve, reject) => {
-            const fp = mokuroFinalize(mokuroSessionId, { method: plan.method || null, localDir: plan.localDir }, (stage, msg) => {
+            const fp = mokuroFinalize(mokuroSessionId, {
+                method: plan.method || null,
+                localDir: plan.localDir,
+
+                overwrite: options.overwrite || null,
+            }, (stage, msg) => {
                 if (stage === 'upload_progress' || stage === 'upload') barUpload.wrap.style.display = 'flex';
-                // The initial "upload" frame announces every file + size, so
-                // pre-size the bar before the first byte arrives.
+
                 if (stage === 'upload' && msg && Array.isArray(msg.files) && uploadFeed.seed) {
                     uploadFeed.seed(msg.files);
                 }
-                // Keep the file count + total size on the bar when done.
                 if (stage === 'done' && uploadFeed.summary) {
                     const s = uploadFeed.summary();
                     if (barUpload.wrap.style.display === 'flex' && s.total > 0) {
@@ -6471,14 +6440,10 @@
                 }
                 if (options.automation) reportRunProgress(options, 'finalize', { stage: stage || null });
             }, uploadFeed);
-            // Poll the bridge's OCR status ~2.5/s so the Mokuro bar keeps moving
-            // while the finalize stream is open; the bridge also publishes live
-            // upload progress to the same /status endpoint, which keeps the bar
-            // moving even with older bridges that buffer their NDJSON frames.
-            // Headless callers can opt out.
+
             let poll = null;
             if (options.pollBridgeStatus !== false) {
-                poll = setInterval(async () => {
+                poll = setBackgroundInterval(async () => {
                     try {
                         const st = await mokuroStatus(mokuroSessionId);
                         if (!st) return;
@@ -6498,36 +6463,14 @@
                 }, 400);
             }
             if (poll && options.registerRunCleanup) {
-                options.registerRunCleanup(() => { if (poll) { clearInterval(poll); poll = null; } });
+                options.registerRunCleanup(() => { if (poll) { clearBackgroundInterval(poll); poll = null; } });
             }
-            fp.then(r => { if (poll) { clearInterval(poll); poll = null; } resolve(r); },
-                   e => { if (poll) { clearInterval(poll); poll = null; } reject(e); });
+            fp.then(r => { if (poll) { clearBackgroundInterval(poll); poll = null; } resolve(r); },
+                   e => { if (poll) { clearBackgroundInterval(poll); poll = null; } reject(e); });
         });
         return { result, plan };
     }
 
-    // =====================================================================
-    // Shared run harness
-    // =====================================================================
-    // Driven by the CMOA and ebookjapan pipelines; BookWalker's full and trial
-    // pipelines never call it and keep their own plumbing. It owns everything the
-    // user can see and everything the Mokuro bridge is told - same bars, same
-    // progress reporting, same session/finalize conversation, same ZIP assembly
-    // and naming - so the stores cannot drift apart.
-    //
-    // What stays site-specific is only *how* pages are fetched: BookWalker's
-    // lane/worker/descramble engine and CMOA's token/quality/quality-blacklist
-    // retry loop have nothing in common, and forcing them through one generic
-    // fetch loop would mean rewriting the tuned path that already works.
-    //
-    // Usage:
-    //   const H = createRunHarness(ui, mode, options, { title, archiveName, cid });
-    //   await H.mokuro.open();          // OCR runs only
-    //   H.showBars();
-    //   ...per page: H.notePage(idx, blob, crc) / H.noteFailure(idx, message)
-    //   await H.finishZip();  |  await H.finishOcr();
-    //   return H.outcome(missing === 0);
-    //   ...always: await H.cleanup()
     function createRunHarness(ui, mode, options, meta) {
         options = options || {};
         meta = meta || {};
@@ -6544,21 +6487,12 @@
         let finishedOk = false;
         let cleanedUp = false;
 
-        // Cleanup registry. run() used to own this list; the harness owns it now
-        // so a site pipeline cannot forget to unwind a poll or a worker pool.
         const cleanups = [];
         const registerCleanup = fn => { if (typeof fn === 'function') cleanups.push(fn); };
         options.registerRunCleanup = registerCleanup;
 
-        // Hold the panel for the whole run; cleanup() releases it, and both
-        // callers (cmoa/02-run.js, ebookjapan/05-run.js) run cleanup() in a
-        // finally, so the lock cannot outlive a failed run either. Without this
-        // only BookWalker locked, and the other two stores could start a second
-        // run over the same book while the first was still fetching.
         if (typeof ui.setRunLock === 'function') ui.setRunLock(true);
 
-        // One upload-bar feed shared by the early cover upload and finalize, so
-        // the bar tracks the whole multi-file upload (cover = file 1/N).
         const uploadFeed = makeUploadBarUpdater(barUpload);
         const coverState = { fired: false };
 
@@ -6573,16 +6507,12 @@
             setBar(barDescramble, 0, '0%');
         }
 
-        // Download bar = pages fetched from the CDN; Descramble bar = pages
-        // actually processed (zipped / handed to OCR). They diverge naturally.
         function refreshProgress() {
             const done = okIdx.size;
             const dl = Math.min(fetched, total);
             setBar(barDownload, total ? (dl / total) * 100 : 0, dl + '/' + total);
             setBar(barDescramble, total ? (done / total) * 100 : 0, done + '/' + total);
-            // The Mokuro bar is owned by the bridge status poll (updateMokuroBar,
-            // done/received/total). Never write it from here or the two writers
-            // fight and the label flickers.
+
         }
 
         const bumpFetched = n => { fetched += (Number(n) || 0); refreshProgress(); };
@@ -6609,14 +6539,6 @@
             refreshProgress();
         }
 
-        // ---------------------------------------------------------------
-        // Mokuro bridge conversation
-        // ---------------------------------------------------------------
-        // Pages are streamed to the bridge in strict page order (buffered until
-        // the gaps fill) rather than in completion order: BookWalker's lane engine
-        // settles pages out of order and CMOA's retry loop skips forward, so
-        // completion order is not a reliable sequence. A failed page is skipped,
-        // which keeps the volume contiguous.
         const mokuro = (mode !== 'ocr') ? null : (() => {
             let sessionId = null;
             let safeTitle = '';
@@ -6648,9 +6570,7 @@
             }
 
             function schedule() {
-                // Keep the concurrent GUI behaviour, but serialize the headless
-                // stream so the returned promise cannot race a POST that is
-                // still in flight after the last page is decoded.
+
                 if (!options.headless) { sendOrdered(); return; }
                 chain = chain.then(sendOrdered, sendOrdered).catch(e => {
                     errors.push('OCR stream: ' + safeLogText((e && e.message) || e));
@@ -6659,7 +6579,8 @@
 
             function startPoll() {
                 if (!sessionId || poll) return;
-                poll = setInterval(async () => {
+
+                poll = setBackgroundInterval(async () => {
                     const st = await mokuroStatus(sessionId);
                     if (!st) return;
                     const done = st.pages_ocr_done ?? 0;
@@ -6669,7 +6590,7 @@
                         pageCount: got, ocrPageCount: done, total: total
                     });
                 }, 700);
-                registerCleanup(() => { if (poll) { clearInterval(poll); poll = null; } });
+                registerCleanup(() => { if (poll) { clearBackgroundInterval(poll); poll = null; } });
             }
 
             return {
@@ -6677,8 +6598,6 @@
                 get safeTitle() { return safeTitle; },
                 get sent() { return sent; },
 
-                // Opening the session is deliberately identical for both stores:
-                // same bridge health gate, same idle gate, same session title.
                 async open() {
                     barWrap.style.display = 'flex';
                     barMokuro.wrap.style.display = 'flex';
@@ -6686,9 +6605,7 @@
                     if (!(await ensureBridgeRunning(25000))) {
                         throw new Error(MOKURO_BRIDGE_OFFLINE_MSG);
                     }
-                    // Never start a capture while the bridge is still working on a
-                    // previous run, unless an automation caller owns the bridge
-                    // lifecycle and asks us to skip this wait.
+
                     if (!options.skipBridgeIdleWait && !(await waitForBridgeIdle(60000))) {
                         throw new Error('The Mokuro Bridge is still busy with a previous OCR/upload — wait for it to finish, then try again.');
                     }
@@ -6714,10 +6631,6 @@
                     if (idx === nextIdx) schedule();
                 },
 
-                // Cover = first page: push it to the destination immediately
-                // (before OCR finishes) so the folder and upload bar show life right
-                // away. Headless/deferred runs stream pages only, with no cover
-                // side effect.
                 cover(idx, blob) {
                     if (options.skipCover || idx !== 1 || coverState.fired || !sessionId) return;
                     coverState.fired = true;
@@ -6745,37 +6658,41 @@
                             errors.push('Final OCR send page ' + i + ': ' + safeLogText((e && e.message) || e));
                         }
                     }
-                    if (poll) { clearInterval(poll); poll = null; }
+
                 },
 
                 async finalize() {
                     barMokuro.wrap.style.display = 'flex';
                     const { result, plan } = await finalizeOcrSession(
                         sessionId, ui, barUpload, barMokuro, total, uploadFeed, options);
+
+                    const partial = !!(result && result.partialUpload);
+                    if (partial) errors.push(msgPartialUpload(result));
                     const missing = total - okIdx.size;
                     if (missing > 0) {
                         if (!options.headless) setRunDetails(details, msgOcrPartial(missing, total), errors);
                         return { result, plan, missing, ok: false };
                     }
                     if (!options.headless) {
-                        if (plan && plan.method === 'local') {
-                            const localPath = storedPathOf(result) || plan.localDir;
-                            if (localPath) details.textContent = msgStoredLocal(localPath);
-                        } else if (plan && plan.method) {
-                            const rp = result && (result.remote_path || result.mega_path);
-                            if (rp) details.textContent = msgUploadedTo(methodShortLabel(plan.method), rp);
+                        if (partial) {
+                            setRunDetails(details, msgPartialUpload(result), errors);
+                        } else {
+                            if (plan && plan.method === 'local') {
+                                const localPath = storedPathOf(result) || plan.localDir;
+                                if (localPath) details.textContent = msgStoredLocal(localPath);
+                            } else if (plan && plan.method) {
+                                const rp = result && (result.remote_path || result.mega_path);
+                                if (rp) details.textContent = msgUploadedTo(methodShortLabel(plan.method), rp);
+                            }
+                            if (errors.length) appendRunDetails(details, errors, 'Issues during the run');
                         }
-                        if (errors.length) appendRunDetails(details, errors, 'Issues during the run');
                     }
-                    if (!options.headless) {
-                        ui.showReaderButton(result);
-                        ui.showStoredButton(result);
-                    }
-                    return { result, plan, missing, ok: true };
+
+                    ui.showReaderButton(result);
+                    ui.showStoredButton(result);
+                    return { result, plan, missing, ok: !partial };
                 },
 
-                // Deferred mode is deliberately page-stream-only: the external
-                // CLI owns /finalize (and any upload/delete policy) later.
                 deferred() {
                     if (runResult) {
                         runResult.pageCount = okIdx.size;
@@ -6793,14 +6710,6 @@
             };
         })();
 
-        // ---------------------------------------------------------------
-        // Page accounting
-        // ---------------------------------------------------------------
-        // A successfully fetched+processed page: counted for both bars, added to
-        // the archive, cached for a resume, and handed to OCR. Sites call this
-        // exactly once per page that produced usable output. `ext` overrides the
-        // archive extension for a page whose bytes could not be re-encoded to the
-        // selected codec (CMOA passes the real one when it kept raw bytes).
         function notePage(idx, blob, crc, ext) {
             okIdx.add(idx);
             failedIdx.delete(idx);
@@ -6820,8 +6729,6 @@
             refreshProgress();
         }
 
-        // A page served from the page cache: already correct, no fetch, no
-        // descramble, no re-upload of the source, so it counts as both.
         function noteCached(idx, blob, crc) {
             okIdx.add(idx);
             failedIdx.delete(idx);
@@ -6834,9 +6741,6 @@
             refreshProgress();
         }
 
-        // ---------------------------------------------------------------
-        // Finishing
-        // ---------------------------------------------------------------
         async function finishZip() {
             if (!zip || okIdx.size === 0) {
                 setRunDetails(details, msgAllFailedZip(), errors);
@@ -6874,19 +6778,11 @@
                 details.textContent = msgZipSaved(entries.length, fmtBytes(zipBlob.size), secs);
                 if (errors.length) appendRunDetails(details, errors, 'Issues during the run');
             }
-            // Matches the long-standing rule: an error-free run clears the page
-            // cache, any run that logged an error keeps it so the next attempt
-            // resumes instead of re-fetching the whole volume.
+
             finishedOk = errors.length === 0;
             return outcome(missing === 0);
         }
 
-        // ---------------------------------------------------------------
-        // Outcome + teardown
-        // ---------------------------------------------------------------
-        // Normalize the result object for automated callers. Sites pass whether
-        // the run was good; the page accounting is filled in here so every store
-        // reports identically.
         function outcome(ok) {
             if (!runResult) return ok;
             runResult.total = total;
@@ -6905,13 +6801,10 @@
             }
             cleanups.length = 0;
             if (finishedOk && options.usePageCache) { try { await clearPageCache(); } catch (e) {} }
-            // Guarded to match the acquire above: a reduced ui (the headless
-            // mirror) must degrade to "no lock", not throw during teardown.
+
             if (typeof ui.setRunLock === 'function') ui.setRunLock(false);
         }
 
-        // Report a thrown run: automation callers get a structured result, the
-        // panel gets the one-line message.
         function reportFailure(e) {
             const message = (e && e.message) ? safeLogText(e.message)
                 : 'something went wrong — see the browser console for details.';
@@ -6940,26 +6833,7 @@
             details,
         };
     }
-    // =====================================================================
-    // Site adapters — one userscript, three stores
-    // =====================================================================
-    // A site adapter supplies only the four things that genuinely differ between
-    // the stores: detection (which store is this page?), metadata (title,
-    // series/volume, page count, archive name), page enumeration (what to fetch,
-    // in reading order), and fetch + descramble (one page → finished image Blob).
-    // Everything else - panel, controls, bars, Mokuro conversation, stat cards,
-    // ZIP naming/assembly, page cache, headless automation - lives in core and is
-    // shared verbatim, which is what keeps the paths from drifting apart.
-    //
-    // Contract:
-    //   id, label, panelTitle      identity shown in the panel
-    //   matches()                  true when this adapter owns the page
-    //   install()                  page hooks; called once, at load
-    //   refresh()                  optional: top up metadata before it is read
-    //   getBook()                  { rawTitle, title, series, volNum } or null
-    //   getPreview()               { title, pages, resolution, type } or null
-    //   getCid()                   stable id, used for the page cache
-    //   run(ui, mode, options)     the download pipeline for this store
+
     const SITE_REGISTRY = [];
     let ACTIVE_SITE = null;
 
@@ -6968,15 +6842,32 @@
         return adapter;
     }
 
+    function storeOwnsHost() {
+        for (const adapter of SITE_REGISTRY) {
+            let owns = false;
+            try { owns = typeof adapter.ownsHost === 'function' && !!adapter.ownsHost(); } catch (e) { owns = false; }
+            if (owns) return true;
+        }
+        return false;
+    }
+
     function detectSite() {
         for (const adapter of SITE_REGISTRY) {
             let owned = false;
             try { owned = !!adapter.matches(); } catch (e) { owned = false; }
             if (owned) return adapter;
         }
-        // BookWalker is the default: it is the original site for this script,
-        // and its panel is also what a bare injected copy (tests, devtools)
-        // expects to get on a host no adapter claims.
+
+        if (isHeadlessPage()) {
+            for (const adapter of SITE_REGISTRY) {
+                let owned = false;
+                try { owned = typeof adapter.headlessMatches === 'function' && !!adapter.headlessMatches(); } catch (e) { owned = false; }
+                if (owned) return adapter;
+            }
+        }
+
+        if (storeOwnsHost()) return null;
+
         return SITE_REGISTRY.find(a => a.id === 'bookwalker') || SITE_REGISTRY[0] || null;
     }
 
@@ -6987,8 +6878,6 @@
         }
         return '';
     }
-    // detectSite() always yields an adapter, so naming one store's pipeline as a
-    // fallback here was dead code and a dependency the shared core should not have.
     function siteRun(ui, mode, options) {
         if (ACTIVE_SITE && typeof ACTIVE_SITE.run === 'function') {
             return ACTIVE_SITE.run(ui, mode, options);
@@ -7000,15 +6889,16 @@
         return (ACTIVE_SITE && ACTIVE_SITE.panelTitle) || 'BookWalker Native Downloader';
     }
 
-    // Shared panel bring-up. Both stores get the identical UI, the identical
-    // button wiring and the identical "wait for the viewer, then show the book
-    // card + reading stats" loop; only the adapter's own answers differ.
     function bootSharedPanel(site) {
         ACTIVE_SITE = site;
         installHeadlessAutomation();
-        // A headless/CLI page gets no panel, no bridge-health tick and no stats
-        // loop: the caller owns all of that.
+
         if (isHeadlessPage()) return null;
+
+        try {
+            const proto = location.protocol;
+            if (proto !== 'http:' && proto !== 'https:') return null;
+        } catch (e) {}
 
         const ui = buildUI();
         const launch = mode => {
@@ -7017,9 +6907,7 @@
                 .catch(e => {
                     const text = safeLogText((e && e.message) || e);
                     console.warn('[bwdd] ' + site.id + ' run failed: ' + text);
-                    // A rejected run must land on the panel, not only in the
-                    // console, or the bars sit at 0/0 and the click looks like it did
-                    // nothing. Un-hide the details box too.
+
                     try {
                         setRunDetails(ui.details, 'the run failed: ' + text, []);
                         if (ui.details) ui.details.hidden = false;
@@ -7038,13 +6926,10 @@
             let statsKicked = false;
             let lastStoresKey = null;
             let lastArchiveSource = null;
-            // The viewer fills its metadata in asynchronously, so poll briefly
-            // rather than reading the title once and settling for document.title.
+
             for (let i = 0; i < 40; i++) {
                 await new Promise(r => setTimeout(r, 500));
-                // Let the adapter top up its own metadata first: CMOA's viewer
-                // fills its page list in after the document is ready, so the
-                // answers below are only as good as the last refresh.
+
                 if (typeof site.refresh === 'function') {
                     try { await site.refresh(); } catch (e) {}
                 }
@@ -7061,12 +6946,7 @@
                         statsKicked = true;
                     } catch (e) {}
                 }
-                // Which other shops carry it, linked to their store pages. This
-                // re-runs when the title or volume changes rather than latching on the
-                // first pass: the viewer publishes metadata asynchronously, and a
-                // lookup fired against a placeholder title comes back "not found" at
-                // every shop. typeof, not try/catch: the availability module is in the
-                // combined build only, so the identifier may not exist at all.
+
                 if (typeof lookupAvailability === 'function' && book && (book.series || book.title)) {
                     const storesKey = String(book.series || book.title).trim() + '|' +
                         (book.volNum == null ? '' : book.volNum);
@@ -7086,7 +6966,8 @@
 
         return ui;
     }
-    async function downloadTrialZip(ui, config, contents, title, sv, mode, details, archiveName, options = {}) {
+
+async function downloadTrialZip(ui, config, contents, title, sv, mode, details, archiveName, options = {}) {
         const { barDownload, barDescramble, barMokuro, barUpload } = ui;
         const zip = mode === 'zip' ? { entries: [] } : null;
         const errors = options.errors || [];
@@ -7137,9 +7018,7 @@
             if (!(await ensureBridgeRunning(25000))) {
                 throw new Error(MOKURO_BRIDGE_OFFLINE_MSG);
             }
-            // Don't start a capture while the bridge is still working on a
-            // previous run, unless the automation caller explicitly owns the
-            // bridge lifecycle and asks us to skip this global wait.
+
             if (!options.skipBridgeIdleWait && !(await waitForBridgeIdle(60000))) {
                 throw new Error('The Mokuro Bridge is still busy with a previous OCR/upload — wait for it to finish, then try again.');
             }
@@ -7157,7 +7036,8 @@
                 sessionId: mokuroSessionId || null, safeTitle: runSafeTitle, total: total
             });
             if (options.pollBridgeStatus !== false) {
-                ocrPoll = setInterval(async () => {
+
+                ocrPoll = setBackgroundInterval(async () => {
                     const st = await mokuroStatus(mokuroSessionId);
                     if (!st) return;
                     const done = (st.pages_ocr_done ?? 0);
@@ -7168,15 +7048,14 @@
                     });
                 }, 700);
                 if (options.registerRunCleanup) options.registerRunCleanup(() => {
-                    if (ocrPoll) { clearInterval(ocrPoll); ocrPoll = null; }
+                    if (ocrPoll) { clearBackgroundInterval(ocrPoll); ocrPoll = null; }
                 });
             }
         }
 
         let fetched = 0;
         let nextIdx = 0;
-        // One upload-bar feed shared by the early cover upload and finalize so
-        // the bar tracks the whole multi-file upload (cover = file 1/N).
+
         const trialUploadFeed = makeUploadBarUpdater(barUpload);
         const trialCoverState = { fired: false };
         async function worker() {
@@ -7207,9 +7086,7 @@
                     fetched++;
                     if (zip) zip.entries.push({ path: 'page-' + String(pageIdx).padStart(4, '0') + '.' + IMAGE_CODEC.ext, blob });
                     if (mode === 'ocr' && mokuroSessionId) {
-                        // Cover = first page: push it before OCR finishes so the
-                        // folder + upload bar show life; deferred automation
-                        // intentionally sends pages only.
+
                         if (!options.skipCover && pageIdx === 1 && !trialCoverState.fired) {
                             trialCoverState.fired = true;
                             uploadCoverEarly({
@@ -7231,8 +7108,6 @@
                     errors.push(j.fid + '#' + j.no + ': ' + safeLogText((e && e.message) || e));
                 }
                 const el = (performance.now() - t1) / 1000;
-                // Download bar tracks pages fetched from the CDN; Descramble
-                // bar tracks pages processed (zipped / sent to OCR).
                 setBar(barDownload, (fetched / total) * 100, fetched + '/' + total);
                 setBar(barDescramble, (okIdx.size / total) * 100, okIdx.size + '/' + total);
                 reportRunProgress(options, 'page', {
@@ -7250,21 +7125,24 @@
             setRunDetails(details,
                 msgAllFailedZip(),
                 errors);
-            if (ocrPoll) { clearInterval(ocrPoll); ocrPoll = null; }
+            if (ocrPoll) { clearBackgroundInterval(ocrPoll); ocrPoll = null; }
             return outcome(false);
         }
         if (mode === 'ocr' && mokuroSessionId) {
-            if (ocrPoll) { clearInterval(ocrPoll); ocrPoll = null; }
+            if (ocrPoll) { clearBackgroundInterval(ocrPoll); ocrPoll = null; }
             const missingOcr = total - okIdx.size;
             if (options.deferFinalize) {
-                // Deferred mode is deliberately page-stream-only.  The external
-                // CLI owns /finalize (and any upload/delete policy) later.
+
                 reportRunProgress(options, 'deferred-finalize', {
                     pageCount: okIdx.size, total: total, deferredFinalize: true
                 });
                 return outcome(missingOcr === 0);
             }
             const { result, plan } = await finalizeOcrSession(mokuroSessionId, ui, barUpload, barMokuro, total, trialUploadFeed, options);
+
+            const partialUpload = !!(result && result.partialUpload);
+            const partialMsg = partialUpload ? msgPartialUpload(result) : '';
+            if (partialUpload) errors.push(partialMsg);
             barMokuro.fill.style.width = '100%';
             barMokuro.labRate.textContent = okIdx.size + '/' + okIdx.size;
             if (missingOcr > 0) {
@@ -7272,14 +7150,16 @@
                     msgOcrPartial(missingOcr, total),
                     errors);
             } else {
-                if (plan && plan.method === 'local') {
+                if (partialUpload) {
+                    setRunDetails(details, partialMsg, errors);
+                } else if (plan && plan.method === 'local') {
                     const localPath = storedPathOf(result) || plan.localDir;
                     if (localPath) details.textContent = msgStoredLocal(localPath);
                 } else if (plan && plan.method) {
                     const rp = result && (result.remote_path || result.mega_path);
                     if (rp) details.textContent = msgUploadedTo(methodShortLabel(plan.method), rp);
                 }
-                if (errors.length) appendRunDetails(details, errors, 'Issues during the run');
+                if (!partialUpload && errors.length) appendRunDetails(details, errors, 'Issues during the run');
             }
             ui.showReaderButton(result);
             ui.showStoredButton(result);
@@ -7307,8 +7187,7 @@
                 details.textContent = msgZipSaved(zipEntries.length, fmtBytes(zipBlob.size), secs);
                 if (errors.length) appendRunDetails(details, errors, 'Issues during the run');
             }
-            // Return success only when nothing is missing: a partial run keeps
-            // its page cache so the next run resumes the missing pages.
+
             return outcome(missing === 0);
         }
         return outcome(false);
@@ -7323,10 +7202,7 @@
         } catch (e) { state.viewerEntries = []; }
     }
     function resetRunState() {
-        // All captured state below is per-book. If this tab has moved to a
-        // different cid (SPA-style navigation), the cached config/keys belong
-        // to the previous book and would silently download the wrong pages
-        // (every CDN path 403s as "session auth expired").
+
         const currentCid = (new URLSearchParams(location.search)).get('cid') || '';
         const cidChanged = currentCid !== state.cid;
         state.cid = currentCid;
@@ -7345,7 +7221,7 @@
         }
     }
 
-    async function run(ui, mode, options) {
+async function run(ui, mode, options) {
         const runOptions = normalizeRunOptions(options, mode);
         const runResult = runOptions.automation
             ? (runOptions.result || newAutomationResult(mode, state.cid, runOptions.deferFinalize))
@@ -7356,10 +7232,7 @@
         }
         const { details, statsEl, barWrap, barDownload, barDescramble, barMokuro, barUpload } = ui;
         let finishedOk = false;
-        // Lock the buttons + destination pickers for the whole run: no second
-        // download can start concurrently (the 10 s bridge-health tick must
-        // never re-enable anything mid-run) and the destination cannot change
-        // under it. Previous reader/stored buttons and the Upload bar are cleared.
+
         ui.setRunLock(true);
         ui.hideReaderButton();
         ui.hideStoredButton();
@@ -7479,8 +7352,7 @@
             let mokuroSessionId = null;
             let ocrPoll = null;
             let runSafeTitle = '';
-            // One upload-bar feed shared by the early cover upload and finalize
-            // so the bar tracks the whole multi-file upload (cover = file 1/N).
+
             const runUploadFeed = makeUploadBarUpdater(barUpload);
             const runCoverState = { fired: false };
             if (mode === 'ocr') {
@@ -7492,9 +7364,7 @@
                 if (!bridgeOk) {
                     throw new Error(MOKURO_BRIDGE_OFFLINE_MSG);
                 }
-                // Don't start a capture while the bridge is still working on a
-                // previous run, unless an automation caller explicitly skips
-                // this global wait.
+
                 if (!runOptions.skipBridgeIdleWait && !(await waitForBridgeIdle(60000))) {
                     throw new Error('The Mokuro Bridge is still busy with a previous OCR/upload — wait for it to finish, then try again.');
                 }
@@ -7512,7 +7382,8 @@
                     sessionId: mokuroSessionId || null, safeTitle: runSafeTitle, total: total
                 });
                 if (runOptions.pollBridgeStatus) {
-                    ocrPoll = setInterval(async () => {
+
+                    ocrPoll = setBackgroundInterval(async () => {
                         const st = await mokuroStatus(mokuroSessionId);
                         if (!st) return;
                         const done = st.pages_ocr_done ?? 0;
@@ -7523,7 +7394,7 @@
                         });
                     }, 700);
                     registerRunCleanup(() => {
-                        if (ocrPoll) { clearInterval(ocrPoll); ocrPoll = null; }
+                        if (ocrPoll) { clearBackgroundInterval(ocrPoll); ocrPoll = null; }
                     });
                 }
             }
@@ -7553,7 +7424,7 @@
             startAuthTimers();
             registerRunCleanup(() => {
                 stopAuthTimers();
-                if (ocrPoll) { clearInterval(ocrPoll); ocrPoll = null; }
+                if (ocrPoll) { clearBackgroundInterval(ocrPoll); ocrPoll = null; }
                 if (pool) pool.terminate();
             });
 
@@ -7589,9 +7460,7 @@
                 }
             }
             function scheduleOcrStreaming() {
-                // Keep the existing concurrent GUI behavior, but serialize the
-                // headless stream so the returned promise cannot race a POST
-                // that is still in flight after the last page is decoded.
+
                 if (!runOptions.headless) {
                     sendOcrStreaming();
                     return;
@@ -7608,9 +7477,7 @@
                 const dlCount = Math.min(fetchedCount, total);
                 setBar(barDownload, (dlCount / total) * 100, dlCount + '/' + total);
                 setBar(barDescramble, (deCount / total) * 100, deCount + '/' + total);
-                // NOTE: the Mokuro bar is owned by the dedicated bridge status
-                // poll (updateMokuroBar, done/received/total), never write it
-                // from here or the two writers fight and the label flickers.
+
             }
 
             function settleJob(job, error, blob, crc) {
@@ -7630,9 +7497,7 @@
                         crc: Number.isInteger(crc) ? crc : undefined,
                     });
                     if (runOptions.usePageCache && state.cid) cachePage(state.cid, job.index, blob, crc);
-                    // Cover = first page: push it before OCR finishes so the
-                    // folder + upload bar show life; headless automation
-                    // suppresses this extra endpoint and streams pages only.
+
                     if (!runOptions.skipCover && mokuroSessionId && job.index === 1 && !runCoverState.fired) {
                         runCoverState.fired = true;
                         uploadCoverEarly({
@@ -7725,9 +7590,7 @@
                             const res = await cdnFetchWithFallback(j.rel, fKey, 45000);
                             if (!res.ok) throw new Error('HTTP ' + res.status);
                             const blob = await res.blob();
-                            // Time the whole fetch+body: GM_xhr's onload and
-                            // fetch()'s resolution fire at different points, so
-                            // header-only timing would under-report the gm lane.
+
                             recordLane(res._lane, performance.now() - t0, blob.size);
                             return { blob };
                         } catch (e) {
@@ -7755,8 +7618,7 @@
                         const msg = safeLogText((e && e.message) || e);
                         ready.push({ job: j, blob: null, error: msg });
                     } finally {
-                        // Exactly one progress tick per job, including the
-                        // 'blocked' path (which the old code silently skipped).
+
                         bumpFetched(1);
                         wake();
                         prefetchInFlight.delete(j.index);
@@ -7781,8 +7643,7 @@
 
                 async function consumeOne() {
                     while (consumed < totalJobs) {
-                        // Keep a small multiple of worker capacity buffered: an
-                        // unbounded pool queue would retain the whole volume.
+
                         while (pending.size >= PIPELINE_LIMIT) {
                             await Promise.race([
                                 waitForWake(),
@@ -7793,8 +7654,7 @@
                         while (!item) {
                             const idx = ready.length ? 0 : -1;
                             if (idx !== -1) {
-                                // Remove on dispatch: a `dispatched` flag alone
-                                // kept every source Blob alive until runJobs ended.
+
                                 item = ready.splice(idx, 1)[0];
                             } else if (prefetchInFlight.size === 0 && prefetchIdx >= jobList.length && ready.length === 0) {
                                 break;
@@ -7819,8 +7679,7 @@
                         const p = new Promise(res => { job._resolve = res; });
                         promises.push(p);
                         if (item.error) {
-                            // Prefetch already exhausted its retry/auth path; let
-                            // the outer retry round handle it.
+
                             settleJob(job, item.error, null);
                         } else if (pool && item.blob) {
                             pool.submit({ ...job, blob: item.blob });
@@ -7863,8 +7722,6 @@
                 await Promise.all(promises);
                 stopAuthTimers();
 
-                // What each transport lane delivered: a separate origin carries a
-                // real share at similar latency; one sharing a socket pool stays ~0%.
                 if (BWDD_DEBUG) console.info('[bwdd] transport lanes:', laneSummary());
                 } finally {
                     pipelineDrain = null;
@@ -7922,15 +7779,11 @@
                 reportRunProgress(runOptions, 'total', { total: total });
             }
             if (cachedCount) {
-                // Cache hits were fetched in an earlier run; count them so the
-                // Download bar shares the Descramble bar's baseline instead of
-                // showing only pages newly fetched this run.
+
                 fetchedCount += cachedCount;
                 refreshProgress();
             }
 
-            // Probe optional transport mirrors only for the normal panel path:
-            // headless callers own the browser/bridge lifecycle.
             if (!runOptions.headless) {
                 try { await probeFetchProxy(); } catch (e) {}
                 try { await probeEdgeMirror(); } catch (e) {}
@@ -7984,11 +7837,10 @@
                     }
                     catch (e) { errors.push('Final OCR send page ' + i + ': ' + safeLogText((e && e.message) || e)); }
                 }
-                if (ocrPoll) { clearInterval(ocrPoll); ocrPoll = null; }
+                if (ocrPoll) { clearBackgroundInterval(ocrPoll); ocrPoll = null; }
                 const missingOcr = total - okIdx.size;
                 if (runOptions.deferFinalize) {
-                    // Return only after every descrambled page POST has settled;
-                    // the external CLI owns the later /finalize request.
+
                     runResult.pageCount = okIdx.size;
                     runResult.total = total;
                     runResult.errors = errors;
@@ -8002,6 +7854,10 @@
                 }
                 barMokuro.wrap.style.display = 'flex';
                 const { result, plan } = await finalizeOcrSession(mokuroSessionId, ui, barUpload, barMokuro, total, runUploadFeed, runOptions);
+
+                const partialUpload = !!(result && result.partialUpload);
+                const partialMsg = partialUpload ? msgPartialUpload(result) : '';
+                if (partialUpload) errors.push(partialMsg);
                 const secs = ((performance.now() - t0) / 1000).toFixed(1);
                 if (failedIdx.size === 0 && errors.length === 0) finishedOk = true;
                 barMokuro.fill.style.width = '100%';
@@ -8011,14 +7867,16 @@
                         msgOcrPartial(missingOcr, total),
                         errors);
                 } else {
-                    if (!runOptions.headless && plan && plan.method === 'local') {
+                    if (!runOptions.headless && partialUpload) {
+                        setRunDetails(details, partialMsg, errors);
+                    } else if (!runOptions.headless && plan && plan.method === 'local') {
                         const localPath = storedPathOf(result) || plan.localDir;
                         if (localPath) details.textContent = msgStoredLocal(localPath);
                     } else if (!runOptions.headless && plan && plan.method) {
                         const rp = result && (result.remote_path || result.mega_path);
                         if (rp) details.textContent = msgUploadedTo(methodShortLabel(plan.method), rp);
                     }
-                    if (!runOptions.headless && errors.length) appendRunDetails(details, errors, 'Issues during the run');
+                    if (!runOptions.headless && !partialUpload && errors.length) appendRunDetails(details, errors, 'Issues during the run');
                 }
                 if (runResult) {
                     runResult.pageCount = okIdx.size;
@@ -8090,8 +7948,7 @@
             const secs = ((performance.now() - t0) / 1000).toFixed(1);
             if (errors.length === 0) finishedOk = true;
             const missing = total - okIdx.size;
-            // A missing manifest section contributes no page indices, so `missing`
-            // alone would still read "Saved 250 of 250" while a section failed.
+
             if (missing > 0 || missingSections.length) {
                 setRunDetails(details, msgZipPartial(okIdx.size, total), errors);
             } else {
@@ -8122,13 +7979,12 @@
         } finally {
             try { cleanupRun(); } catch (e) {}
             if (finishedOk && runOptions.usePageCache) await clearPageCache();
-            // Re-derive the enabled state from the bridge health, if the
-            // bridge dropped mid-run, the OCR button stays disabled afterwards.
+
             ui.setRunLock(false);
         }
     }
 
-    function decodeConfig(content) {
+function decodeConfig(content) {
         const c = String(content || '');
         if (c.indexOf('"data":"') === -1) {
             try {
@@ -8155,7 +8011,7 @@
         return JSON.parse(jsonStr);
     }
 
-    function buildBookPreview() {
+function buildBookPreview() {
         try {
             const rawTitle = state.cti || document.title || '';
             const title = cleanTitle(rawTitle) || state.cid || 'Unknown Book';
@@ -8186,23 +8042,28 @@
         } catch (e) { return null; }
     }
 
-    // =====================================================================
-    // BookWalker site adapter
-    // =====================================================================
-    // BookWalker is the original site, so its pipeline is unchanged; only its
-    // identity and metadata answers are exposed here.
+    function bwOwnsHost() {
+        try { return /(^|\.)bookwalker\.jp$/i.test(location.hostname); } catch (e) { return false; }
+    }
     registerSite({
         id: 'bookwalker',
         label: 'BookWalker',
         panelTitle: 'BookWalker Native Downloader',
+        ownsHost() {
+            return bwOwnsHost();
+        },
         matches() {
+
             try {
-                return /(^|\.)bookwalker\.jp$/i.test(location.hostname);
+                return bwOwnsHost() && /^viewer(-trial|-ptrial|-subscription)?\.bookwalker\.jp$/i.test(location.hostname);
             } catch (e) { return false; }
         },
+        headlessMatches() {
+
+            return bwOwnsHost();
+        },
         install() {
-            // A headless CLI run may deliberately defer the capture and call
-            // activateCapture() itself once the page is where it wants it.
+
             if (!shouldDeferNetworkCapture()) installNetworkCapture();
         },
         getBook() {
@@ -8216,57 +8077,273 @@
         archiveDefault(rawTitle) { return archiveDefaultName(rawTitle) || fsSafePath(state.cid || ''); },
         run(ui, mode, options) { return run(ui, mode, options); },
         state: state,
-        // Console surface for this store only; the entry point merges whatever
-        // the active adapter puts here into window.__bwdd.
+
         debug: {
             decodeConfig, pageSeedsNo, A9p, b8gNo, state, buildWorkerSource,
             fetchAndDescramble, cdnFetch, cdnFetchWithFallback,
+
+            bwHeadlessCrFromLoader, bwHeadlessCr, bwHeadlessOpenFree, bwHeadlessWanted,
         },
     });
-    // =====================================================================
-    // Initialization
-    // =====================================================================
-    // One entry point for both stores. The adapter is chosen from the host,
-    // given the chance to install its page hooks, and then the shared panel is
-    // brought up against it. A host no adapter claims still gets the
-    // BookWalker adapter, which is what a bare injected copy expects.
+
+    const BW_HEADLESS_API = 'https://viewer.bookwalker.jp';
+    const BW_HEADLESS_LOADER = '/browserWebApi/03/getLoader';
+    const BW_HEADLESS_CR_KEY = 'bwdd.bw.headless.cr';
+
+    const BW_PRODUCT_PATH = /^\/de([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\/?$/i;
+    function bwProductId(where) {
+        try {
+            const path = where ? new URL(where, location.href).pathname : location.pathname;
+            const m = BW_PRODUCT_PATH.exec(path);
+            return m ? m[1] : null;
+        } catch (e) { return null; }
+    }
+
+    function bwHeadlessCid() {
+        return bwProductId(location.href) || '';
+    }
+
+    function bwHeadlessWanted() {
+        try {
+            if (state.auth && state.baseUrl) return false;
+            return !!bwProductId(location.href);
+        } catch (e) { return false; }
+    }
+
+    const BW_HEADLESS_ARITH = /^(?:[0-9.eE+\-*/(),\s]|Math\.(?:asin|acos|atan2?|sin|cos|tan|sqrt|cbrt|pow|abs|round|floor|ceil|trunc|sign|exp|log|log2|log10|hypot|min|max|fround|sinh|cosh|tanh))*$/;
+
+    function bwHeadlessCrFromLoader(text) {
+        const src = String(text || '');
+        const m = /(?:^|[^A-Za-z0-9_$.])c9P\s*=\s*function\s*\(\s*\)\s*\{/.exec(src);
+        if (!m) return '';
+
+        const open = src.indexOf('{', m.index);
+        if (open < 0) return '';
+        let depth = 0;
+        let quote = '';
+        let end = -1;
+        for (let i = open; i < src.length; i++) {
+            const ch = src[i];
+            if (quote) {
+                if (ch === '\\') { i++; continue; }
+                if (ch === quote) quote = '';
+                continue;
+            }
+            if (ch === '"' || ch === "'" || ch === '`') { quote = ch; continue; }
+            if (ch === '{') depth++;
+            else if (ch === '}') { depth--; if (!depth) { end = i; break; } }
+        }
+        if (end < 0) return '';
+        const body = src.slice(open + 1, end);
+
+        const exprM = /(?:let|var|const)\s+[A-Za-z_$][A-Za-z0-9_$]*\s*=\s*([^;]+);/.exec(body);
+        if (!exprM) return '';
+        const expr = exprM[1].trim();
+        if (!BW_HEADLESS_ARITH.test(expr)) return '';
+        const precisionM = /toFixed\(\s*(\d{1,2})\s*\)/.exec(body);
+        const suffixM = /["']([0-9]{1,12})["']\s*;?\s*\}?\s*$/.exec(body.trim());
+        if (!precisionM || !suffixM) return '';
+        let r = NaN;
+        try {
+
+            r = Number(new Function('return (' + expr + ');')());
+        } catch (e) { return ''; }
+        if (!isFinite(r)) return '';
+        const s = '' + r.toFixed(parseInt(precisionM[1], 10));
+        const dot = s.indexOf('.');
+        if (dot < 0) return '';
+        const cr = s.substring(dot + 1, s.length - 1) + suffixM[1];
+        return /^[0-9]{6,32}$/.test(cr) ? cr : '';
+    }
+
+    async function bwHeadlessCr() {
+
+        let cached = '';
+        try { cached = sessionStorage.getItem(BW_HEADLESS_CR_KEY) || ''; } catch (e) { cached = ''; }
+        if (/^[0-9]{6,32}$/.test(cached)) return cached;
+        const res = await bwHeadlessGet(BW_HEADLESS_API + BW_HEADLESS_LOADER);
+        if (!res || res.status !== 200 || !res.text) {
+            throw new Error('BookWalker licence bootstrap failed: the reader loader answered HTTP ' +
+                ((res && res.status) || '?') + '.');
+        }
+        const cr = bwHeadlessCrFromLoader(res.text);
+        if (!cr) throw new Error('BookWalker licence bootstrap failed: the reader loader did not expose its licence nonce.');
+        try { sessionStorage.setItem(BW_HEADLESS_CR_KEY, cr); } catch (e) {}
+        return cr;
+    }
+
+    let bwHeadlessCookies = '';
+
+    function bwHeadlessHeaderValue(headers, name) {
+        const text = String(headers || '');
+        const re = new RegExp('^' + name + ':\\s*(.*)$', 'gim');
+        const m = re.exec(text);
+        return m ? m[1].trim() : '';
+    }
+
+    function bwHeadlessAbsorbCookies(headers) {
+        const text = String(headers || '');
+        const found = [];
+        const re = /^set-cookie:\s*([^=\s;]+)=([^;\s]*)/gim;
+        let m;
+        while ((m = re.exec(text))) found.push(m[1] + '=' + m[2]);
+        if (!found.length) return;
+        const jar = new Map();
+        for (const pair of (bwHeadlessCookies ? bwHeadlessCookies.split('; ') : [])) {
+            const eq = pair.indexOf('=');
+            if (eq > 0) jar.set(pair.slice(0, eq), pair.slice(eq + 1));
+        }
+        for (const pair of found) {
+            const eq = pair.indexOf('=');
+            if (eq > 0) jar.set(pair.slice(0, eq), pair.slice(eq + 1));
+        }
+        bwHeadlessCookies = Array.from(jar, ([k, v]) => k + '=' + v).join('; ');
+    }
+
+    function bwHeadlessRequest(url) {
+        const headers = { Accept: '*/*' };
+        if (bwHeadlessCookies) headers.Cookie = bwHeadlessCookies;
+        if (typeof GM_xmlhttpRequest === 'function') {
+            return new Promise((resolve, reject) => {
+                GM_xmlhttpRequest({
+                    method: 'GET', url: url, headers: headers, timeout: 20000,
+                    onload: r => {
+                        bwHeadlessAbsorbCookies(r && r.responseHeaders);
+                        resolve({ status: r && r.status, text: (r && r.responseText) || '' });
+                    },
+                    onerror: e => reject(new Error('GM_xhr: ' + ((e && e.error) || 'request failed'))),
+                    ontimeout: () => reject(new Error('GM_xhr: Timeout')),
+                });
+            });
+        }
+        return fetchWithTimeout(url, { credentials: 'include', headers: headers }, 20000)
+            .then(async r => {
+                try { bwHeadlessAbsorbCookies(Array.from(r.headers || []).map(p => 'set-cookie: ' + p[1]).join('\n')); } catch (e) {}
+                return { status: r.status, text: await r.text() };
+            });
+    }
+
+    function bwHeadlessGet(url) {
+        return bwHeadlessRequest(url);
+    }
+
+    const BW_HEADLESS_VIEW = '/browserWebApi/03/view?cid=';
+
+    async function bwHeadlessOpenFree(cid) {
+        state.cid = cid;
+
+        state.apiBase = BW_HEADLESS_API;
+        let last = null;
+        for (let attempt = 0; attempt < 2; attempt++) {
+
+            if (attempt) {
+                try { sessionStorage.removeItem(BW_HEADLESS_CR_KEY); } catch (e) {}
+                bwHeadlessCookies = '';
+            }
+            try {
+                await bwHeadlessGet(BW_HEADLESS_API + BW_HEADLESS_VIEW + encodeURIComponent(cid));
+                const cr = await bwHeadlessCr();
+                const url = BW_HEADLESS_API + '/browserWebApi/c?cid=' + encodeURIComponent(cid) +
+                    '&BID=' + encodeURIComponent(getBID()) + '&cr=' + encodeURIComponent(cr);
+                const res = await bwHeadlessGet(url);
+                let d = null;
+                try { d = res && res.text ? JSON.parse(res.text) : null; } catch (e) { d = null; }
+                if (d && d.auth_info && d.url) {
+                    state.auth = d.auth_info;
+                    state.baseUrl = d.url;
+                    if (d.cti) state.cti = d.cti;
+                    return d;
+                }
+                last = d && d.status != null ? String(d.status) : ('HTTP ' + ((res && res.status) || '?'));
+
+                if (last !== '503' && last !== '401' && last !== '403') break;
+            } catch (e) {
+                last = (e && e.message) || 'request failed';
+                if (attempt || !/HTTP 5|Failed|fetch|Timeout/i.test(String(last))) break;
+            }
+        }
+        const st = String(last || '?');
+        let why = '';
+        if (st === '401') why = ' This volume needs a signed-in session; open it once in the reader, then try the download again.';
+        else if (st === '995') why = ' The store did not offer this volume to an anonymous reader.';
+        else if (st === '503') why = ' The reader refused the licence nonce; if this repeats, open the volume in the reader once.';
+        const err = new Error('BookWalker refused the licence for ' + cid + ' (status ' + st + ').' + why);
+        if (st === '401' || st === '995') err.code = 'LOGIN_REQUIRED';
+        throw err;
+    }
+
     const BWDD_SITE = detectSite();
     ACTIVE_SITE = BWDD_SITE;
-    if (BWDD_SITE && typeof BWDD_SITE.install === 'function') {
-        try { BWDD_SITE.install(); } catch (e) {}
+    if (BWDD_SITE) {
+        if (typeof BWDD_SITE.install === 'function') {
+            try { BWDD_SITE.install(); } catch (e) {}
+        }
+
+        installHeadlessAutomation();
+
+        try {
+            if (typeof probeFetchProxy === 'function' && !isHeadlessPage()) {
+                const refreshPorts = () => { try { probeFetchProxy().catch(() => {}); } catch (e) {} };
+                refreshPorts();
+                if (typeof setBackgroundInterval === 'function') setBackgroundInterval(refreshPorts, 30000);
+            }
+        } catch (e) {}
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', () => bootSharedPanel(BWDD_SITE));
+        } else {
+            bootSharedPanel(BWDD_SITE);
+        }
     }
 
-    // Install the page API before DOMContentLoaded so a CLI can call start()
-    // as soon as the userscript has been injected.
-    installHeadlessAutomation();
-    if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', () => bootSharedPanel(BWDD_SITE));
-    } else {
-        bootSharedPanel(BWDD_SITE);
-    }
-
-    if (BWDD_DEBUG && !isHeadlessPage()) {
+    if (BWDD_SITE && BWDD_DEBUG && !isHeadlessPage()) {
         try {
             const dbg = {
                 cleanTitle, splitSeriesVolume, fsSafePath, zipBaseName, crc32Bytes, buildStoreZip,
                 get imageCodec() { return IMAGE_CODEC; }, resolveImageCodec,
-                // transport lanes: exposed for the lane/burst test harness
-                allLanes, fetchSocketBudget, laneStats, laneSummary, recordLane, dedupeInflight,
+
+                allLanes, fetchSocketBudget, rawSocketBudget, laneStats, laneSummary, recordLane, dedupeInflight,
+                addProxyPorts, clearProxySource,
+                CHROMIUM_SOCKETS_PER_PROCESS, CONTROL_PLANE_SOCKET_RESERVE, MAX_DATA_PLANE_SOCKETS,
                 probeFetchProxy, probeDotLane, probeEdgeMirror, discoverProxyPorts,
                 setProxyUpstreams, proxyCanServe,
                 dottedUrl, edgeUrlFor, proxyPorts, laneFetch, capabilitySummary, workerPoolSize, workerBatchSize, makePool,
+                proxyLaneFetch, proxyLaneAvailable,
+                canSpawnBlobWorker, clearPageCache,
+
+                setBackgroundInterval, clearBackgroundInterval, backgroundDelay, yieldToTasks,
+
+                mokuroClient: {
+                    bridgeUrl: MOKURO_BRIDGE_URL,
+                    startSession: mokuroStartSession,
+                    streamPage: mokuroStreamPage,
+                    uploadCover: mokuroUploadCover,
+                    status: mokuroStatus,
+                    finalize: mokuroFinalize,
+                    uploadPlan: mokuroUploadPlan,
+                    readerJumpUrl,
+                    makeNdjsonSink,
+                    readNdjsonText,
+                    readNdjsonStream,
+                },
                 get gmUsable() { return gmUsable; },
+                get proxyRealmBlocked() { return proxyRealmBlocked; },
+                resetProxyRealmFlag,
             };
-            // Whatever the active store wants on the console, so this file never
-            // names one of them.
+
             Object.assign(dbg, (BWDD_SITE && BWDD_SITE.debug) || {});
-            window.__bwdd = dbg;
+            debugRealm().__bwdd = dbg;
         } catch (e) {}
-        try { window.__bwddUI = Object.assign(window.__bwddUI || {}, { renderStatsCards, renderBookCard, renderNativelyCard, renderMangaKotobaCard, setBar, showBars }); } catch (e) {}
-        // The active adapter, for the site-adapter tests.
-        try { window.__bwddSite = BWDD_SITE; } catch (e) {}
+        try {
+            debugRealm().__bwddUI = Object.assign(debugRealm().__bwddUI || {},
+                { renderStatsCards, renderBookCard, renderNativelyCard, renderMangaKotobaCard, setBar, showBars });
+        } catch (e) {}
+
+        try { debugRealm().__bwddSite = BWDD_SITE; } catch (e) {}
         for (const k in ((BWDD_SITE && BWDD_SITE.debugGlobals) || {})) {
-            try { window[k] = BWDD_SITE.debugGlobals[k]; } catch (e) {}
+            try { debugRealm()[k] = BWDD_SITE.debugGlobals[k]; } catch (e) {}
+
+            try { window[k] = debugRealm()[k]; } catch (e) {}
         }
     }
+
 })();

@@ -10,7 +10,7 @@ const fs = require('fs');
 const path = require('path');
 
 const CHROME = process.env.PUPPETEER_EXECUTABLE_PATH || undefined;
-const US = path.resolve(__dirname, '..', process.env.BWDD_US || 'omnimanga-native-downloader.user.js');
+const US = path.resolve(__dirname, '..', process.env.BWDD_US || 'dokuha-userscript.user.js');
 const DELAY = 300;
 const BUF = Buffer.alloc(1024, 4);
 
@@ -78,7 +78,6 @@ const listen = (s) => new Promise(r => s.listen(0, '127.0.0.1', () => r(s.addres
     return p;
   }
 
-  // ---------------- mode: server ACCEPTS the dotted host ----------------
   mode = 'ok'; perHost.clear();
   let page = await freshPage();
   const enabled = await page.evaluate((base) => window.__bwdd.probeDotLane(base + 'probe.png'), BASE);
@@ -91,7 +90,6 @@ const listen = (s) => new Promise(r => s.listen(0, '127.0.0.1', () => r(s.addres
   check('socket budget counts the dot lane',
     budget === 6 * lanesAfter.length,
     'budget = ' + budget + ' for ' + lanesAfter.length + ' lane(s) ' + JSON.stringify(lanesAfter));
-  // fire 12 at once and see whether both host spellings carry traffic
   perHost.clear();
   const okCount = await page.evaluate(async (base) => {
     const b = window.__bwdd;
@@ -111,7 +109,6 @@ const listen = (s) => new Promise(r => s.listen(0, '127.0.0.1', () => r(s.addres
     'peak bare=' + bare.max + ' dotted=' + dotted.max + ' (6/6 = separate pools)');
   await page.close();
 
-  // ---------------- mode: server REJECTS the dotted host ----------------
   mode = 'reject'; perHost.clear();
   page = await freshPage();
   const rejected = await page.evaluate((base) => window.__bwdd.probeDotLane(base + 'probe.png'), BASE);

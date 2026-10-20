@@ -1,6 +1,3 @@
-    // =====================================================================
-    // Site adapters — one userscript, three stores
-    // =====================================================================
     // A site adapter supplies only the four things that genuinely differ between
     // the stores: detection (which store is this page?), metadata (title,
     // series/volume, page count, archive name), page enumeration (what to fetch,
@@ -11,7 +8,9 @@
     //
     // Contract:
     //   id, label, panelTitle      identity shown in the panel
-    //   matches()                  true when this adapter owns the page
+    //   ownsHost()                 does this store own this host? (storefront guard)
+    //   matches()                  true only on this store's reader page
+    //   headlessMatches()          optional: whole-host claim for an explicit headless inject
     //   install()                  page hooks; called once, at load
     //   refresh()                  optional: top up metadata before it is read
     //   getBook()                  { rawTitle, title, series, volNum } or null
@@ -26,15 +25,47 @@
         return adapter;
     }
 
+    // A storefront page is a page on a store's own host that its adapter
+    // refused: a series, title, product or search page. Those pages lead up to a
+    // reader and carry none of the data a run needs, so no adapter may claim
+    // them, not even another store's.
+    function storeOwnsHost() {
+        for (const adapter of SITE_REGISTRY) {
+            let owns = false;
+            try { owns = typeof adapter.ownsHost === 'function' && !!adapter.ownsHost(); } catch (e) { owns = false; }
+            if (owns) return true;
+        }
+        return false;
+    }
+
     function detectSite() {
         for (const adapter of SITE_REGISTRY) {
             let owned = false;
             try { owned = !!adapter.matches(); } catch (e) { owned = false; }
             if (owned) return adapter;
         }
-        // BookWalker is the default: it is the original site for this script,
-        // and its panel is also what a bare injected copy (tests, devtools)
-        // expects to get on a host no adapter claims.
+        // A headless caller injects this script itself, deliberately, and its
+        // entry point is sometimes a store page rather than a reader: the
+        // viewer-free licence exchange for a BookWalker free volume starts on a
+        // /de<uuid>/ product page, and ebookjapan detail URLs resolve through
+        // br_api. Only those adapters name such a whole-host claim, and only a
+        // headless page can reach this branch; the metadata does not match those
+        // URLs, so a normal page load never gets here.
+        if (isHeadlessPage()) {
+            for (const adapter of SITE_REGISTRY) {
+                let owned = false;
+                try { owned = typeof adapter.headlessMatches === 'function' && !!adapter.headlessMatches(); } catch (e) { owned = false; }
+                if (owned) return adapter;
+            }
+        }
+        // A storefront page on a store's own host: its adapter refused it and no
+        // other store may take it. No adapter means no panel, no network capture
+        // and no bridge probe, which is the point: before the reader there is
+        // nothing to download.
+        if (storeOwnsHost()) return null;
+        // A host no store owns at all is a bare injected copy (devtools, a
+        // browser test, a CLI). BookWalker stays the default there, as it always
+        // was for this script.
         return SITE_REGISTRY.find(a => a.id === 'bookwalker') || SITE_REGISTRY[0] || null;
     }
 
@@ -45,8 +76,6 @@
         }
         return '';
     }
-    // detectSite() always yields an adapter, so naming one store's pipeline as a
-    // fallback here was dead code and a dependency the shared core should not have.
     function siteRun(ui, mode, options) {
         if (ACTIVE_SITE && typeof ACTIVE_SITE.run === 'function') {
             return ACTIVE_SITE.run(ui, mode, options);
@@ -58,15 +87,19 @@
         return (ACTIVE_SITE && ACTIVE_SITE.panelTitle) || 'BookWalker Native Downloader';
     }
 
-    // Shared panel bring-up. Both stores get the identical UI, the identical
-    // button wiring and the identical "wait for the viewer, then show the book
-    // card + reading stats" loop; only the adapter's own answers differ.
     function bootSharedPanel(site) {
         ACTIVE_SITE = site;
         installHeadlessAutomation();
         // A headless/CLI page gets no panel, no bridge-health tick and no stats
         // loop: the caller owns all of that.
         if (isHeadlessPage()) return null;
+        // A produced document (about:blank, blob:, data:) is never a store page.
+        // A userscript manager does not inject into one, and a browser test that
+        // injects everywhere must not mount a panel there either.
+        try {
+            const proto = location.protocol;
+            if (proto !== 'http:' && proto !== 'https:') return null;
+        } catch (e) {}
 
         const ui = buildUI();
         const launch = mode => {

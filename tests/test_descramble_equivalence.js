@@ -13,7 +13,7 @@ const path = require('path');
 const https = require('https');
 
 const CHROME = process.env.PUPPETEER_EXECUTABLE_PATH || undefined;
-const US = path.resolve(__dirname, '..', process.env.BWDD_US || 'omnimanga-native-downloader.user.js');
+const US = path.resolve(__dirname, '..', process.env.BWDD_US || 'dokuha-userscript.user.js');
 const W = 1400, H = 2100, Q = 0.92;
 
 const appSrv = https.createServer(
@@ -171,7 +171,6 @@ const CASES = [
   }, W, H);
   console.log(`source JPEG ${(info.size / 1048576).toFixed(2)} MB, ${W}x${H}\n`);
 
-  // Runs a worker source in the page and hashes the blob it returns.
   async function run(code, seeds, useTiles) {
     return await page.evaluate(async (code, seeds, useTiles, W, H, q) => {
       const blob = window.__b;
@@ -233,7 +232,6 @@ const CASES = [
     }, code, seedA, seedB, W, H, Q);
   }
 
-  // ---- the shipped worker must match the reference, case by case --------
   let allMatch = true;
   for (const c of CASES) {
     const ref = await run(REFERENCE, c.seeds, true);
@@ -255,7 +253,6 @@ const CASES = [
       batchA.crcOne === batchA.expectedCrcOne && batchA.crcTwo === batchA.expectedCrcTwo,
     `A ${JSON.stringify(batchA.one)}/${batchA.crcOne} vs ${JSON.stringify(batchRefA)}; B ${JSON.stringify(batchA.two)}/${batchA.crcTwo} vs ${JSON.stringify(batchRefB)}`);
 
-  // ---- a no-op page must come back untouched ---------------------------
   const origHash = await page.evaluate(async () => {
     const u = new Uint8Array(await window.__b.arrayBuffer());
     let h = 2166136261 >>> 0;

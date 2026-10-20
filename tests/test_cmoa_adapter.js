@@ -27,13 +27,13 @@ const path = require('path');
 const os = require('os');
 
 const CHROME = process.env.PUPPETEER_EXECUTABLE_PATH || undefined;
-const US = path.resolve(__dirname, '..', process.env.BWDD_US || 'omnimanga-native-downloader.user.js');
+const US = path.resolve(__dirname, '..', process.env.BWDD_US || 'dokuha-userscript.user.js');
 
 const CID = '0000249510_jp_0001';
 const CDN = 'https://free-binb-cmoa.akamaized.net/sbc';
-const MESSY_TITLE = '無料・試し読みページ スーパーの裏でヤニ吸うふたり 1巻（ビッグガンガンコミックス） ｜ 地主 ｜ 漫画（マンガ）・電子書籍のコミックシーモア';
-const CLEAN_TITLE = 'スーパーの裏でヤニ吸うふたり 1巻';
-const EXPECTED_ARCHIVE = 'スーパーの裏でヤニ吸うふたり 1巻';
+const MESSY_TITLE = '無料・試し読みページ サンプル店舗作品 1巻（サンプルコミックス） ｜ サンプル作者 ｜ 漫画（マンガ）・電子書籍のコミックシーモア';
+const CLEAN_TITLE = 'サンプル店舗作品 1巻';
+const EXPECTED_ARCHIVE = 'サンプル店舗作品 1巻';
 
 // 240x240 page, four 120x120 tiles.
 const SIZE = 240;
@@ -217,6 +217,10 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 
     const results = [];
     const check = (n, pass, d) => { results.push({ n, pass, d }); console.log((pass ? 'PASS  ' : 'FAIL  ') + n + '  — ' + d); };
+    // The first two runs model a free/trial volume, which refuses the original
+    // rendition; the last one flips this so the probe is exercised from the
+    // other side, where the original rendition is the rung that answers.
+    let acceptOriginal = false;
 
     const browser = await puppeteer.launch({
         executablePath: CHROME, headless: true,
@@ -245,7 +249,7 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
                 p: 'TOKEN-ONE',
                 ViewMode: 2,
                 ContentDate: '99991031163056',
-                Authors: [{ Name: '地主' }],
+                Authors: [{ Name: 'サンプル作者' }],
             }],
         });
 
@@ -271,10 +275,17 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
             // free/trial volume does, so the ladder must drop to q=1.
             if (url.includes('sbcGetImg.php')) {
                 const u = new URL(url);
+                // The trailing-dot origin is a bonus lane, not a page fetch, and
+                // this fake CDN does not serve it. Refusing the dotted host here
+                // keeps that probe out of the request counts below, which are
+                // about how many times a *page* is fetched and at which rung.
+                if (u.hostname.endsWith('.')) {
+                    return req.respond({ status: 403, headers: { 'Access-Control-Allow-Origin': '*' }, body: 'no dotted host' });
+                }
                 const q = u.searchParams.get('q');
                 const src = u.searchParams.get('src');
                 page.evaluate(v => { window.__requestedQualities.push(v); }, q).catch(() => {});
-                if (q === '0') {
+                if (q === '0' && !acceptOriginal) {
                     return req.respond({ status: 403, headers: { 'Access-Control-Allow-Origin': '*' }, body: 'denied' });
                 }
                 const body = scrambledBySrc.get(src);
@@ -301,7 +312,6 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
         await page.addScriptTag({ content: src });
         await sleep(1200);
 
-        // ---- detection + shared panel ----
         const shell = await page.evaluate(() => {
             const root = document.querySelector('#bwdd-root');
             const title = document.querySelector('#bwdd-panel-title');
@@ -324,7 +334,6 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
         check('both download controls are present, exactly as on BookWalker',
             shell.hasZip && shell.hasOcr, 'zip=' + shell.hasZip + ' ocr=' + shell.hasOcr);
 
-        // ---- metadata + naming ----
         await page.waitForFunction(
             () => { const i = document.querySelector('#bwdd-archive-name'); return i && i.value.length > 0; },
             { timeout: 8000 }
@@ -347,10 +356,9 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
         check('the archive name uses the shared naming rule, not a CMOA-specific one',
             meta.archive === EXPECTED_ARCHIVE, JSON.stringify(meta.archive));
         check('the shared book card renders for the CMOA volume',
-            !!meta.stats && meta.stats.includes('スーパーの裏でヤニ吸うふたり'),
+            !!meta.stats && meta.stats.includes('サンプル店舗作品'),
             JSON.stringify((meta.stats || '').slice(0, 90)));
 
-        // ---- the download itself ----
         await page.click('button.bwdd-btn.zip');
         try {
             await page.waitForFunction(() => !!window.__capturedZip, { timeout: 45000 });
@@ -397,11 +405,126 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
         }
 
         const qualities = await page.evaluate(() => window.__requestedQualities);
+        const refusedRung = qualities.filter(q => q === '0').length;
+        const answeringRung = qualities.filter(q => q === '1').length;
+        // One page walks the ladder before the fan-out; every other page starts
+        // on the rung that answered. A per-page ladder would send q=0 once per
+        // page - which is what a 160-page CMOA volume did 157 times - so this
+        // count is the whole point of the probe: 1, not PAGES.
+        check('exactly one page walks the refused rung, not every page',
+            refusedRung === 1, 'q=0 sent ' + refusedRung + ' time(s) for ' + PAGES + ' pages');
         check('the ladder starts at the original rendition, then falls back to the standard one',
             qualities.includes('0') && qualities.includes('1'),
             'requested q=' + JSON.stringify([...new Set(qualities)]));
+        check('every page is fetched exactly once on the rung that answers',
+            answeringRung === PAGES, 'q=1 sent ' + answeringRung + ' time(s) for ' + PAGES + ' pages');
+        const settled = await page.evaluate(() => ({
+            quality: window.__bwddCmoa.quality,
+            winning: [...window.__bwddCmoa.winningRungs],
+            blacklist: [...window.__bwddCmoa.qualityBlacklist],
+        }));
+        check('the probe run leaves the volume settled on the answering rung',
+            settled.quality === '1' && settled.winning.includes('1') && settled.blacklist.includes('0'),
+            'quality=' + settled.quality + ' winning=' + JSON.stringify(settled.winning) +
+            ' blacklist=' + JSON.stringify(settled.blacklist));
         check('the per-page retry ladder resolves every page',
             entries.length === PAGES, entries.length + '/' + PAGES + ' pages in the archive');
+
+        // The archive above is the proof that the worker path is *correct*; this
+        // is the proof that it is the path that actually ran. Without both, a
+        // silent fall back to the inline canvas would look like a pass.
+        const assembly = await page.evaluate(() => ({
+            counts: window.__bwdd.cmoaReassembly,
+            depth: window.__bwdd.cmoaProcessDepth(),
+        }));
+        check('every page was reassembled in a worker, none on the main thread',
+            assembly.counts.worker === PAGES && assembly.counts.inline === 0 && assembly.counts.fallback === 0,
+            JSON.stringify(assembly.counts));
+        check('the reassembly pool was closed and the decode gate drained',
+            assembly.depth.busy === 0 && assembly.depth.queued === 0 && assembly.depth.workers === 0,
+            JSON.stringify(assembly.depth));
+        check('the gate is sized to the pool, not to the socket fan-out',
+            assembly.depth.lastWorkers > 0 &&
+            assembly.depth.limit >= assembly.depth.lastWorkers &&
+            assembly.depth.limit <= assembly.depth.lastWorkers * 4 &&
+            assembly.depth.limit < 64,
+            'limit=' + assembly.depth.limit + ' for ' + assembly.depth.lastWorkers +
+            ' worker(s); the socket fan-out is up to 256');
+
+        // Same volume, same codec, reassembled the old way. The two archives must
+        // be indistinguishable: if OffscreenCanvas encoded differently from the
+        // DOM canvas, or the blit rectangles drifted, the bytes would differ.
+        await page.evaluate(() => {
+            window.__capturedZip = null;
+            window.__bwddCmoaInline = true;
+            window.__bwdd.cmoaReassembly.worker = 0;
+            window.__bwdd.cmoaReassembly.inline = 0;
+            window.__bwdd.cmoaReassembly.fallback = 0;
+        });
+        await page.evaluate(() => window.__bwdd.clearPageCache());
+        await page.click('button.bwdd-btn.zip');
+        await page.waitForFunction(() => !!window.__capturedZip, { timeout: 45000 })
+            .catch(() => {});
+        const inlineCaptured = await page.evaluate(() => window.__capturedZip);
+        const inlineAssembly = await page.evaluate(() => window.__bwdd.cmoaReassembly);
+        const inlineBuf = Buffer.from((inlineCaptured && inlineCaptured.b64) || '', 'base64');
+        check('the forced-inline run reassembled every page on the main thread',
+            inlineAssembly.inline === PAGES && inlineAssembly.worker === 0,
+            JSON.stringify(inlineAssembly));
+        // Compare the *entries*, not the archives: the store ZIP stamps each page
+        // with a DOS date, whose two-second granularity makes two archives of
+        // identical pages differ whenever the runs straddle a tick. The page
+        // bytes are what the reassembly produces, so those are what must match.
+        const inlineEntries = readStoreZip(inlineBuf);
+        const sameNames = inlineEntries.length === entries.length &&
+            inlineEntries.every((e, i) => e.name === entries[i].name);
+        const drift = sameNames
+            ? entries.map((e, i) => (e.data.equals(inlineEntries[i].data) ? -1 : i)).filter(i => i >= 0)
+            : [];
+        check('the worker and main-thread paths produce identical page bytes',
+            sameNames && inlineEntries.length === PAGES && drift.length === 0,
+            sameNames
+                ? inlineEntries.length + '/' + PAGES + ' entries, ' +
+                  (drift.length ? 'pages ' + drift.map(i => i + 1).join(',') + ' differ' :
+                   'all ' + zipBuf.length + 'B of page data match')
+                : 'entry names differ');
+        if (inlineBuf.length) {
+            const ip = await checkTilePositions(readStoreZip(inlineBuf)[0].data, 0);
+            check('the main-thread archive descrambles to the same tile order',
+                ip.ok, ip.detail);
+        } else {
+            check('the main-thread archive descrambles to the same tile order', false, 'no archive captured');
+        }
+
+        // The probe must not cost anything when the head of the ladder works:
+        // one request per page, page 1 included, and no fallback at all.
+        acceptOriginal = true;
+        await page.evaluate(() => {
+            window.__capturedZip = null;
+            window.__bwddCmoaInline = false;
+            window.__requestedQualities.length = 0;
+            window.__bwddCmoa.qualityBlacklist.clear();
+            window.__bwddCmoa.winningRungs.clear();
+            window.__bwddCmoa.quality = '0';
+        });
+        await page.evaluate(() => window.__bwdd.clearPageCache());
+        await page.click('button.bwdd-btn.zip');
+        await page.waitForFunction(() => !!window.__capturedZip, { timeout: 45000 })
+            .catch(() => {});
+        const paidCaptured = await page.evaluate(() => window.__capturedZip);
+        const paidQualities = await page.evaluate(() => window.__requestedQualities);
+        const paidEntries = readStoreZip(Buffer.from((paidCaptured && paidCaptured.b64) || '', 'base64'));
+        check('a licensed original rendition is used for every page, with no fallback request',
+            paidQualities.length === PAGES && paidQualities.every(q => q === '0'),
+            'requested q=' + JSON.stringify(paidQualities) + ' for ' + PAGES + ' pages');
+        check('the paid-volume run still produces the whole archive',
+            paidEntries.length === PAGES, paidEntries.length + '/' + PAGES + ' pages in the archive');
+        if (paidEntries.length) {
+            const pp = await checkTilePositions(paidEntries[0].data, 0);
+            check('the paid-volume page is descrambled back into the correct tile order', pp.ok, pp.detail);
+        } else {
+            check('the paid-volume page is descrambled back into the correct tile order', false, 'no entries');
+        }
 
     } finally {
         if (page) await page.close().catch(() => {});

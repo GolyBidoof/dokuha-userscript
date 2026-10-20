@@ -1,6 +1,3 @@
-    // =====================================================================
-    // 6. Worker Pool & Descramble Engine
-    // =====================================================================
     function buildWorkerSource() {
         const deps = [
             'const AUTH_PARAM_KEYS = ' + JSON.stringify(AUTH_PARAM_KEYS) + ';',

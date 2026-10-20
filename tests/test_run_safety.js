@@ -51,7 +51,6 @@ function sliceFunction(text, header) {
 (async () => {
     const src = fs.readFileSync(US, 'utf8');
 
-    // ---------------------------------------------------------------- fix 1
     const harnessSrc = sliceFunction(src, 'function createRunHarness(ui, mode, options, meta) {');
     check('the shared run harness is present in the shipped artifact', !!harnessSrc);
 
@@ -89,7 +88,6 @@ function sliceFunction(text, header) {
         check('a ui without setRunLock is tolerated', !threw, threw ? threw.message : 'no throw');
     }
 
-    // ---------------------------------------------------------------- fix 2
     const wrapperSrc = sliceFunction(src, 'async function ebjResolvePages(target, opts) {');
     check('ebookjapan resolves through a single-flight wrapper', !!wrapperSrc);
     check('its in-flight promise is declared at module scope',

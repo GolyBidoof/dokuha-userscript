@@ -2,6 +2,18 @@
     // Headless automation is deliberately a page-level opt-in.  Keeping the
     // check in one helper means the normal panel path never has to know about
     // it, while a Puppeteer caller can inject the flag before the script runs.
+    // The realm the debug surface is published on. A @grant-ed userscript runs in
+    // Tampermonkey's sandbox, where `window` is the sandbox's own object and not
+    // the page's: assigning __bwdd to it leaves the page console reading
+    // undefined, which is exactly how ?bwddDebug failed on ebookjapan while the
+    // same code passed every in-page test. unsafeWindow (granted in the header) is
+    // the page's window; fall back to `window` where it is absent, as in the CLI.
+    function debugRealm() {
+        try {
+            return (typeof unsafeWindow !== 'undefined' && unsafeWindow) || window;
+        } catch (e) { return window; }
+    }
+
     function isHeadlessPage() {
         try {
             return window.__BWDD_HEADLESS__ === true || !!window.__BWDD_CLI__;

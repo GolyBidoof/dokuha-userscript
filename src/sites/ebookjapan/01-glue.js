@@ -1,6 +1,3 @@
-    // =====================================================================
-    // ebookjapan — the viewer's wasm core, embedded and pinned
-    // =====================================================================
     // The viewer descrambles a page with a small Rust/wasm module driven by a
     // glue script. Both are embedded here as base64, for the same two reasons
     // BookWalker's configuration_pack is captured rather than guessed: a run
@@ -75,11 +72,6 @@
 
     function ebjResetCore() { ebjCore = null; }
 
-    /**
-     * Compile the pinned glue and instantiate the wasm module.
-     * Resolves to the module's exports ({ default, decrypt_session, open_param,
-     * get_page_name, shuffle, ... }).
-     */
     async function ebjLoadGlue() {
         if (ebjCore) return ebjCore;
         let src;

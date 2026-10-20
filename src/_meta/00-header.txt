@@ -4,13 +4,14 @@
 // @version      {{VERSION}}
 // @description  {{DESCRIPTION}}
 // @author       GolyBidoof
-// @homepageURL  https://github.com/GolyBidoof/bookwalker-ebookjapan-cmoa-native-downloader
-// @supportURL   https://github.com/GolyBidoof/bookwalker-ebookjapan-cmoa-native-downloader/issues
+// @homepageURL  https://github.com/GolyBidoof/dokuha-userscript
+// @supportURL   https://github.com/GolyBidoof/dokuha-userscript/issues
 // @updateURL    {{UPDATE_URL}}
 // @downloadURL  {{DOWNLOAD_URL}}
 {{MATCH_LINES}}
 // @icon         {{ICON}}
 // @grant        GM_xmlhttpRequest
+// @grant        unsafeWindow
 {{CONNECT_LINES}}
 // @run-at       document-end
 // @license      MIT

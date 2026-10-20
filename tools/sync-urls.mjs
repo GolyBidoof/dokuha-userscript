@@ -1,9 +1,5 @@
 #!/usr/bin/env node
 /*
- * Prints, for every target, the GreasyFork sync source URL for its artifact.
- *
- *   node tools/sync-urls.mjs                        # the release branch
- *   BWDD_SYNC_BRANCH=main node tools/sync-urls.mjs
  *
  * GreasyFork's sync settings take a GitHub *raw* URL (its sync_type "webhook"),
  * which it re-fetches periodically and pulls when @version changes. That URL is
@@ -11,7 +7,7 @@
  * and reads it from targets.json, so a new store appears here by itself.
  *
  * Which entry gets which URL is NOT obvious: the file named
- * omnimanga-native-downloader.user.js is the combined script, while the
+ * dokuha-userscript.user.js is the combined script, while the
  * BookWalker-only entry follows bookwalker-only.user.js. See RELEASING.md.
  */
 import fs from 'node:fs';
@@ -49,7 +45,7 @@ for (const r of rows) {
 console.log('\n  version now: ' + version +
     '   (GreasyFork pulls the file only when @version changes)');
 console.log('  release notes to paste:  npm run notes -- v' + version);
-console.log('\n  The combined script is omnimanga-native-downloader.user.js.');
+console.log('\n  The combined script is dokuha-userscript.user.js.');
 console.log('  The BookWalker-only entry follows bookwalker-only.user.js - see RELEASING.md.');
 console.log('  The release branch does not exist until the first release, so these 404');
 console.log('  until then - GreasyFork simply has nothing to pull, which is the safe default.');

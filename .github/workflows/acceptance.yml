@@ -1,0 +1,91 @@
+# Live acceptance: does each store still download, and are the pages descrambled?
+#
+# Deliberately NOT part of CI. ci.yml is hermetic and stays that way; this
+# workflow talks to real storefronts, so it runs only when a human asks for it.
+# Promoting it to a schedule is a one-line change, but it hits three stores from
+# one IP every time it runs — make that a decision, not an accident.
+#
+# No secrets are needed. Every target is a volume the store is giving away right
+# now, discovered at run time, so nothing has to be rotated and no account is
+# involved. Kindle is left out: read.amazon.co.jp needs a signed-in Amazon
+# session, and Amazon is hostile to datacenter IPs.
+#
+# The headless CLI is checked out alongside this repo and run against the same
+# volume. Two independent descramblers have to agree on the pixels, which is what
+# makes "the pages are descrambled" checkable without a golden image — see
+# tests/acceptance/lib/oracle.js.
+name: Acceptance (live stores)
+
+on:
+  workflow_dispatch:
+    inputs:
+      stores:
+        description: Comma-separated stores to check
+        required: false
+        default: bookwalker,cmoa,ebookjapan
+        type: string
+      min_pages:
+        description: Fewest pages that counts as a working download
+        required: false
+        default: '5'
+        type: string
+      min_psnr:
+        description: PSNR (dB) at which two implementations count as agreeing
+        required: false
+        default: '25'
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  acceptance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out the userscript
+        uses: actions/checkout@v4
+
+      # Public repository, so the default token is enough — no PAT to rotate.
+      - name: Check out the headless CLI (the second implementation)
+        uses: actions/checkout@v4
+        with:
+          repository: GolyBidoof/dokuha-cli
+          path: cli
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install
+        run: npm install --no-audit --no-fund
+
+      - name: Ensure a Chrome for the browser run
+        run: npm run browser
+
+      # The committed artifact is what users install, and what this run drives.
+      # A stale one would mean testing something other than what src/ produces.
+      - name: Artifacts match src/
+        run: npm run check:build
+
+      - name: Install the CLI's dependencies
+        run: npm install --no-audit --no-fund
+        working-directory: cli
+
+      - name: Acceptance run
+        run: |
+          node tests/acceptance/run.js \
+            --cli ./cli \
+            --stores "${{ inputs.stores }}" \
+            --min-pages "${{ inputs.min_pages }}" \
+            --min-psnr "${{ inputs.min_psnr }}"
+
+      # The report is the useful output even when the run fails, so it is
+      # uploaded either way. Downloads themselves are never kept.
+      - name: Keep the report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: acceptance-report
+          path: tests/acceptance_result.json
+          if-no-files-found: warn

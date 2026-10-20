@@ -1,33 +1,24 @@
 #!/usr/bin/env node
 /*
- * Builds the installable userscripts from the fragments in src/.
- *
- * The fragments are plain, ordered pieces of one IIFE: they share a single
- * closure and are concatenated in manifest order, which is also the order they
- * appear in the shipped file.  Keeping the build this dumb means the artifact
- * stays readable and diffable against src/ line-for-line, and there is no
- * bundler, no module loader and no source map to go stale.
- *
- * Targets (src/targets.json) select which modules go into an artifact:
- *
- *   both        omnimanga-native-downloader.user.js   _meta core sites/* entry
- *   bookwalker  bookwalker-only.user.js                _meta core sites/bookwalker entry
- *   cmoa        cmoa-only.user.js                      _meta core sites/cmoa entry
- *
+ * The fragments are plain pieces of one IIFE: they share a single closure and
+ * are concatenated in the order derived from their `after` references in
+ * src/manifest.json, which is also the order they appear in the shipped file.
+ * The metadata block is copied verbatim; every other fragment is passed through
+ * the lexer in tools/strip-comments.js, so the shipped file keeps its code and
+ * line structure but loses the comments and dead whitespace. It is still a
+ * plain concatenation - no bundler, no module loader, no source map to go
+ * stale - and the annotated source stays readable in src/.
  * The split artifacts share the compiled core but carry exactly one store's
  * module, so neither contains a line of the other store's logic.  Each target
  * also renders its own metadata block from src/_meta/00-header.txt, so the name,
  * @match and @connect never claim a store the artifact cannot handle.
  *
- *   node build.mjs                       write every target
- *   node build.mjs --target cmoa         write one target
- *   node build.mjs --check               verify every artifact matches src/
- *   node build.mjs --check --target cmoa verify one artifact
  */
 import fs from 'node:fs';
 import vm from 'node:vm';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import stripComments from './tools/strip-comments.js';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const SRC = path.join(ROOT, 'src');
@@ -48,6 +39,12 @@ function repositoryUrl() {
     return String(repo).replace(/^git\+/, '').replace(/\.git$/, '').replace(/\/$/, '');
 }
 const RELEASE_BASE = repositoryUrl() + '/releases/latest/download';
+const REPO_URL = repositoryUrl();
+
+// One line, immediately after the metadata block, so a reader of the installed
+// artifact knows where the documented source is. The bundles are the build
+// output; src/ keeps every comment and is the place to read or change anything.
+const POINTER_NOTE = '// Comment-stripped build. Annotated source, tests and explanations: ' + REPO_URL;
 
 function readJson(file) {
     return JSON.parse(fs.readFileSync(file, 'utf8'));
@@ -94,14 +91,64 @@ function checkVersion(text, version) {
     }
 }
 
+// The manifest is a dependency list, not a sequence. A fragment may name an
+// `after` fragment, and build.mjs derives the load order by sorting those
+// references: a fragment is emitted only once the fragment it follows has been,
+// and where the constraints still leave a choice the manifest order breaks the
+// tie. With every fragment tagged, the graph is a single chain and the derived
+// order does not depend on where an entry sits in the array at all.
+//
+// This is what makes a new store a self-contained block rather than an
+// insertion into a shared list: point the block's first fragment `after` at the
+// fragment it belongs behind, point whatever used to follow that fragment at
+// the block's last fragment, and the derived order puts the whole block there.
+// Before this, adding a store meant finding the exact position in the
+// interleaved core/site sequence and splicing it in by hand.
+function orderFragments(fragments) {
+    const index = new Map(fragments.map((f, i) => [f.file, i]));
+    const children = new Map();
+    const indegree = new Map(fragments.map(f => [f.file, 0]));
+    for (const frag of fragments) {
+        if (frag.after == null) continue;
+        if (typeof frag.after !== 'string') throw new Error('fragment `after` must be a file path: ' + JSON.stringify(frag));
+        if (frag.after === frag.file) throw new Error('fragment cannot follow itself: ' + frag.file);
+        if (!index.has(frag.after)) {
+            throw new Error('fragment ' + frag.file + ' follows an unknown fragment: ' + frag.after);
+        }
+        if (!children.has(frag.after)) children.set(frag.after, []);
+        children.get(frag.after).push(frag);
+        indegree.set(frag.file, indegree.get(frag.file) + 1);
+    }
+    // Kahn's algorithm, ready set kept in manifest order so a partial graph
+    // still produces a stable, reproducible sequence.
+    const ready = fragments.filter(f => indegree.get(f.file) === 0);
+    const out = [];
+    while (ready.length) {
+        const frag = ready.shift();
+        out.push(frag);
+        for (const child of children.get(frag.file) || []) {
+            indegree.set(child.file, indegree.get(child.file) - 1);
+            if (indegree.get(child.file) !== 0) continue;
+            const at = ready.findIndex(f => index.get(f.file) > index.get(child.file));
+            if (at === -1) ready.push(child);
+            else ready.splice(at, 0, child);
+        }
+    }
+    if (out.length !== fragments.length) {
+        const stuck = fragments.filter(f => !out.includes(f)).map(f => f.file);
+        throw new Error('manifest `after` references form a cycle (or an unreachable fragment): ' + stuck.join(', '));
+    }
+    return out;
+}
+
 // The fragment list is hand-maintained, so check it against the tree. A file
 // dropped into src/ but never listed would be silently missing from every
 // artifact, and a module no target includes would be code that ships nowhere -
 // both were easy to miss behind the old bytes/lines map, which had itself
 // drifted 1,789 lines out of date before it was removed.
-function checkManifest(manifest) {
+function checkManifest(manifest, fragments) {
     const listed = new Set();
-    for (const frag of manifest.fragments) {
+    for (const frag of fragments) {
         if (!frag.file || !frag.module) throw new Error('fragment needs file and module: ' + JSON.stringify(frag));
         if (listed.has(frag.file)) throw new Error('duplicate fragment in manifest: ' + frag.file);
         listed.add(frag.file);
@@ -122,54 +169,68 @@ function checkManifest(manifest) {
     if (unlisted.length) throw new Error('in src/ but not in src/manifest.json: ' + unlisted.join(', '));
     const used = new Set();
     for (const t of Object.values(readJson(TARGETS_FILE))) for (const mo of t.modules) used.add(mo);
-    const orphan = [...new Set(manifest.fragments.map(f => f.module))].filter(mo => !used.has(mo)).sort();
+    const orphan = [...new Set(fragments.map(f => f.module))].filter(mo => !used.has(mo)).sort();
     if (orphan.length) throw new Error('module no target includes: ' + orphan.join(', '));
 
     // The other direction, which used to fail silently: a module name a target
     // lists but no fragment declares. A typo there produces an artifact that
     // builds, compiles and passes --check while quietly missing a whole store or
     // feature - the worst kind of release bug, because nothing looks wrong.
-    const declared = new Set(manifest.fragments.map(f => f.module));
+    const declared = new Set(fragments.map(f => f.module));
     const phantom = [...used].filter(mo => !declared.has(mo)).sort();
     if (phantom.length) throw new Error('target names a module with no fragments: ' + phantom.join(', '));
 
-    // Manifest order is load-bearing: SITE_REGISTRY is a const and detectSite()
-    // is first-match-wins, so a store fragment placed above the fragment that
-    // defines registerSite() is a TDZ ReferenceError at boot, and one placed
+    // The derived order is load-bearing: SITE_REGISTRY is a const and detectSite()
+    // is first-match-wins, so a store fragment ordered above the fragment that
+    // defines registerSite() is a TDZ ReferenceError at boot, and one ordered
     // above another store silently wins the hosts they share. Neither shows up
-    // as a syntax error, so check the order explicitly.
+    // as a syntax error, so check the derived order explicitly: an `after` that
+    // points a store fragment in front of registerSite() fails here.
     const body = f => fs.readFileSync(path.join(SRC, f.file), 'utf8');
-    const defines = manifest.fragments.findIndex(f => /function\s+registerSite\s*\(/.test(body(f)));
+    const defines = fragments.findIndex(f => /function\s+registerSite\s*\(/.test(body(f)));
     if (defines >= 0) {
-        const early = manifest.fragments
+        const early = fragments
             .map((f, i) => ({ f, i }))
             .filter(({ f, i }) => i < defines && /registerSite\s*\(\s*\{/.test(body(f)))
             .map(({ f }) => f.file);
         if (early.length) {
             throw new Error('fragment calls registerSite() before ' +
-                manifest.fragments[defines].file + ' defines it: ' + early.join(', '));
+                fragments[defines].file + ' defines it: ' + early.join(', '));
         }
     }
 }
 
-function assemble(targetId) {
-    const manifest = readJson(MANIFEST);
+function assemble(targetId, fragments) {
     const targets = readJson(TARGETS_FILE);
     const target = targets[targetId];
     if (!target) throw new Error('unknown target: ' + targetId + ' (have ' + Object.keys(targets).join(', ') + ')');
     const allow = new Set(target.modules);
     const version = readVersion();
-    const parts = [];
+    // The metadata block is copied byte for byte; every other fragment goes
+    // through the lexer in tools/strip-comments.js, so the installed file
+    // carries no comments and no dead whitespace. Stripping happens here, on
+    // each source fragment, before the pieces are joined: the manifest checks
+    // above still read the untouched files in src/.
     const included = [];
-    for (const frag of manifest.fragments) {
+    let text = '';
+    for (const frag of fragments) {
         if (!allow.has(frag.module)) continue;
-        let body = fs.readFileSync(path.join(SRC, frag.file), 'utf8');
-        if (frag.file === HEADER) body = renderHeader(body, target, version);
+        const body = fs.readFileSync(path.join(SRC, frag.file), 'utf8');
         if (!body.endsWith('\n')) throw new Error('fragment must end with a newline: ' + frag.file);
-        parts.push(body);
+        const first = included.length === 0;
         included.push(frag.file);
+        if (frag.file === HEADER) {
+            if (!first) throw new Error('the metadata header must be the first fragment: ' + frag.file);
+            text += renderHeader(body, target, version) + POINTER_NOTE + '\n';
+            continue;
+        }
+        let stripped = stripComments.stripSource(body);
+        if (!stripped.endsWith('\n')) stripped += '\n';
+        // A blank line between fragments keeps the artifact readable without
+        // carrying the comment banners the sources used to separate them.
+        text += (first ? '' : '\n') + stripped;
     }
-    const text = parts.join('');
+    if (included[0] !== HEADER) throw new Error('target ' + targetId + ' does not include the metadata header');
     checkVersion(text, version);
     const out = path.join(ROOT, target.out);
     checkSyntax(text, out);
@@ -212,12 +273,14 @@ function parseArgs(argv) {
 
 function main() {
     const { ids, check } = parseArgs(process.argv.slice(2));
-    checkManifest(readJson(MANIFEST));
+    const manifest = readJson(MANIFEST);
+    const fragments = orderFragments(manifest.fragments);
+    checkManifest(manifest, fragments);
     const all = Object.keys(readJson(TARGETS_FILE));
     const want = ids.length ? ids : all;
     let bad = 0;
     for (const id of want) {
-        const { text, out, included, target } = assemble(id);
+        const { text, out, included, target } = assemble(id, fragments);
         const rel = path.relative(ROOT, out);
         if (check) {
             const current = fs.existsSync(out) ? fs.readFileSync(out, 'utf8') : '';

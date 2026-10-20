@@ -12,12 +12,11 @@ const fs = require('fs');
 const path = require('path');
 
 const CHROME = process.env.PUPPETEER_EXECUTABLE_PATH || undefined;
-const US = path.resolve(__dirname, '..', process.env.BWDD_US || 'omnimanga-native-downloader.user.js');
+const US = path.resolve(__dirname, '..', process.env.BWDD_US || 'dokuha-userscript.user.js');
 const DELAY = 300;
 const BUF = Buffer.alloc(4096, 8);
 const N = 60;
 
-// ---- stand-in "CDN" (HTTP/1.1, capped at 6 by Chrome if hit directly) ----
 const cdn = { cur: 0, max: 0, hits: 0, viaEdge: 0 };
 const cdnSrv = http.createServer((req, res) => {
   cdn.cur++; cdn.hits++; if (cdn.cur > cdn.max) cdn.max = cdn.cur;
@@ -30,7 +29,6 @@ const cdnSrv = http.createServer((req, res) => {
   }, DELAY);
 });
 
-// ---- stand-in for the Cloudflare Worker: HTTP/2 front-end ----------------
 let CDN = '';
 const edge = { conns: 0, cur: 0, max: 0, token: '' };
 const edgeSrv = http2.createSecureServer({
@@ -117,7 +115,6 @@ const uscript = loadUserscript();
     return ok;
   }, n);
 
-  // ---- baseline: no edge configured ----------------------------------
   let page = await freshPage(null, null);
   const noEdge = await page.evaluate(() => window.__bwdd.probeEdgeMirror().then(v => ({ v, lanes: window.__bwdd.allLanes().map(l => l.name) })));
   check('with no mirror configured the lane stays off',
@@ -129,7 +126,6 @@ const uscript = loadUserscript();
     cdn.max === 6, 'peak = ' + cdn.max + ' (ok=' + baseOk + '/' + N + ')');
   await page.close();
 
-  // ---- with the edge mirror ------------------------------------------
   cdn.cur = 0; cdn.max = 0; cdn.hits = 0; cdn.viaEdge = 0;
   edge.conns = 0; edge.cur = 0; edge.max = 0;
   page = await freshPage(EDGE, null);
@@ -146,7 +142,6 @@ const uscript = loadUserscript();
     edge.max >= 30, 'peak concurrent h2 streams = ' + edge.max + ' over ' + edge.conns + ' TCP conn(s)');
   await page.close();
 
-  // ---- token-protected worker, no token supplied ----------------------
   edge.token = 'sekrit';
   page = await freshPage(EDGE, null);
   const noTok = await page.evaluate(() => window.__bwdd.probeEdgeMirror().then(v => ({ v, lanes: window.__bwdd.allLanes().map(l => l.name) })));
@@ -154,7 +149,6 @@ const uscript = loadUserscript();
     noTok.v === false && !noTok.lanes.includes('edge'), JSON.stringify(noTok));
   await page.close();
 
-  // ---- token supplied -------------------------------------------------
   page = await freshPage(EDGE, 'sekrit');
   const withTok = await page.evaluate(() => window.__bwdd.probeEdgeMirror().then(v => ({ v, lanes: window.__bwdd.allLanes().map(l => l.name) })));
   check('supplying the token activates the lane',

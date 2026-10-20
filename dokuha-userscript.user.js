@@ -1,21 +1,25 @@
 // ==UserScript==
-// @name         Omnimanga Native Downloader
+// @name         dokuha-userscript
 // @namespace    http://tampermonkey.net/
-// @version      2.0.0
-// @description  Saves a book from the BookWalker viewer, the CMOA speed reader or the ebookjapan reader as a ZIP or CBZ of full-resolution page images, fetched from the CDN and unscrambled offline. Optional Japanese OCR through mokuro-bridge, with upload to MEGA, Google Drive or OneDrive.
+// @version      3.0.0
+// @description  Saves a book from the BookWalker viewer, the CMOA speed reader, the ebookjapan reader, the Kindle web manga reader or the k-manga viewer as a ZIP or CBZ of full-resolution page images, fetched from the store and unscrambled offline. Optional Japanese OCR through mokuro-bridge, with upload to MEGA, Google Drive or OneDrive.
 // @author       GolyBidoof
-// @homepageURL  https://github.com/GolyBidoof/bookwalker-ebookjapan-cmoa-native-downloader
-// @supportURL   https://github.com/GolyBidoof/bookwalker-ebookjapan-cmoa-native-downloader/issues
-// @updateURL    https://github.com/GolyBidoof/bookwalker-ebookjapan-cmoa-native-downloader/releases/latest/download/omnimanga-native-downloader.user.js
-// @downloadURL  https://github.com/GolyBidoof/bookwalker-ebookjapan-cmoa-native-downloader/releases/latest/download/omnimanga-native-downloader.user.js
+// @homepageURL  https://github.com/GolyBidoof/dokuha-userscript
+// @supportURL   https://github.com/GolyBidoof/dokuha-userscript/issues
+// @updateURL    https://github.com/GolyBidoof/dokuha-userscript/releases/latest/download/dokuha-userscript.user.js
+// @downloadURL  https://github.com/GolyBidoof/dokuha-userscript/releases/latest/download/dokuha-userscript.user.js
 // @match        https://viewer.bookwalker.jp/*
 // @match        https://viewer-trial.bookwalker.jp/*
 // @match        https://viewer-ptrial.bookwalker.jp/*
 // @match        https://viewer-subscription.bookwalker.jp/*
 // @match        https://www.cmoa.jp/bib/speedreader/*
+// @match        https://www.cmoa.jp/reader/*
 // @match        https://ebookjapan.yahoo.co.jp/viewer/*
+// @match        https://read.amazon.co.jp/manga/*
+// @match        https://comic.k-manga.jp/viewer/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=bookwalker.jp
 // @grant        GM_xmlhttpRequest
+// @grant        unsafeWindow
 // @connect      learnnatively.com
 // @connect      manga-kotoba.com
 // @connect      ebookjapan.yahoo.co.jp
@@ -26,15 +30,22 @@
 // @connect      free-binb-cmoa.akamaized.net
 // @connect      binb-cmoa.akamaized.net
 // @connect      prod-contents-br-page.akamaized.net
+// @connect      read.amazon.co.jp
+// @connect      www.amazon.co.jp
+// @connect      *.cloudfront.net
+// @connect      comic.k-manga.jp
+// @connect      bv.k-manga.jp
+// @connect      ws.viewer.k-manga.jp
 // @connect      127.0.0.1
 // @connect      localhost
 // @run-at       document-end
 // @license      MIT
 //
-// One script, three stores. The panel, its controls, the Mokuro bridge, the
+// One script, five stores. The panel, its controls, the Mokuro bridge, the
 // reading-stat cards, the ZIP naming and the headless automation API are shared
 // verbatim; only the store-specific protocol lives in its own module under
-// src/sites/. BookWalker is the default for any page no adapter claims.
+// src/sites/. Only the readers are matched; BookWalker stays the fallback for a
+// host no store owns, such as a bare injected copy.
 //
 // CREDITS
 //   - BookWalker viewer protocol reverse-engineered and validated against
@@ -62,61 +73,52 @@
 //   falls back to a public CORS proxy (or hides), and the store links cannot be
 //   resolved, so they are simply not shown.
 // ==/UserScript==
+// Comment-stripped build. Annotated source, tests and explanations: https://github.com/GolyBidoof/dokuha-userscript
+
 (function () {
     'use strict';
 
-    // Derived from the installed metadata, not a hardcoded copy: a pinned literal
-    // silently goes stale across releases, so the panel reports an old version no
-    // matter which build is actually running.
     const BWDD_VERSION = (() => {
         try {
             const v = (typeof GM_info !== 'undefined') && GM_info.script && GM_info.script.version;
             if (v) return v;
-        } catch (e) { /* not in a userscript manager (e.g. injected in a test) */ }
-        return '2.0.0';   // the single source of truth: build.mjs substitutes this into @version
+        } catch (e) { }
+        return '3.0.0';
     })();
-    // Debug-only: internals on window.* are exposed only when the page URL
-    // carries ?bwddDebug=1, so page scripts cannot reach mutable script state by
-    // default. It lives in the shared core because the core itself logs through
-    // it.
+
     const BWDD_DEBUG = (() => {
         try { return new URLSearchParams(location.search).has('bwddDebug'); } catch (e) { return false; }
     })();
     const BWDD_AUTHOR = 'GolyBidoof';
-    const BWDD_REPO_URL = 'https://github.com/GolyBidoof/bookwalker-ebookjapan-cmoa-native-downloader';
+    const BWDD_SCRIPT_NAME = 'dokuha-userscript';
+    const BWDD_REPO_URL = 'https://github.com/GolyBidoof/dokuha-userscript';
 
-    // =====================================================================
-    // 1. Capture the viewer's own network responses (browser data reuse)
-    // =====================================================================
     const state = {
         cid: (new URLSearchParams(location.search)).get('cid') || '',
         fileBases: {},
-        auth: null,        // {hti, cfg, bid, uuid, pfCd, Policy, Signature, Key-Pair-Id}
-        baseUrl: null,     // e.g. https://bw-bv-epubs.bookwalker.jp/3_product/<cid>/1/<pid>/
-        cti: null,         // title
-        configBody: null,  // encrypted configuration_pack.json text
+        auth: null,
+        baseUrl: null,
+        cti: null,
+        configBody: null,
         configFromUrl: null
     };
-    // Headless auth refreshes must correlate like one browser session. Do not
-    // mint a new BID on every retry/endpoint call, but never consult browser
-    // storage in this mode.
+
     let headlessBid = null;
 
-    // Shared protocol/presentation constants (single source of truth).
     const AUTH_PARAM_KEYS = ['hti', 'cfg', 'bid', 'uuid', 'pfCd', 'Policy', 'Signature', 'Key-Pair-Id'];
 
-    // Headless automation is deliberately a page-level opt-in.  Keeping the
-    // check in one helper means the normal panel path never has to know about
-    // it, while a Puppeteer caller can inject the flag before the script runs.
+    function debugRealm() {
+        try {
+            return (typeof unsafeWindow !== 'undefined' && unsafeWindow) || window;
+        } catch (e) { return window; }
+    }
+
     function isHeadlessPage() {
         try {
             return window.__BWDD_HEADLESS__ === true || !!window.__BWDD_CLI__;
         } catch (e) { return false; }
     }
 
-    // Error messages from fetch failures can echo a request URL. Keep signed CDN
-    // query parameters and URL credentials out of page logs even in headed mode;
-    // this is deliberately independent of the CLI's queue sanitization.
     function safeLogText(value) {
         let text = String(value == null ? '' : value);
         text = text.replace(/https?:\/\/[^\s"'<>]+/gi, match => {
@@ -140,7 +142,7 @@
         );
     }
 
-    const automationMemory = {
+const automationMemory = {
         status: {
             state: 'idle', status: 'idle', ok: false, mode: null, cid: '', title: '',
             total: 0, pageCount: 0, sessionId: null, safeTitle: null,
@@ -191,7 +193,7 @@
                 options.onProgress(Object.assign({}, event, {
                     errors: Array.isArray(event.errors) ? event.errors.slice() : undefined
                 }));
-            } catch (e) { /* a consumer callback must never break a download */ }
+            } catch (e) { }
         }
         try {
             if (typeof window.__bwddProgress === 'function') {
@@ -199,7 +201,7 @@
                     errors: Array.isArray(event.errors) ? event.errors.slice() : undefined
                 }));
             }
-        } catch (e) { /* the page-level hook is best effort */ }
+        } catch (e) { }
     }
     function newAutomationResult(mode, cid, deferredFinalize) {
         return {
@@ -328,18 +330,8 @@
         window.__bwddAutomation = api;
     }
 
-    // A property of the archiver rather than of either store's reader, so the
-    // core owns it.
     const JPEG_QUALITY = 0.92;
-    //   localStorage.bwddImageFormat  = 'jpeg' | 'webp' | 'lossless' | 'png'
-    //   localStorage.bwddImageQuality = 0.85      (0-1, lossy formats only)
-    // The CDN already hands us a lossy JPEG, so re-encoding is a second
-    // generation. Measured on a 1600x2400 manga page (bytes / encode ms):
-    // jpeg 0.92 0.94 MB / 14 (default), jpeg 0.85 0.79 / 13, webp 0.92 0.75 / 180,
-    // webp lossless 0.18 / 47 (bit-exact), png 0.69 / 15. On photo pages lossless
-    // costs far more (webp lossless 3.4 MB / 592 ms), so it stays a choice rather
-    // than a default. image/jxl and image/avif are not encodable here:
-    // convertToBlob silently returns PNG for both.
+
     function resolveImageCodec() {
         let fmt = 'jpeg', quality = JPEG_QUALITY;
         try {
@@ -354,25 +346,20 @@
                 : (!isHeadlessPage() ? localStorage.getItem('bwddImageQuality') : null);
             const qv = parseFloat(raw);
             if (isFinite(qv) && qv > 0 && qv <= 1) quality = qv;
-        } catch (e) { /* opaque origin, or storage disabled, keep the defaults */ }
-        // 'lossless' is WebP at quality 1, which is bit-exact; browsers without a
-        // WebP encoder fall back to PNG, which is lossless too. Either way the
-        // lossless setting really is lossless.
+        } catch (e) { }
+
         if (fmt === 'lossless') return { fmt, type: 'image/webp', quality: 1, ext: 'webp', lossless: true };
         if (fmt === 'webp') return { fmt, type: 'image/webp', quality, ext: 'webp', lossless: false };
         if (fmt === 'png') return { fmt, type: 'image/png', quality, ext: 'png', lossless: true };
         return { fmt: 'jpeg', type: 'image/jpeg', quality, ext: 'jpg', lossless: false };
     }
-    // Mutable: the panel changes it, and the next download must pick it up without
-    // a page reload, so nothing may cache this at load time.
+
     let IMAGE_CODEC = resolveImageCodec();
     function refreshImageCodec() {
         IMAGE_CODEC = resolveImageCodec();
         return IMAGE_CODEC;
     }
-    // BookWalker-only helper: locate the viewer's own NFBR engine object, which
-    // holds the signed auth the capture hooks read. BWDD_DEBUG itself lives in
-    // the shared core now.
+
     function findInNFBR(win) {
         const out = { auth: null, baseUrl: null, config: null, cti: null };
         if (!win || !win.NFBR) return out;
@@ -433,44 +420,57 @@
         } catch (e) { if (BWDD_DEBUG) console.warn('[bwdd] findInNFBR:', safeLogText(e && e.message)); }
         return out;
     }
-    // -----------------------------------------------------------------
-    // Page cache (IndexedDB)
-    // -----------------------------------------------------------------
-    let pageDB = null;
+
+let pageDB = null;
+    let pageDBPromise = null;
     function openPageDB() {
-        return new Promise((resolve, reject) => {
-            if (pageDB) return resolve(pageDB);
-            try {
-                const req = indexedDB.open('bwdd-pages-v2', 1);
-                req.onupgradeneeded = () => {
-                    const db = req.result;
-                    if (!db.objectStoreNames.contains('pages')) db.createObjectStore('pages');
-                };
-                req.onsuccess = () => { pageDB = req.result; resolve(pageDB); };
-                req.onerror = () => reject(req.error);
-            } catch (e) { reject(e); }
+
+        if (pageDB) return Promise.resolve(pageDB);
+        if (pageDBPromise) return pageDBPromise;
+        pageDBPromise = new Promise((resolve, reject) => {
+            let req;
+            try { req = indexedDB.open('bwdd-pages-v2', 1); } catch (e) { reject(e); return; }
+            req.onupgradeneeded = () => {
+                const db = req.result;
+                if (!db.objectStoreNames.contains('pages')) db.createObjectStore('pages');
+            };
+            req.onsuccess = () => { pageDB = req.result; resolve(pageDB); };
+            req.onerror = () => reject(req.error);
+
+            req.onblocked = () => reject(new Error('page cache open blocked'));
+        });
+        pageDBPromise.catch(() => { pageDBPromise = null; });
+        return pageDBPromise;
+    }
+
+    function withDeadline(p, ms) {
+        return new Promise((resolve) => {
+            let done = false;
+            const timer = setTimeout(() => { if (!done) { done = true; resolve(null); } }, ms);
+            p.then(
+                (v) => { if (!done) { done = true; clearTimeout(timer); resolve(v); } },
+                () => { if (!done) { done = true; clearTimeout(timer); resolve(null); } },
+            );
         });
     }
-    // Entries are {blob, ts, crc}: ts enforces the TTL and the size cap keeps the
-    // cache from eating the browser's disk. Keys include the codec and quality so
-    // a format change cannot reuse the wrong output blob or CRC.
+
+    const PAGE_CACHE_READ_TIMEOUT_MS = 1000;
+
     const PAGE_CACHE_TTL_MS = 20 * 60 * 1000;
-    const PAGE_CACHE_MAX_ENTRIES = 4000;        // safety cap (~3 GB at 700 KB/page)
+    const PAGE_CACHE_MAX_ENTRIES = 4000;
     const PAGE_CACHE_PRUNE_INTERVAL_MS = 30 * 1000;
     const cachedPageCrc = new WeakMap();
     let pageCachePruneTimer = null;
     let pageCachePruneInFlight = null;
     let pageCachePruneRequested = false;
-    let lastPageCachePruneAt = 0;
+
+    let lastPageCachePruneAt = Date.now();
     function schedulePageCachePrune(delayMs) {
-        // Headless automation intentionally does not keep a page-cache
-        // housekeeping timer alive between Puppeteer runs.
+
         if (isHeadlessPage()) return;
-        // A full cursor scan after every put turns a 300-page run into hundreds
-        // of overlapping O(cache-size) scans. Keep at most one periodic prune.
+
         if (pageCachePruneInFlight) {
-            // A write that arrived while the cursor was walking would otherwise
-            // leave no future trigger once that walk finishes.
+
             pageCachePruneRequested = true;
             return;
         }
@@ -507,20 +507,34 @@
                 tx.objectStore('pages').put(record, key);
                 tx.oncomplete = () => res(true);
                 tx.onerror = () => rej(tx.error);
+                tx.onabort = () => rej(tx.error || new Error('page cache put aborted'));
             });
             schedulePageCachePrune();
             return true;
         } catch (e) { return false; }
     }
+    function readCachedRecord(db, key) {
+        return new Promise((res) => {
+            let settled = false;
+            const finish = (v) => { if (!settled) { settled = true; res(v); } };
+            let tx;
+            try { tx = db.transaction('pages', 'readonly'); }
+            catch (e) { finish(null); return; }
+
+            tx.onabort = () => finish(null);
+            tx.onerror = () => finish(null);
+            try {
+                const rq = tx.objectStore('pages').get(key);
+                rq.onsuccess = () => finish(rq.result || null);
+                rq.onerror = () => finish(null);
+            } catch (e) { finish(null); }
+        });
+    }
     async function getCachedPage(cid, index) {
         try {
-            const db = await openPageDB();
-            const v = await new Promise((res) => {
-                const tx = db.transaction('pages', 'readonly');
-                const rq = tx.objectStore('pages').get(pageCacheKey(cid, index));
-                rq.onsuccess = () => res(rq.result || null);
-                rq.onerror = () => res(null);
-            });
+            const db = await withDeadline(openPageDB(), PAGE_CACHE_READ_TIMEOUT_MS);
+            if (!db) return null;
+            const v = await withDeadline(readCachedRecord(db, pageCacheKey(cid, index)), PAGE_CACHE_READ_TIMEOUT_MS);
             if (v && v.blob) {
                 if (Number.isInteger(v.crc)) cachedPageCrc.set(v.blob, v.crc);
                 return v.blob;
@@ -596,6 +610,132 @@
         } catch (e) { return false; }
     }
 
+    const TICKER_HELLO_MS = 1500;
+    const tickerSource = [
+        'const timers = new Map();',
+        'onmessage = function (e) {',
+        '    const d = e.data || {};',
+        '    if (d.op === "start") {',
+        '        const previous = timers.get(d.id);',
+        '        if (previous !== undefined) clearInterval(previous);',
+        '        timers.set(d.id, setInterval(function () { postMessage(d.id); }, d.ms));',
+        '    } else if (d.op === "stop") {',
+        '        const t = timers.get(d.id);',
+        '        if (t !== undefined) clearInterval(t);',
+        '        timers.delete(d.id);',
+        '    }',
+        '};',
+        'postMessage("ready");',
+    ].join('\n');
+
+    const tickers = new Map();
+    let tickerRelay = null;
+    let tickerRelayReady = false;
+    let tickerHelloTimer = null;
+    let tickerSeq = 0;
+
+    function tickerRun(rec) {
+        if (rec.stopped) return;
+        try { rec.fn(); } catch (e) {}
+    }
+
+    function tickerFallback(rec) {
+        if (rec.stopped || rec.fallbackId !== null) return;
+        rec.fallbackId = setInterval(() => tickerRun(rec), rec.ms);
+    }
+    function tickerRelayFailed() {
+        if (tickerHelloTimer) { clearTimeout(tickerHelloTimer); tickerHelloTimer = null; }
+        if (tickerRelay) { try { tickerRelay.terminate(); } catch (e) {} }
+        tickerRelay = false;
+        tickerRelayReady = false;
+        for (const rec of tickers.values()) tickerFallback(rec);
+    }
+    function ensureTickerRelay() {
+        if (tickerRelay !== null) return tickerRelay;
+        if (typeof Worker !== 'function' || typeof Blob !== 'function' ||
+            typeof URL === 'undefined' || typeof URL.createObjectURL !== 'function') {
+            tickerRelay = false;
+            return false;
+        }
+        let worker = null;
+        try {
+            const url = URL.createObjectURL(new Blob([tickerSource], { type: 'text/javascript' }));
+            try { worker = new Worker(url); } finally { URL.revokeObjectURL(url); }
+        } catch (e) {
+            tickerRelay = false;
+            return false;
+        }
+        worker.onmessage = (ev) => {
+            if (typeof ev.data === 'string') {
+                if (ev.data !== 'ready') return;
+                tickerRelayReady = true;
+                if (tickerHelloTimer) { clearTimeout(tickerHelloTimer); tickerHelloTimer = null; }
+
+                for (const rec of tickers.values()) {
+                    if (rec.fallbackId !== null) { clearInterval(rec.fallbackId); rec.fallbackId = null; }
+                }
+                return;
+            }
+            const rec = tickers.get(ev.data);
+            if (rec) tickerRun(rec);
+        };
+
+        worker.onerror = () => tickerRelayFailed();
+        tickerRelay = worker;
+
+        tickerHelloTimer = setTimeout(() => { if (!tickerRelayReady) tickerRelayFailed(); }, TICKER_HELLO_MS);
+        return worker;
+    }
+    function setBackgroundInterval(fn, ms) {
+        if (typeof fn !== 'function') throw new TypeError('setBackgroundInterval needs a function');
+        const delay = Math.max(16, Number(ms) || 0);
+        const id = ++tickerSeq;
+        const rec = { id, fn, ms: delay, fallbackId: null, stopped: false };
+        tickers.set(id, rec);
+        const relay = ensureTickerRelay();
+        if (relay) {
+            try { relay.postMessage({ op: 'start', id, ms: delay }); }
+            catch (e) { tickerRelayFailed(); }
+        }
+
+        if (!tickerRelayReady) tickerFallback(rec);
+        return id;
+    }
+    function clearBackgroundInterval(id) {
+        const rec = tickers.get(id);
+        if (!rec) return;
+        rec.stopped = true;
+        tickers.delete(id);
+        if (rec.fallbackId !== null) { clearInterval(rec.fallbackId); rec.fallbackId = null; }
+
+        if (tickerRelay) {
+            try { tickerRelay.postMessage({ op: 'stop', id }); } catch (e) {}
+        }
+    }
+
+    function backgroundDelay(ms) {
+        return new Promise(resolve => {
+            const id = setBackgroundInterval(() => { clearBackgroundInterval(id); resolve(); }, ms);
+        });
+    }
+
+    let taskYieldPorts = null;
+    function yieldToTasks() {
+        if (typeof MessageChannel !== 'function') return new Promise(r => setTimeout(r, 0));
+        if (!taskYieldPorts) {
+            const ports = { channel: new MessageChannel(), waiters: [] };
+            taskYieldPorts = ports;
+            ports.channel.port1.onmessage = () => {
+                const next = ports.waiters.shift();
+                if (next) next();
+            };
+        }
+        return new Promise(resolve => {
+            taskYieldPorts.waiters.push(resolve);
+            taskYieldPorts.channel.port2.postMessage(0);
+        });
+    }
+
     function apiOriginFromUrl(url) {
         try {
             const m = url.match(/^(https?:\/\/[^/]+)/);
@@ -615,12 +755,6 @@
         try { return window.location.origin; } catch (e) { return ''; }
     }
 
-    // Single reader for captured API/config responses, used by both the
-    // fetch and XHR hooks below so the two capture paths can never classify an
-    // endpoint differently (they once duplicated this and drifted). Handles:
-    //   /browserWebApi/c | /trial-page/c  → full auth reply (auth_info + url)
-    //   /browserWebApi/pb                 → incremental auth_info (policy refresh)
-    //   configuration_pack.json           → encrypted manifest text (best dir wins)
     function absorbApiResponse(url, text) {
         try {
             if (url.includes('/browserWebApi/c') || url.includes('/trial-page/c')) {
@@ -632,8 +766,7 @@
                 recordApiBase(url);
                 const d = JSON.parse(text);
                 if (d.auth_info) {
-                    // pb rotates the CloudFront policy; a changed signature
-                    // resets the request-count budget.
+
                     const before = authPolicySig();
                     state.auth = Object.assign({}, state.auth || {}, d.auth_info);
                     if (authPolicySig() !== before) resetAuthBudget();
@@ -648,9 +781,6 @@
         } catch (e) {}
     }
 
-    // Hooks. Headless callers can defer these wrappers until the automation
-    // run starts; some viewer builds keep their document-start loader alive
-    // when a fetch wrapper is installed before their own bootstrap finishes.
     let networkCaptureInstalled = false;
     function installNetworkCapture() {
         if (networkCaptureInstalled) return;
@@ -688,34 +818,9 @@
             return false;
         }
     }
-    // NOTE: the install call lives in this site's adapter (install()), so the
-    // entry point can decide per page which store's capture to bring up.
 
-    // =====================================================================
-    // 2. Crypto: decrypt configuration_pack.json
-    // =====================================================================
-    //
-    // The viewer's configuration_pack.json is a custom envelope:
-    //   { "version":"1.0", "data":"<custom-base64 payload>" }
-    // Decoding is a fixed pipeline: custom base64 (A8j) -> a byte-keyed
-    // key schedule (A3b / B0p / A7L / A6I / A2F / B0L / tB0l, an RC4 variant)
-    // -> UTF-8 JSON of the page manifest. The first 128 chars of the payload
-    // are three 32-byte keys (key1/key2/key3) later used to derive per-page
-    // descramble seeds (section 3) and image filename tokens (section 4).
-    //
-    // NOTE: identifiers like A8j, A3b, B0p, v4..v9 are the original names
-    // from the minified viewer, preserved verbatim because this port is
-    // validated byte-for-byte against live HAR data and the bookworm
-    // offline client. Renaming them would risk silent drift; the
-    // pipeline below is annotated instead.
-    // =====================================================================
-
-    // Used by the key-schedule shuffles below.
     function arraySwap(arr, a, b) { const t = arr[a]; arr[a] = arr[b]; arr[b] = t; }
 
-    // --- Custom base64 lookup tables (4 chars -> 3 bytes) ---
-    // BookWalker's base64 alphabet is the standard A-Z a-z 0-9 + / set, but
-    // the decode uses shifted bit masks per byte position (v5..v9).
     const ARR1 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'.split('');
     const ARR2 = ARR1.map(c => c.charCodeAt(0));
     const v4 = [], v5 = [], v6 = [], v7 = [], v8 = [], v9 = [], vak = [];
@@ -726,9 +831,6 @@
     }
     const A8f = [v4, v5, v6, v7, v8, v9, vak];
 
-    // Decode the custom base64 payload between dataOffset..dataEndOffset.
-    // Returns [decodedBytes, decodedLength, key1, key2, key3] where the keys
-    // are the first 128 chars split into three 32-byte registers.
     function A8j(content, dataOffset, dataEndOffset) {
         const arrayLength = 32, keyDataLength = 128;
         const payloadOffset = dataOffset + keyDataLength;
@@ -932,10 +1034,8 @@
         const [content, clen] = st;
         return [new TextDecoder('utf-8').decode(content.slice(0, clen))];
     }
-    // =====================================================================
-    // 3. Tile shuffle & descramble arithmetic (A9p)
-    // =====================================================================
-    const B2Y_TRIPLES = JSON.parse('[[1,3,10],[1,5,16],[1,5,19],[1,9,29],[1,11,6],[1,11,16],[1,19,3],[1,21,20],[1,27,27],[2,5,15],[2,5,21],[2,7,7],[2,7,9],[2,7,25],[2,9,15],[2,15,17],[2,15,25],[2,21,9],[3,1,14],[3,3,26],[3,3,28],[3,3,29],[3,5,20],[3,5,22],[3,5,25],[3,7,29],[3,13,7],[3,23,25],[3,25,24],[3,27,11],[4,3,17],[4,3,27],[4,5,15],[5,3,21],[5,7,22],[5,9,7],[5,9,28],[5,9,31],[5,13,6],[5,15,17],[5,17,13],[5,21,12],[5,27,8],[5,27,21],[5,27,25],[5,27,28],[6,1,11],[6,3,17],[6,17,9],[6,21,7],[6,21,13],[7,1,9],[7,1,18],[7,1,25],[7,13,25],[7,17,21],[7,25,12],[7,25,20],[8,7,23],[8,9,23],[9,5,14],[9,5,25],[9,11,19],[9,21,16],[10,9,21],[10,9,25],[11,7,12],[11,7,16],[11,17,13],[11,21,13],[12,9,23],[13,3,17],[13,3,27],[13,5,19],[13,17,15],[14,1,15],[14,13,15],[15,1,29],[17,15,20],[17,15,23],[17,15,26]]');
+
+const B2Y_TRIPLES = JSON.parse('[[1,3,10],[1,5,16],[1,5,19],[1,9,29],[1,11,6],[1,11,16],[1,19,3],[1,21,20],[1,27,27],[2,5,15],[2,5,21],[2,7,7],[2,7,9],[2,7,25],[2,9,15],[2,15,17],[2,15,25],[2,21,9],[3,1,14],[3,3,26],[3,3,28],[3,3,29],[3,5,20],[3,5,22],[3,5,25],[3,7,29],[3,13,7],[3,23,25],[3,25,24],[3,27,11],[4,3,17],[4,3,27],[4,5,15],[5,3,21],[5,7,22],[5,9,7],[5,9,28],[5,9,31],[5,13,6],[5,15,17],[5,17,13],[5,21,12],[5,27,8],[5,27,21],[5,27,25],[5,27,28],[6,1,11],[6,3,17],[6,17,9],[6,21,7],[6,21,13],[7,1,9],[7,1,18],[7,1,25],[7,13,25],[7,17,21],[7,25,12],[7,25,20],[8,7,23],[8,9,23],[9,5,14],[9,5,25],[9,11,19],[9,21,16],[10,9,21],[10,9,25],[11,7,12],[11,7,16],[11,17,13],[11,21,13],[12,9,23],[13,3,17],[13,3,27],[13,5,19],[13,17,15],[14,1,15],[14,13,15],[15,1,29],[17,15,20],[17,15,23],[17,15,26]]');
     const XSHIFT = [
         (p1, p2, p3, p4) => { p1 ^= p1 << p2; p1 ^= p1 >>> p3; p1 ^= p1 << p4; return p1; },
         (p1, p2, p3, p4) => { p1 ^= p1 << p4; p1 ^= p1 >>> p3; p1 ^= p1 << p2; return p1; },
@@ -1152,10 +1252,7 @@
         };
     }
 
-    // =====================================================================
-    // 4. Page image filename token
-    // =====================================================================
-    function v_jdf(filename) {
+function v_jdf(filename) {
         const n = parseInt(filename, 10);
         if (!isNaN(n) && n >= 0 && n <= 1152921504606847000) {
             const h = n.toString(16);
@@ -1217,10 +1314,7 @@
         return pageId + '/' + v_jdf(fname) + v_ndf(v_hdf(k1, k2, k3), pageId, fname) + '.jpeg';
     }
 
-    // =====================================================================
-    // 5. Auth helpers
-    // =====================================================================
-    function isPublicBootstrapPage() {
+function isPublicBootstrapPage() {
         try { return !!(window.__BWDD_CLI__ && window.__BWDD_CLI__.publicBootstrap); } catch (_) { return false; }
     }
     function isPublicFreeBootstrapPage() {
@@ -1233,11 +1327,7 @@
         return m ? decodeURIComponent(m[1]) : '';
     }
     function generatedBid() {
-        // The native viewer mints this value client-side and persists it under
-        // localStorage['NFBR.Global/BrowserId']; the observed shape is
-        // <epoch-ms><8 digits>NFBR and the server accepts a self-minted one
-        // (verified against /trial-page/c with status 200). When the viewer
-        // engine has not run yet, mint the same shape instead of refusing.
+
         if (!headlessBid) {
             headlessBid = (state.auth && state.auth.bid) ||
                 (Date.now() + '' + Math.floor(Math.random() * 1e8) + 'NFBR');
@@ -1258,10 +1348,7 @@
         return p.toString();
     }
 
-    // =====================================================================
-    // 6. Worker Pool & Descramble Engine
-    // =====================================================================
-    function buildWorkerSource() {
+function buildWorkerSource() {
         const deps = [
             'const AUTH_PARAM_KEYS = ' + JSON.stringify(AUTH_PARAM_KEYS) + ';',
             'const B2Y_TRIPLES = ' + JSON.stringify(B2Y_TRIPLES) + ';',
@@ -1284,16 +1371,14 @@
         return deps.join('\n');
     }
 
-    const WORKER_BATCH_SIZE = 2;
+const WORKER_BATCH_SIZE = 2;
 
     function workerBatchSize(type) {
-        // JPEG is the default and benefits from two overlapping codec jobs.
-        // Lossless WebP/PNG encoders have much higher peak memory/CPU cost, so
-        // keep a conservative single-page queue for those formats.
+
         return type === 'image/jpeg' ? WORKER_BATCH_SIZE : 1;
     }
 
-    function workerMain() {
+function workerMain() {
         let crcTable = null;
         async function crcForZip(blob) {
             if (!crcTable) {
@@ -1351,10 +1436,7 @@
                 const needsScale = !!(S && S.Width && S.Height && (W !== S.Width || H !== S.Height));
                 const needsTiles = !seeds.noDescramble;
                 if (!needsTiles && !needsScale && outType === 'image/jpeg' && blob.type === 'image/jpeg') {
-                    // Nothing has to change about this page. Decoding and
-                    // re-encoding it costs ~57ms on a 1600x2400 scan (measured)
-                    // to produce a slightly worse copy of the bytes we already
-                    // hold, so hand the original straight back.
+
                     if (bmp.close) bmp.close();
                     const unchanged = { id, blob };
                     if (needCrc) unchanged.crc = await crcForZip(blob);
@@ -1363,12 +1445,7 @@
                 const canvas = new OffscreenCanvas(W, H);
                 const ctx = canvas.getContext('2d');
                 if (needsTiles) {
-                    // Blit each tile straight from the decoded bitmap into its
-                    // destination rect. The previous version pulled the whole
-                    // frame back with getImageData, copied the tiles in JS and
-                    // pushed it back with putImageData, about 46MB of avoidable
-                    // memory traffic per page, which is what stopped the decoder
-                    // keeping up with the fetcher. Measured 2.08x on 14 cores.
+
                     for (const t of A9p(seeds, W, H)) {
                         ctx.drawImage(bmp, t.destX, t.destY, t.width, t.height,
                             t.srcX, t.srcY, t.width, t.height);
@@ -1400,10 +1477,7 @@
         self.onmessage = async (ev) => {
             const isBatch = Array.isArray(ev.data.jobs);
             const jobs = isBatch ? ev.data.jobs : [ev.data];
-            // processPage allocates an independent bitmap/canvas per item, so
-            // Promise.all overlaps codec work without sharing mutable surfaces.
-            // Acknowledge each result as soon as it finishes: if a sibling hangs,
-            // the pool can commit this page and time out only the unfinished one.
+
             if (!isBatch) {
                 self.postMessage(await processPage(ev.data));
                 return;
@@ -1415,7 +1489,7 @@
         };
     }
 
-    function workerPoolSize() {
+function workerPoolSize() {
         let cores = 8;
         try { cores = navigator.hardwareConcurrency || 8; } catch (e) {}
         return Math.min(Math.max(4, cores), 16);
@@ -1430,17 +1504,12 @@
         let nextBatchId = 1;
         let pumpScheduled = false;
 
-        // The job envelope belongs to the site module: BookWalker ships its own
-        // relPath/seeds/q shape, ebookjapan ships page geometry and session
-        // material. A site that supplies no builder keeps the original shape.
         const messageFor = typeof buildMessage === 'function' ? buildMessage : function (job) {
             const message = {
                 id: job.id, relPath: job.relPath, seeds: job.seeds,
                 q: job.q, fmt: job.fmt, needCrc: !!job.needCrc, timeoutMs: jobTimeoutMs,
             };
-            // The main-thread prefetcher already downloaded this page, so pass
-            // the Blob (structured-cloneable, unlike an ArrayBuffer) instead of
-            // re-fetching through the six-socket origin.
+
             if (job.blob) message.blob = job.blob;
             else {
                 message.auth = job.auth;
@@ -1452,6 +1521,15 @@
             const timer = timers.get(id);
             if (timer) clearTimeout(timer);
             timers.delete(id);
+        }
+
+        function transfersFor(jobs) {
+            const out = [];
+            for (const job of jobs) {
+                if (!job || !Array.isArray(job.transfer)) continue;
+                for (const item of job.transfer) if (item) out.push(item);
+            }
+            return out;
         }
         function replaceWorker(w) {
             const idx = workers.indexOf(w);
@@ -1484,8 +1562,7 @@
             w.batchId = null;
             const recycle = w.hadTimeout;
             w.hadTimeout = false;
-            // A timed-out page may still own native codec work. Preserve every
-            // sibling that did finish, but never reuse that worker.
+
             if (recycle) replaceWorker(w);
             pump();
         }
@@ -1532,7 +1609,7 @@
                     timers.set(job.id, setTimeout(() => timeoutJob(w, job.id), jobTimeoutMs));
                 }
                 try {
-                    w.postMessage({ batchId, jobs: jobs.map(messageFor) });
+                    w.postMessage({ batchId, jobs: jobs.map(messageFor) }, transfersFor(jobs));
                 } catch (e) {
                     for (const job of jobs) {
                         clearJobTimer(job.id);
@@ -1545,8 +1622,7 @@
                     retry = true;
                 }
             }
-            // A failed structured clone leaves this worker idle. Revisit the
-            // queue once so one bad job cannot stall every page behind it.
+
             if (retry) schedulePump();
         }
         function schedulePump() {
@@ -1558,8 +1634,7 @@
             });
         }
         return {
-            // Coalesce synchronous submissions: pumping on every submit would
-            // defeat batching before the second page ever reached the queue.
+
             submit(job) { queue.push(job); schedulePump(); },
             terminate() {
                 queue.length = 0;
@@ -1574,8 +1649,7 @@
     function detectWorkers() {
         try {
             if (typeof Worker === 'undefined' || typeof OffscreenCanvas === 'undefined') return false;
-            // The worker source belongs to a site module, so a build without
-            // one simply has no worker pool rather than a broken reference.
+
             if (typeof buildWorkerSource !== 'function') return false;
             const src = buildWorkerSource();
             const url = URL.createObjectURL(new Blob([src], { type: 'text/javascript' }));
@@ -1586,8 +1660,35 @@
         } catch (e) { return false; }
     }
 
+    function canSpawnBlobWorker(timeoutMs) {
+        return new Promise(resolve => {
+            if (typeof Worker === 'undefined') { resolve(false); return; }
+            let url = null, w = null, done = false;
+            const finish = ok => {
+                if (done) return;
+                done = true;
+                if (w) { try { w.terminate(); } catch (e) {} }
+                if (url) { try { URL.revokeObjectURL(url); } catch (e) {} }
+                resolve(ok);
+            };
+            try {
+                url = URL.createObjectURL(new Blob(['self.postMessage(1);'], { type: 'text/javascript' }));
+                w = new Worker(url);
+            } catch (e) { finish(false); return; }
+            w.onmessage = () => finish(true);
+            w.onerror = () => finish(false);
+            setTimeout(() => finish(false), timeoutMs || 1500);
+        });
+    }
+
     async function fetchWithTimeout(url, opts, ms) {
         const ctrl = new AbortController();
+        const external = opts && opts.signal;
+        const onExternalAbort = () => { try { ctrl.abort(); } catch (e) {} };
+        if (external) {
+            if (external.aborted) onExternalAbort();
+            else { try { external.addEventListener('abort', onExternalAbort, { once: true }); } catch (e) {} }
+        }
         let timer = setTimeout(() => ctrl.abort(), ms);
         let cleared = false;
         const clear = () => {
@@ -1595,6 +1696,7 @@
             cleared = true;
             clearTimeout(timer);
             timer = null;
+            if (external) { try { external.removeEventListener('abort', onExternalAbort); } catch (e) {} }
         };
         try {
             const res = await fetch(url, Object.assign({}, opts, { signal: ctrl.signal }));
@@ -1626,26 +1728,29 @@
         try { if (res && res._bwddClearTimeout) res._bwddClearTimeout(); } catch (e) {}
     }
 
-    // Chrome allows 6 concurrent HTTP/1.1 connections per origin (scheme + host
-    // + PORT), and the CDN is a single HTTP/1.1 host, so the page alone is pinned
-    // at 6. Extra lanes: `gm` (Tampermonkey's own pool) and `px:N` (a local helper
-    // port; each is a separate origin and the script bounds the fan-out).
     const PROXY_HOST = 'http://127.0.0.1:';
     const PROXY_BASE_PORT = 7010;
-    // Each localhost port is a separate HTTP/1.1 origin. Chromium's normal
-    // group limit is 6 per origin; it is not a 300-socket global cap. Keep a
-    // finite bridge fan-out so a misconfigured helper cannot create unbounded
-    // work, while allowing a bridge that exposes more ports to use them.
+
     const PROXY_MAX_PORTS = 64;
-    // A failing port is parked, not deleted: a wide burst can fail every port at
-    // once, and deleting them collapses the run onto the 6-socket page lane.
+
     const PROXY_ERROR_PARK = 12;
     const PROXY_PARK_MAX = 5;
     const PROXY_PARK_MS = 4000;
+    const PROXY_RETIRE_MS = 90000;
     let gmUsable = (typeof GM_xmlhttpRequest === 'function');
+
+    let proxyRealmBlocked = false;
     const proxyPorts = [];
     const proxyPortSources = new Map();
-    const retiredProxyPorts = new Set();
+
+    const retiredProxyPorts = new Map();
+    function proxyRetireMs() {
+        try {
+            const v = Number(window.__bwddProxyRetireMs);
+            if (isFinite(v) && v >= 0) return v;
+        } catch (e) {}
+        return PROXY_RETIRE_MS;
+    }
 
     const laneStats = {};
     function addLane(name) {
@@ -1660,20 +1765,11 @@
     addLane('page');
     addLane('gm');
 
-    // Chrome keys its socket pool by *site*, so a subdomain of a host we can
-    // already reach buys nothing; "host." (trailing dot) is a distinct host and
-    // gets its own pool. The signed policy covers a path wildcard, so the dot
-    // cannot break the signature, but whether CloudFront serves it is not
-    // knowable in advance, so the lane self-verifies on a real page and a
-    // rejection costs one request.
     let dotLaneEnabled = false;
     function dottedUrl(url) {
-        // Dot the HOSTNAME only: appending it to the authority would give
-        // "host:8443." and corrupt the port. The rest of
-        // the URL is left byte-identical so the signed query is untouched.
-        //   https://a.example.com:8443/x -> https://a.example.com.:8443/x
+
         return url.replace(/^(https?:\/\/)([^/?#:]+)(:\d+)?/, (m, scheme, hostname, port) => {
-            if (hostname.endsWith('.') || /^[\d.]+$/.test(hostname)) return m; // already dotted / an IP
+            if (hostname.endsWith('.') || /^[\d.]+$/.test(hostname)) return m;
             return scheme + hostname + '.' + (port || '');
         });
     }
@@ -1682,6 +1778,8 @@
         try {
             const res = await fetchWithTimeout(dottedUrl(probeUrl), { credentials: 'omit' }, 8000);
             if (res && res.ok) {
+
+                await releaseResponse(res);
                 dotLaneEnabled = true;
                 addLane('dot');
                 const dottedHost = (dottedUrl(probeUrl).match(/^https?:\/\/([^/?#]+)/) || [])[1] || '';
@@ -1691,6 +1789,7 @@
                 }
                 return true;
             }
+            await releaseResponse(res);
             if (BWDD_DEBUG) {
                 console.info('[bwdd] trailing-dot lane off (probe returned HTTP ' +
                     (res && res.status) + ')');
@@ -1701,12 +1800,6 @@
         return false;
     }
 
-    // HTTP/2 edge-mirror lane (self-verifying, strictly opt-in). The CDN answers
-    // "http/1.1 only" over ALPN, which is what makes the 6-socket cap bind; a host
-    // speaking HTTP/2 multiplexes many streams over one connection (measured: 100
-    // concurrent, ~8.9x the direct path). It is the only route past the cap with
-    // nothing running locally, but it sends the signed URL through whoever runs
-    // the mirror, so it stays opt-in. See bw-edge-mirror.js.
     let edgeUrl = '';
     let edgeToken = '';
     let edgeLaneEnabled = false;
@@ -1756,7 +1849,6 @@
     }
 
     function edgeUrlFor(url) {
-        // Same path and signed query, different front-end.
         return edgeUrl + url.replace(/^https?:\/\/[^/]+/, '');
     }
 
@@ -1770,26 +1862,36 @@
             if (onlineOnly && !proxyPortOnline(p)) continue;
             const st = laneStats['px:' + p];
             if (st && st.parkUntil > now) continue;
-            out.push({ name: 'px:' + p, kind: 'proxy', port: p });
+            out.push({
+                name: 'px:' + p, kind: 'proxy', port: p,
+                pathUpstream: proxyPortUsesPathUpstream(p),
+            });
         }
         return out;
     }
-    // Six everywhere except the edge mirror, which multiplexes many streams over
-    // one HTTP/2 connection, so it should absorb proportionally more traffic.
+
     function laneCapacity(L) {
         return L && L.kind === 'edge' ? 100 : 6;
     }
-    // Sizes the prefetch window: a small multiple of the real socket capacity.
+
+    const CHROMIUM_SOCKETS_PER_PROCESS = 256;
+    const CONTROL_PLANE_SOCKET_RESERVE = 16;
+    const MAX_DATA_PLANE_SOCKETS = CHROMIUM_SOCKETS_PER_PROCESS - CONTROL_PLANE_SOCKET_RESERVE;
+
     function fetchSocketBudget(onlineOnly) {
+        let n = 0;
+        for (const L of allLanes(onlineOnly)) n += laneCapacity(L);
+        n = Math.min(n, MAX_DATA_PLANE_SOCKETS);
+        return n;
+    }
+
+    function rawSocketBudget(onlineOnly) {
         let n = 0;
         for (const L of allLanes(onlineOnly)) n += laneCapacity(L);
         return n;
     }
 
-    // NOTE: named gmBlobFetch, not gmFetch, the stats section further down
-    // already declares a `gmFetch` in this same scope, and a duplicate function
-    // declaration hoists with the *last* one winning for the whole scope.
-    function gmBlobFetch(url, timeoutMs) {
+    function gmBlobFetch(url, timeoutMs, headers) {
         return new Promise((resolve, reject) => {
             let settled = false;
             const fail = (msg) => {
@@ -1801,6 +1903,7 @@
                 GM_xmlhttpRequest({
                     method: 'GET',
                     url,
+                    headers: headers || undefined,
                     timeout: timeoutMs || 45000,
                     responseType: 'blob',
                     onload: (r) => {
@@ -1810,7 +1913,8 @@
                         if (body instanceof ArrayBuffer) body = new Blob([body], { type: 'image/jpeg' });
                         if (!(body instanceof Blob)) { fail('GM_xhr: no blob body'); return; }
                         const ok = r.status >= 200 && r.status < 300;
-                        resolve({ ok, status: r.status, blob: async () => body, _lane: 'gm' });
+                        resolve({ ok, status: r.status, blob: async () => body,
+                            headers: gmHeaderShim(r.responseHeaders), _lane: 'gm' });
                     },
                     onerror: () => fail('GM_xhr: request failed'),
                     ontimeout: () => fail('GM_xhr: timeout'),
@@ -1820,12 +1924,40 @@
         });
     }
 
-    // Which hosts the bridge's proxy ports will fetch: it rewrites the request
-    // onto x-bwdd-upstream and refuses any host outside its own allowlist, so a
-    // port is only usable for a CDN the bridge accepts ("*" = generic). A bridge
-    // too old to advertise the list is assumed to serve only the BookWalker CDN,
-    // which keeps an existing setup working without aiming a CMOA path at a host
-    // that would answer from the wrong CDN.
+    function gmHeaderShim(raw) {
+        const text = String(raw || '');
+        return {
+            get(name) {
+                const want = String(name || '').toLowerCase();
+                for (const line of text.split(/\r?\n/)) {
+                    const ix = line.indexOf(':');
+                    if (ix === -1) continue;
+                    if (line.slice(0, ix).trim().toLowerCase() === want) return line.slice(ix + 1).trim();
+                }
+                return null;
+            },
+        };
+    }
+
+    async function loopbackJson(url, timeoutMs) {
+        if (!proxyRealmBlocked) {
+            try {
+                const r = await fetchWithTimeout(url, { credentials: 'omit', cache: 'no-store' }, timeoutMs);
+                if (r.ok) return await r.json();
+            } catch (e) { }
+        }
+
+        if (typeof GM_xmlhttpRequest !== 'function') return null;
+        try {
+            const res = await gmBlobFetch(url, timeoutMs || 2500);
+            if (!res || !res.ok) return null;
+            const blob = await res.blob();
+            const j = JSON.parse(await blob.text());
+            proxyRealmBlocked = true;
+            return j;
+        } catch (e) { return null; }
+    }
+
     let proxyUpstreamPatterns = ['bw-bv-epubs.bookwalker.jp'];
     let proxyDefaultHost = 'bw-bv-epubs.bookwalker.jp';
     function setProxyUpstreams(list, defaultUpstream) {
@@ -1874,8 +2006,22 @@
         return n;
     }
 
-    function addProxyPorts(list, source) {
+    const PATH_UPSTREAM_PREFIX = '/_bwdd/';
+    const pathUpstreamSources = new Set();
+
+    function proxyPortUsesPathUpstream(port) {
+        const sources = proxyPortSources.get(port);
+        if (!sources) return false;
+        for (const source of sources) {
+            if (pathUpstreamSources.has(source)) return true;
+        }
+        return false;
+    }
+
+    function addProxyPorts(list, source, options) {
         const key = source || 'legacy';
+        if (options && options.pathUpstream) pathUpstreamSources.add(key);
+        else pathUpstreamSources.delete(key);
         const advertised = new Set();
         for (const raw of (Array.isArray(list) ? list : [])) {
             const port = parseInt(raw, 10);
@@ -1891,7 +2037,13 @@
         }
         pruneProxyPorts();
         for (const port of advertised) {
-            if (retiredProxyPorts.has(port)) continue;
+            if (retiredProxyPorts.has(port)) {
+                if (retiredProxyPorts.get(port) > Date.now()) continue;
+
+                retiredProxyPorts.delete(port);
+                const st = laneStats['px:' + port];
+                if (st) { st.parks = 0; st.errors = 0; st.parkUntil = 0; }
+            }
             if (!proxyPorts.includes(port) && activeProxyPortCount() < PROXY_MAX_PORTS) {
                 proxyPorts.push(port);
                 addLane('px:' + port);
@@ -1915,6 +2067,7 @@
     }
 
     function clearProxySource(source) {
+        pathUpstreamSources.delete(source);
         for (const [port, sources] of proxyPortSources) {
             sources.delete(source);
             if (!sources.size) proxyPortSources.delete(port);
@@ -1922,81 +2075,77 @@
         pruneProxyPorts();
     }
 
-    // mokuro-bridge doubles as an accelerator: it serves the CDN on extra
-    // localhost ports (each its own 6-socket origin) advertised in /health, so a
-    // user already running it for OCR gets those lanes with no setup.
-    // Downloading never *depends* on it, no bridge simply means no lanes.
     async function probeBridgeFetchProxy() {
+
+        const j = await loopbackJson(MOKURO_BRIDGE_URL + '/health', 2500);
+
+        if (!j) return;
         clearProxySource('bridge');
-        try {
-            const r = await fetchWithTimeout(MOKURO_BRIDGE_URL + '/health',
-                { cache: 'no-store' }, 2500);
-            if (!r.ok) return;
-            const j = await r.json();
-            if (j && (j.fetchUpstreams || j.upstream)) {
-                setProxyUpstreams(j.fetchUpstreams, j.upstream);
-            }
-            if (j && Array.isArray(j.fetchProxyPorts) && j.fetchProxyPorts.length) {
-                addProxyPorts(j.fetchProxyPorts, 'bridge');
-            }
-        } catch (e) { /* bridge not running */ }
+        if (j.fetchUpstreams || j.upstream) {
+            setProxyUpstreams(j.fetchUpstreams, j.upstream);
+        }
+        if (Array.isArray(j.fetchProxyPorts) && j.fetchProxyPorts.length) {
+
+            addProxyPorts(j.fetchProxyPorts, 'bridge', { pathUpstream: !!j.fetchPathUpstream });
+        }
     }
 
-    // Discover the optional local fetch proxy. If the helper is not running this
-    // is one failed request to a closed local port and the run proceeds on the
-    // page + gm lanes exactly as before. If it had to move off 7010 (port in use),
-    // point the script at it with `window.__bwddProxyBasePort = 7100;`.
     async function probeFetchProxy() {
         return await discoverProxyPorts();
     }
 
-    // Re-run discovery so the panel's pre-flight indicator lights up bridge ports
-    // that started *after* the page loaded; source ownership and retirement decide
-    // which lanes remain selectable.
+    let discoveryInFlight = null;
+
     async function discoverProxyPorts() {
-        clearProxySource('helper');
+        if (discoveryInFlight) return await discoveryInFlight;
+        discoveryInFlight = discoverProxyPortsOnce();
+        try { return await discoveryInFlight; }
+        finally { discoveryInFlight = null; }
+    }
+
+    async function discoverProxyPortsOnce() {
         let basePort = PROXY_BASE_PORT;
         try {
             if (typeof window !== 'undefined' && window.__bwddProxyBasePort) {
                 basePort = parseInt(window.__bwddProxyBasePort, 10) || PROXY_BASE_PORT;
             }
         } catch (e) {}
-        try {
-            const r = await fetchWithTimeout(PROXY_HOST + basePort + '/__bwdd_health',
-                { credentials: 'omit', cache: 'no-store' }, 800);
-            if (r.ok) {
-                const j = await r.json();
-                if (j && j.bwddFetchProxy) {
-                    if (Array.isArray(j.upstreams) && j.upstreams.length) setProxyUpstreams(j.upstreams);
-                    addProxyPorts(
-                        Array.isArray(j.portList) && j.portList.length
-                            ? j.portList
-                            : Array.from(
-                                { length: Math.min(PROXY_MAX_PORTS, j.ports || 1) },
-                                (_, i) => basePort + i),
-                        'helper'
-                    );
-                }
+
+        const helper = (async () => {
+            const j = await loopbackJson(PROXY_HOST + basePort + '/__bwdd_health', 800);
+            if (j && j.bwddFetchProxy) {
+                clearProxySource('helper');
+                if (Array.isArray(j.upstreams) && j.upstreams.length) setProxyUpstreams(j.upstreams);
+                addProxyPorts(
+                    Array.isArray(j.portList) && j.portList.length
+                        ? j.portList
+                        : Array.from(
+                            { length: Math.min(PROXY_MAX_PORTS, j.ports || 1) },
+                            (_, i) => basePort + i),
+                    'helper',
+                    { pathUpstream: !!j.pathUpstream }
+                );
             }
-        } catch (e) { /* helper not running */ }
-        await probeBridgeFetchProxy();
+        })();
+        await Promise.all([helper, probeBridgeFetchProxy()]);
         return proxyPorts;
     }
 
-    // Last known bridge reachability, mirrored out of buildUI's poll, for the
-    // bridge/OCR status shown in the panel; the per-port source map decides which
-    // discovered proxy lanes are usable now.
     let laneBridgeOnline = false;
 
     function capabilitySummary() {
         const lanes = allLanes(true);
         const ports = lanes.filter(l => l.kind === 'proxy').length;
         const sockets = fetchSocketBudget(true);
+        const rawSockets = rawSocketBudget(true);
         const offlineSockets = 6 + (gmUsable ? 6 : 0) + (dotLaneEnabled ? 6 : 0) +
             (edgeLaneEnabled ? 100 : 0);
         return {
             ports,
             sockets,
+            rawSockets,
+
+            socketsClamped: rawSockets > sockets,
             withoutBridge: offlineSockets,
             effectiveSockets: sockets,
             workers: workerPoolSize(),
@@ -2007,14 +2156,8 @@
         };
     }
 
-    // Least-*utilised* lane wins (in-flight divided by capacity), so the 6-socket
-    // lanes fill up while the edge mirror keeps absorbing work; the tie-break
-    // rotates so even a low-concurrency run touches every lane.
     let laneRR = 0;
-    // allowProxy=false keeps a request off the local fetch-proxy lanes: they are
-    // not transparent forwarders, so a port advertised for one store's CDN would
-    // answer every other store's path from the wrong host (a 404 at best). A
-    // caller fetching a CDN the proxy was not configured for must opt out.
+
     function pickLane(allowProxy) {
         let lanes = allLanes(true);
         if (allowProxy === false) {
@@ -2033,17 +2176,17 @@
     }
 
     function proxyUrlFor(port, url) {
-        // Same path + signed query, different origin.
         return PROXY_HOST + port + url.replace(/^https?:\/\/[^/]+/, '');
     }
 
-    // A failing lane is parked (helper port) or retired rather than deleted
-    // outright: a wide burst can fail every lane at once, and dropping them
-    // collapses the run onto the page lane.
+    function proxyPathUrlFor(port, host, url) {
+        return PROXY_HOST + port + PATH_UPSTREAM_PREFIX + host + url.replace(/^https?:\/\/[^/?#]+/, '');
+    }
+
     function laneRetireLimit(lane) {
         if (lane.kind === 'gm') return 5;
         if (lane.kind === 'proxy') return PROXY_ERROR_PARK;
-        return 8;   // edge, dot
+        return 8;
     }
 
     function retireLane(lane, err) {
@@ -2065,49 +2208,89 @@
                 const ix = proxyPorts.indexOf(lane.port);
                 if (ix !== -1) proxyPorts.splice(ix, 1);
                 proxyPortSources.delete(lane.port);
-                retiredProxyPorts.add(lane.port);
+                retiredProxyPorts.set(lane.port, Date.now() + proxyRetireMs());
                 console.warn('[bwdd] fetch proxy port ' + lane.port + ' retired after repeated parks');
             }
         }
     }
 
-    async function laneAttempt(lane, url, timeoutMs) {
+    async function laneAttempt(lane, url, timeoutMs, signal) {
         const to = timeoutMs || 45000;
         if (lane.kind === 'gm') return await gmBlobFetch(url, to);
         if (lane.kind === 'edge') {
             const opts = { credentials: 'omit' };
             if (edgeToken) opts.headers = { 'x-bwdd-token': edgeToken };
-            return await fetchWithTimeout(edgeUrlFor(url), opts, to);
+            return await fetchWithTimeout(edgeUrlFor(url), Object.assign({ signal: signal }, opts), to);
         }
         if (lane.kind === 'dot') {
-            return await fetchWithTimeout(dottedUrl(url), { credentials: 'omit' }, to);
+            return await fetchWithTimeout(dottedUrl(url), { credentials: 'omit', signal: signal }, to);
         }
         if (lane.kind === 'proxy') {
-            // The proxy carries only path + query, so it must be told which CDN
-            // the bytes come from. The bridge rejects any host outside its
-            // allowlist with a JSON 403, which laneFetch treats as a lane failure
-            // rather than an answer from the CDN. A request for the CDN the
-            // bridge already defaults to sends no header (so no CORS preflight);
-            // only a different CDN names itself, which lets one bridge serve
-            // several stores without a second instance.
+
             const opts = { credentials: 'omit' };
             const host = hostOf(url);
-            if (host && host !== proxyDefaultHost) opts.headers = { 'x-bwdd-upstream': host };
-            const res = await fetchWithTimeout(proxyUrlFor(lane.port, url), opts, to);
-            if (res.status === 403) {
-                const ct = res.headers && res.headers.get && res.headers.get('content-type');
-                if (ct && ct.indexOf('application/json') !== -1) {
-                    await releaseResponse(res);
-                    throw new Error('fetch proxy refused host ' + host);
+
+            let target = proxyUrlFor(lane.port, url);
+            if (host && lane.pathUpstream) target = proxyPathUrlFor(lane.port, host, url);
+            else if (host && host !== proxyDefaultHost) opts.headers = { 'x-bwdd-upstream': host };
+
+            const gmHeaders = (host && !lane.pathUpstream) ? { 'x-bwdd-upstream': host } : null;
+            const viaGm = async () => await gmProxyRequest(target, host, to, gmHeaders);
+            if (proxyRealmBlocked) return await viaGm();
+            try {
+                if (signal) opts.signal = signal;
+                const res = await fetchWithTimeout(target, opts, to);
+                if (res.status === 403) {
+                    const ct = res.headers && res.headers.get && res.headers.get('content-type');
+                    if (ct && ct.indexOf('application/json') !== -1) {
+                        await releaseResponse(res);
+                        throw new Error('fetch proxy refused host ' + host);
+                    }
                 }
+                if (res.status >= 500 && res.status <= 504) {
+                    await releaseResponse(res);
+                    throw new Error('fetch proxy transport error ' + res.status);
+                }
+                return res;
+            } catch (e) {
+
+                const gm = await viaGm();
+                if (!gm) throw e;
+                proxyRealmBlocked = true;
+                console.warn('[bwdd] this page\u2019s CSP refuses http:// loopback \u2014 ' +
+                    'the accelerator now rides GM_xmlhttpRequest');
+                return gm;
             }
-            if (res.status >= 500 && res.status <= 504) {
-                await releaseResponse(res);
-                throw new Error('fetch proxy transport error ' + res.status);
-            }
-            return res;
         }
-        return await fetchWithTimeout(url, { credentials: 'omit' }, to);
+        return await fetchWithTimeout(url, { credentials: 'omit', signal: signal }, to);
+    }
+
+    function resetProxyRealmFlag() { proxyRealmBlocked = false; }
+
+    let gmProxyLastNote = '';
+    function gmProxyNote(why) {
+        if (why === gmProxyLastNote) return;
+        gmProxyLastNote = why;
+        console.warn('[bwdd] fetch proxy lane unusable: ' + why);
+    }
+
+    async function gmProxyRequest(target, host, timeoutMs, headers) {
+        if (typeof GM_xmlhttpRequest !== 'function') return null;
+        let gm;
+        try { gm = await gmBlobFetch(target, timeoutMs, headers); }
+        catch (e) {
+            gmProxyNote('unreachable: ' + safeLogText((e && e.message) || e));
+            return null;
+        }
+        if (!gm.ok) gmProxyNote('HTTP ' + gm.status + ' for host ' + (host || '(default)'));
+        const ct = gm.headers && gm.headers.get && gm.headers.get('content-type');
+        if (gm.status === 403 && ct && ct.indexOf('application/json') !== -1) {
+            throw new Error('fetch proxy refused host ' + host);
+        }
+        if (gm.status >= 500 && gm.status <= 504) {
+            throw new Error('fetch proxy transport error ' + gm.status);
+        }
+        return gm;
     }
 
     function tagLane(res, name) {
@@ -2117,12 +2300,22 @@
 
     async function laneFetch(url, timeoutMs, opts) {
         const lane = pickLane(opts && opts.allowProxy);
-        const st = laneStats[lane.name];
         const isPage = lane.kind === 'page';
+        const signal = opts && opts.signal;
+        try {
+            return await laneAttemptRated(lane, url, timeoutMs, signal);
+        } catch (e) {
+            if (isPage) throw e;
+        }
+        return await onPageLane(url, timeoutMs, signal);
+    }
+
+    async function laneAttemptRated(lane, url, timeoutMs, signal) {
+        const st = laneStats[lane.name];
         const countsNonOk = lane.kind === 'edge' || lane.kind === 'dot';
         st.inflight++;
         try {
-            const res = await laneAttempt(lane, url, timeoutMs);
+            const res = await laneAttempt(lane, url, timeoutMs, signal);
             if (res && res.status >= 500 && res.status <= 504 &&
                 (lane.kind === 'edge' || lane.kind === 'dot' || lane.kind === 'gm')) {
                 await releaseResponse(res);
@@ -2132,18 +2325,39 @@
             else if (countsNonOk && ++st.errors >= laneRetireLimit(lane)) retireLane(lane, null);
             return tagLane(res, lane.name);
         } catch (e) {
-            if (isPage) throw e;
             if (++st.errors >= laneRetireLimit(lane)) retireLane(lane, e);
+            throw e;
         } finally {
             st.inflight--;
         }
-        return await onPageLane(url, timeoutMs);
     }
 
-    async function onPageLane(url, timeoutMs) {
+    function proxyLaneAvailable() {
+        return allLanes(true).some(L => L.kind === 'proxy');
+    }
+
+    async function proxyLaneFetch(url, timeoutMs) {
+
+        if (!proxyCanServe(hostOf(url))) return null;
+        const px = allLanes(true).filter(L => L.kind === 'proxy');
+        if (!px.length) return null;
+
+        const n = px.length;
+        let best = px[0], bestScore = Infinity;
+        for (let i = 0; i < n; i++) {
+            const L = px[(laneRR + i) % n];
+            const score = laneStats[L.name].inflight / laneCapacity(L);
+            if (score < bestScore) { bestScore = score; best = L; }
+        }
+        laneRR = (laneRR + 1) % n;
+        try { return await laneAttemptRated(best, url, timeoutMs); }
+        catch (e) { return null; }
+    }
+
+    async function onPageLane(url, timeoutMs, signal) {
         laneStats.page.inflight++;
         try {
-            return tagLane(await fetchWithTimeout(url, { credentials: 'omit' }, timeoutMs || 45000), 'page');
+            return tagLane(await fetchWithTimeout(url, { credentials: 'omit', signal: signal }, timeoutMs || 45000), 'page');
         } finally {
             laneStats.page.inflight--;
         }
@@ -2154,10 +2368,6 @@
         s.done++; s.ms += ms; s.bytes += (bytes || 0);
     }
 
-    // Deliberately no per-lane pages/sec: a lane has no wall-clock window of its
-    // own, so dividing pages by *summed request time* just reports 1/latency (a
-    // real run printed 0.7/s per lane while the batch did 15 pages/s, ~21 requests
-    // in flight). Share plus mean latency shows whether a lane is pulling weight.
     function laneSummary() {
         const out = {};
         let total = 0;
@@ -2174,10 +2384,7 @@
         }
         return out;
     }
-    // Collapse concurrent requests for the same key onto one promise: retry rounds
-    // and duplicated manifest entries legitimately ask for the same page twice
-    // otherwise. The entry is dropped as soon as it settles, so a later retry
-    // round can still re-fetch a page that genuinely failed.
+
     function dedupeInflight(map, key, start) {
         let p = map.get(key);
         if (!p) {
@@ -2189,10 +2396,8 @@
         return p;
     }
 
+async function decodeBlobMain(blob, seeds, q, fmt) {
 
-    async function decodeBlobMain(blob, seeds, q, fmt) {
-        // Same approach as workerMain: blit tiles straight from the decoded
-        // bitmap instead of round-tripping the frame through getImageData.
         const codec = fmt ? { type: fmt, ext: IMAGE_CODEC.ext } : IMAGE_CODEC;
         const bmp = await createImageBitmap(blob);
         const W = bmp.width, H = bmp.height;
@@ -2227,7 +2432,7 @@
             outCanvas.toBlob(b => b ? res2(b) : rej(new Error('toBlob')), codec.type, q));
     }
 
-    let rateLimitCooldownUntil = 0;
+let rateLimitCooldownUntil = 0;
     let consecutiveBlocks = 0;
     function corsLikeError(e, status) {
         if (status === 429 || status === 503) return true;
@@ -2258,19 +2463,15 @@
     const REQS_PER_POLICY_RENEW = 100;
     function authRequestBudgetExhausted() { return reqsSinceAuth >= REQS_PER_POLICY_RENEW; }
     function resetAuthBudget() { reqsSinceAuth = 0; }
-    function cdnBaseCandidates(fileKey, relPath) {
+
+function cdnBaseCandidates(fileKey, relPath) {
         const out = [];
         const add = (u) => { if (u && out.indexOf(u) === -1) out.push(u); };
         if (fileKey && state.fileBases && state.fileBases[fileKey]) add(state.fileBases[fileKey]);
         if (state.baseUrl) {
             const m = state.baseUrl.match(/^(.*?\/SVGA\/)(?:[^/]+\/)?$/);
             if (m) {
-                // Pick the variant this rel actually lives in FIRST. Captures:
-                // cover/front-matter/shared pages sit under SVGA/shared while
-                // the body pages sit under SVGA/normal_default, a mismatched
-                // first guess 403s and (in the old code) stalled the whole run
-                // on breaker cooldowns. Guessing right means the first probe
-                // usually 200s.
+
                 const isShared = /(^|\/)shared\//.test(relPath || '');
                 const variants = isShared ? ['shared', 'normal_default'] : ['normal_default', 'shared'];
                 for (const v of variants) add(m[1] + v + '/');
@@ -2286,23 +2487,15 @@
             try {
                 const res = await cdnFetch((attempt) => {
                     const base = bases[bi] + relPath + '?' + authQuery(state.auth);
-                    // Only retries carry a cache-buster, so the first attempt
-                    // stays byte-identical to what the viewer itself requests.
+
                     return attempt > 0 ? base + '&_bwr=' + attempt + '-' + Date.now().toString(36) : base;
                 }, timeoutMs || 45000);
-                // Remember which base dir actually served this page family so
-                // later pages skip the probe chain entirely (state.fileBases is
-                // reset per run in resetRunState).
+
                 if (fileKey && state.fileBases && !state.fileBases[fileKey]) state.fileBases[fileKey] = bases[bi];
                 return res;
             } catch (e) {
                 lastErr = e;
-                // 403 with a still-valid policy = this base-dir guess does not
-                // host the file (wrong SVGA variant). That is NOT a rate limit:
-                // move to the next candidate immediately, no breaker, no auth
-                // churn. (Genuinely expired policies are retried inside
-                // cdnFetch, and prefetchOne rotates auth when every candidate
-                // path-denies.)
+
                 if (e && e.pathDenied) continue;
                 if (breakerOpen()) {
                     await waitOutCooldown();
@@ -2315,12 +2508,7 @@
 
     async function cdnFetch(urlBuilder, timeoutMs) {
         await waitOutCooldown();
-        // Policy-clock renewal: every /browserWebApi/pb response mints a
-        // CloudFront policy whose DateLessThan is ~60 s out (verified on all
-        // live captures), and no capture shows a per-policy *request* quota on
-        // valid paths. Refresh when the current policy is about to lapse OR the
-        // legacy request-count budget trips; count alone was refreshing far too
-        // eagerly during 128-wide bursts.
+
         if ((!authLooksFresh() || reqsSinceAuth >= REQS_PER_POLICY_RENEW) && authRefreshPromise === null) {
             try {
                 const before = authPolicySig();
@@ -2343,25 +2531,13 @@
             }
             lastStatus = status; lastErr = err;
             if (status === 403) {
-                // A 403 while the policy still has runway is a PATH denial: this
-                // base-dir guess does not host the file (captures show the same
-                // token 200s under .../SVGA/shared while bare .../SVGA 403s
-                // forever). Refreshing auth cannot fix a wrong path and must not
-                // trip the global breaker, so signal pathDenied. Only a lapsed
-                // policy is rotated and retried first.
+
                 if (!authLooksFresh() && attempt < 2) {
                     const before = authPolicySig();
                     try { await refreshAuthBest(); } catch (e2) {}
                     if (authPolicySig() !== before) { reqsSinceAuth = 0; continue; }
                 }
-                // A fresh policy that still 403s is usually BookWalker's cached S3
-                // error page for one object, per-URL and transient (in a
-                // 308-request capture every 403 cleared on a plain retry), not a
-                // path denial. One jittered retry before concluding the path
-                // is wrong, so one bad edge entry cannot cost a whole page. The
-                // retry carries a cache-buster: the signed policy's Resource is
-                // a path wildcard, so the query string is not part of the
-                // signature and the extra param cannot invalidate it.
+
                 if (attempt === 0) {
                     await sleepMs(120 + Math.random() * 240);
                     continue;
@@ -2386,11 +2562,13 @@
         e4.status = lastStatus;
         throw e4;
     }
-    function effectiveBurst(base) {
+
+function effectiveBurst(base) {
         if (consecutiveBlocks === 0) return base;
         return Math.max(4, Math.floor(base / (consecutiveBlocks + 1)));
     }
-    function authPolicySig() {
+
+function authPolicySig() {
         try { return (state.auth && state.auth['Policy'] || '') + '|' + (state.auth && state.auth['Signature'] || ''); }
         catch (e) { return ''; }
     }
@@ -2402,15 +2580,6 @@
         return await decodeBlobMain(blob, seeds, q, fmt);
     }
 
-    // =====================================================================
-    // 7. Manga stats bridge (manga-kotoba + LearnNatively)
-    // =====================================================================
-    // Cross-origin fetch for the stats bridges. Neither site is usable with a
-    // plain page fetch: learnnatively.com sends no CORS headers, and
-    // manga-kotoba.com stopped reflecting the Origin (a bare fetch now fails with
-    // "No 'Access-Control-Allow-Origin' header"). GM_xmlhttpRequest bypasses CORS
-    // but only if the user accepted the permission; otherwise it falls back to a
-    // public CORS proxy so the cards still work.
     const CORS_PROXIES = [
         'https://corsproxy.io/?url=',
         'https://api.allorigins.win/raw?url=',
@@ -2426,10 +2595,9 @@
                         ontimeout: () => reject(new Error('GM_xhr: Timeout')),
                     });
                 });
-            } catch (e) { /* fall through to proxies */ }
+            } catch (e) { }
         }
-        // Bounded like the other two paths: without a signal a host that accepts
-        // the connection and never answers leaves the card pending forever.
+
         try {
             const ctrl = new AbortController();
             const timer = setTimeout(() => ctrl.abort(), timeoutMs);
@@ -2437,7 +2605,7 @@
                 const r = await fetch(url, { credentials: 'omit', signal: ctrl.signal });
                 return { status: r.status, text: await r.text() };
             } finally { clearTimeout(timer); }
-        } catch (e) { /* fall through to proxies */ }
+        } catch (e) { }
         for (const proxy of CORS_PROXIES) {
             try {
                 const ctrl = new AbortController();
@@ -2447,12 +2615,20 @@
                     r = await fetch(proxy + encodeURIComponent(url), { signal: ctrl.signal });
                     if (r.ok) return { status: r.status, text: await r.text() };
                 } finally { clearTimeout(timer); }
-            } catch (e) { /* try next proxy */ }
+            } catch (e) { }
         }
         throw new Error('fetch failed: ' + url.slice(0, 80));
     }
     function extractVolumeNumber(title) {
         const t = String(title || '');
+
+        const tail = t.match(/[（(]?\s*([0-9０-９]{1,4})\s*[）)]?\s*[巻話]?\s*$/);
+        if (tail) {
+            const digits = tail[1].replace(/[０-９]/g, c => String.fromCharCode(c.charCodeAt(0) - 0xFEE0));
+            return parseInt(digits, 10);
+        }
+        const kanjiTail = t.match(/([一二三四五六七八九十百]+)\s*[巻話]\s*$/);
+        if (kanjiTail) return kanjiNum(kanjiTail[1]);
         const full = t.match(/([0-9０-９]+)/);
         if (full) {
             const digits = full[1].replace(/[０-９]/g, c => String.fromCharCode(c.charCodeAt(0) - 0xFEE0));
@@ -2511,12 +2687,7 @@
             if (!links) return null;
             const norm = (x) => String(x || '').replace(/[\s　\u30fb・:：()（）]/g, '').toLowerCase();
             const target = norm(usedTitle);
-            // manga-kotoba's /series/ results wrap an entire card in the anchor,
-            // so anchor.textContent is far broader than the series name: scoring
-            // the whole anchor made a spin-off listed before the base series win
-            // merely by *containing* the name (幸色のワンルーム　外伝　正壊の名探偵
-            // beat 幸色のワンルーム). Match the card's own Japanese title, and
-            // break substring ties toward the closest (shortest) title.
+
             const titleOf = (a) => {
                 const h = a.querySelector('.japanese-title, .series-title, h3');
                 if (h) { const x = (h.textContent || '').trim(); if (x) return x; }
@@ -2571,7 +2742,8 @@
             cur = cur
                 .replace(/[\s　]*(文庫版|新装版|完全版|愛蔵版|廉価版|普及版|電子版|特装版|限定版|豪華版|分冊版|合本版|オンデマンド版|デジタル版|単行本版|ノベルズ版|ペーパーバック版)[\s　]*$/u, '')
                 .replace(/[\s　]*[(（]*(文庫|新装|完全|愛蔵|廉価|普及)[)）]*[\s　]*$/u, '')
-                .replace(/[\s　]*第?[一二三四五六七八九十百0-9０-９]*[巻話版編]?[\s　]*$/u, '')
+
+                .replace(/[\s　]*第?[0-9０-９一二三四五六七八九十百]+[巻話版編]?[\s　]*$/u, '')
                 .trim();
             push(cur);
             if (cur === before) break;
@@ -2602,8 +2774,8 @@
             const first = items[0];
             const sid = first.series_id.replace(/-/g, '').slice(0, 10);
             let volUrl = null, volTitle = null, level = null;
-            let matchedNo = null;      // which volume the resolved link actually is
-            let fallbackNearest = null; // nearest available volume when exact not found
+            let matchedNo = null;
+            let fallbackNearest = null;
             try {
                 const shtml = (await gmFetch('https://learnnatively.com/series/' + sid + '/')).text;
                 const sdoc = new DOMParser().parseFromString(shtml, 'text/html');
@@ -2612,7 +2784,7 @@
                     const parent = a.closest('.item, .subitems > div, li, div') || a;
                     const notice = parent.querySelector('.item-type-notice');
                     const numMatch = (notice ? notice.textContent : '') + ' ' + (a.getAttribute('title') || a.textContent);
-                    // Book #N (series page) is authoritative; fall back to title patterns
+
                     const m = numMatch.match(/Book\s*#?\s*(\d+)/i) || numMatch.match(/第?\s*(\d+)\s*巻/) ||
                              numMatch.match(/(\d+)\s*$/) || numMatch.match(/[（(]?([0-9０-９]{1,3})[）)]/);
                     const an = m ? parseInt(m[1].replace(/[０-９]/g, c => String.fromCharCode(c.charCodeAt(0) - 0xFEE0)), 10) : NaN;
@@ -2623,7 +2795,7 @@
                         break;
                     }
                     if (!isNaN(an)) {
-                        // nearest volume at or below the current one, as a fallback
+
                         if (!fallbackNearest || (an > fallbackNearest.an && an <= volumeNum) ||
                             (an <= volumeNum && (fallbackNearest.an > volumeNum || an > fallbackNearest.an))) {
                             fallbackNearest = { an, href: a.getAttribute('href'), title: a.getAttribute('title') || a.textContent.trim() };
@@ -2646,17 +2818,14 @@
             const lvlFromRating = first.rating ? first.rating.lvl : null;
             const tmpFlag = first.rating ? !!(first.rating.temporary || first.rating.always_temporary) : false;
             const bookUrl = volUrl ? 'https://learnnatively.com' + volUrl : ('https://learnnatively.com' + first.url);
-            // enriched from the search API response, no extra fetch needed
+
             const rd = first.review_data || {};
             const badges = [];
             if (first.wanikani) badges.push('WK');
             if (first.book_club) badges.push('BC');
-            // reading/finished counts still come from the book page
+
             const meta = await fetchLnBookMeta(bookUrl);
-            // Label the card with the *resolved* book (volTitle/matchedNo), not
-            // the raw first search hit: the API ranks by popularity, so for
-            // 幸色のワンルーム it returns "幸色のワンルーム 1" even when the
-            // resolved book is volume 3, and the card read "… 1".
+
             return Object.assign({
                 seriesUrl: 'https://learnnatively.com/series/' + sid + '/',
                 bookUrl,
@@ -2702,9 +2871,7 @@
             return out;
         } catch (e) { return null; }
     }
-    // Fire both catalog lookups at once and render each card as soon as its own
-    // lookup resolves, so a slow or missing site only delays its own card. Both
-    // lookups swallow their failures and resolve to null, which renders nothing.
+
     function fetchAndRenderStats(statsEl, seriesTitle, volumeNum) {
         if (!statsEl || !seriesTitle) return;
         lookupMangaKotoba(seriesTitle, volumeNum)
@@ -2715,7 +2882,6 @@
             .catch(e => { if (BWDD_DEBUG) console.warn('[bwdd] LearnNatively lookup error:', safeLogText(e && e.message)); });
     }
 
-    // Card helpers (accessible: real links, labelled pills, dl rows)
     function el(tag, cls, text) {
         const n = document.createElement(tag);
         if (cls) n.className = cls;
@@ -2739,7 +2905,7 @@
         if (!container) return null;
         const old = container.querySelector('.bwdd-card[data-card="' + key + '"]');
         if (old) old.remove();
-        // buildFn may legitimately return null when there is nothing to show.
+
         const card = buildFn();
         if (!card) return null;
         card.dataset.card = key;
@@ -2760,7 +2926,7 @@
         card.appendChild(el('h3', null, kicker));
         return card;
     }
-    // Single lookup: [pill bg, JLPT hint]. Darkened for ≥4.5:1 white-text contrast.
+
     function levelInfo(level) {
         const l = Number(level);
         if (isNaN(l)) return ['#5b21b6', ''];
@@ -2809,10 +2975,9 @@
         const head = el('div', 'bwdd-ln-head');
         if (meta.childElementCount) head.appendChild(meta);
         if (ln.title) {
-            // If the title already carries the volume number ("…」 1", "…（２）",
-            // "…1巻"), don't repeat it as "· Vol. N".
+
             const titleHasVol = ln.volume != null && (() => {
-                // normalize full-width digits so （２） and 2 both match
+
                 const t = String(ln.title).replace(/[０-９]/g, c => String.fromCharCode(c.charCodeAt(0) - 0xFEE0));
                 return new RegExp('(^|[^0-9])' + ln.volume + '([^0-9]|$)').test(t) ||
                        new RegExp('[（(]' + ln.volume + '[）)]').test(t);
@@ -2824,7 +2989,6 @@
         if (head.childElementCount) card.appendChild(head);
         const bits = [];
         if (ln.avgRating != null) {
-            // Label the count: ratings when present, otherwise reviews.
             if (ln.ratings != null) {
                 bits.push(`★ ${Number(ln.avgRating).toFixed(1)} · ${Number(ln.ratings).toLocaleString()} ratings`);
             } else if (ln.reviews != null) {
@@ -2912,10 +3076,7 @@
         });
     }
 
-    // =====================================================================
-    // 8. Mokuro bridge client
-    // =====================================================================
-    const MOKURO_BRIDGE_URL = (() => {
+const MOKURO_BRIDGE_URL = (() => {
         const defaultUrl = 'http://127.0.0.1:62642';
         try {
             const marker = window.__BWDD_CLI__;
@@ -2926,40 +3087,23 @@
                     return parsed.toString().replace(/\/+$/, '');
                 }
             }
-        } catch (_) { /* malformed marker: retain the local default */ }
+        } catch (_) { }
         return defaultUrl;
     })();
     const MOKURO_BRIDGE_START_URL = 'bw-mokuro-bridge://start';
-    // Shown (via the run's catch-all) when the bridge cannot be reached.
     const MOKURO_BRIDGE_OFFLINE_MSG =
         'The Mokuro Bridge app is not running.\n\n' +
         'Get and start mokuro-bridge (github.com/GolyBidoof/mokuro-bridge) — its ' +
         'README shows the start command for your OS (macOS/Linux: ./run.sh from ' +
         'its folder), then click “Save and run through Mokuro” again.';
 
-    // Hysteresis so a single dropped /health probe (or a slow response during
-    // a heavy upload) can't flip the UI to "offline" and hide the bars. The
-    // dot/message only go grey after BRIDGE_FAIL_LIMIT consecutive failures.
     const BRIDGE_FAIL_LIMIT = 3;
     let bridgeConsecFail = 0;
-    // Strictly "did the last probe actually answer". bridgeHealth() below is
-    // deliberately sticky so the OCR button does not flap on one missed poll,
-    // but the pre-flight socket readout must not promise ports that are not
-    // reachable this instant, so it reads this instead.
+
     let bridgeReachableNow = false;
-    // Misses are only forgiven once the bridge has actually answered at least
-    // once. Without this a cold page load with no bridge advertises "online" for
-    // the first BRIDGE_FAIL_LIMIT polls, contradicting the socket readout.
+
     let bridgeEverReachable = false;
-    // One CSP-proof GET against the local bridge, shaped like a fetch Response
-    // so every caller keeps its `r.ok` / `r.status` / `r.json()` / `r.text()`
-    // code unchanged. ebookjapan serves `connect-src 'self' https: wss:` (no
-    // plain http:/ws:), so a page fetch to http://127.0.0.1:62642 is refused
-    // there while the same request is fine on BookWalker/CMOA. GM_xmlhttpRequest
-    // is issued by the userscript manager and is exempt from the page CSP, so it
-    // is tried first whenever the manager grants it, with the page fetch as the
-    // fallback. GM hands back the whole body at once, so this helper covers the
-    // read-only GET endpoints; mokuroBridgePost does the multipart writes.
+
     async function mokuroBridgeGet(url, timeoutMs = 5000) {
         if (typeof GM_xmlhttpRequest === 'function') {
             const gm = await new Promise((resolve, reject) => {
@@ -2982,11 +3126,7 @@
         }
         return await fetchWithTimeout(url, { cache: 'no-store' }, timeoutMs);
     }
-    // POST twin of mokuroBridgeGet for the multipart write endpoints
-    // (session/start, session/<id>/page, session/<id>/cover, finalize): same
-    // contract, GM_xmlhttpRequest first for the same CSP reason, fetchWithTimeout
-    // otherwise. The FormData goes over as `data` with no Content-Type set by
-    // hand, so Tampermonkey encodes the multipart body and boundary itself.
+
     async function mokuroBridgePost(url, timeoutMs, formData) {
         if (typeof GM_xmlhttpRequest === 'function') {
             const gm = await new Promise((resolve, reject) => {
@@ -3008,6 +3148,29 @@
         }
         return await fetchWithTimeout(url, { method: 'POST', body: formData }, timeoutMs);
     }
+
+    function bridgeHttpError(status, detail, action) {
+        const text = typeof detail === 'string' ? detail.trim() : '';
+        const err = new Error('Mokuro bridge ' + action + ' failed (HTTP ' + status + ')' +
+            (text ? ': ' + text : ''));
+        err.status = status;
+        err.detail = text;
+        return err;
+    }
+    async function bridgeErrorDetail(res) {
+        const text = await res.text().catch(() => '');
+        try {
+            const detail = (JSON.parse(text) || {}).detail;
+            if (typeof detail === 'string') return detail;
+            if (Array.isArray(detail)) {
+                return detail.map(d => (d && (d.msg || d.message)) || '').filter(Boolean).join('; ');
+            }
+        } catch (e) { }
+        return String(text || '').trim().slice(0, 300);
+    }
+    async function bridgeError(res, action) {
+        return bridgeHttpError(res.status, await bridgeErrorDetail(res), action);
+    }
     async function bridgeHealth() {
         try {
             const r = await mokuroBridgeGet(MOKURO_BRIDGE_URL + '/health', 2000);
@@ -3022,7 +3185,6 @@
             return bridgeEverReachable && bridgeConsecFail < BRIDGE_FAIL_LIMIT;
         }
     }
-    // Cached /health payload (upload backends, output dir, version…).
     let bridgeInfo = null;
     async function refreshBridgeInfo() {
         try {
@@ -3031,10 +3193,7 @@
         } catch (e) {}
         return null;
     }
-    // --- Generic upload-method support (mokuro-bridge >= 0.3) ---
-    // The bridge exposes GET /upload-methods listing every method plus the
-    // default; we pick the first configured one (or 'local') and remember its
-    // folder. Falls back to /health mega_configured on older bridges.
+
     let uploadMethods = null;
     async function fetchUploadMethods() {
         try {
@@ -3043,12 +3202,7 @@
         } catch (e) {}
         return null;
     }
-    // Resolve which upload method + destination folder to use:
-    // { method, folder, label }. The bridge's sticky default is reported only
-    // when it is actually usable: "local" is always configured, so picking the
-    // first *configured* method would always say "saving locally", while an
-    // unconfigured default (e.g. drive not set up) must not be advertised as
-    // the destination.
+
     async function mokuroUploadPlan() {
         const methods = uploadMethods || await fetchUploadMethods();
         if (methods && Array.isArray(methods.methods)) {
@@ -3064,12 +3218,11 @@
                 list[0];
             if (picked) return { method: picked.id, folder: picked.current_folder || null, label: picked.name || picked.id };
         }
-        // older bridge: only /health
+
         const info = bridgeInfo || await refreshBridgeInfo();
         if (info && info.mega_configured) return { method: 'mega', folder: info.mega_library_root || null, label: 'MEGA' };
         return { method: 'local', folder: info && info.output_dir || null, label: 'Local' };
     }
-    // Final decision for a run: the panel's pick wins, else the bridge default.
     async function resolveUploadChoice(ui) {
         const plan = await mokuroUploadPlan().catch(() => ({ method: null, folder: null, label: null }));
         let method = plan.method, folder = plan.folder;
@@ -3083,10 +3236,7 @@
 
     async function ensureBridgeRunning(timeoutMs = 15000) {
         if (await bridgeHealth()) return true;
-        // The extension adapter owns bridge discovery and startup. Never click
-        // the custom protocol from an automation page: that creates a browser
-        // permission prompt and turns a local bridge outage into a surprising
-        // UI side effect. The caller receives the same clear offline error.
+
         let bridgeManaged = false;
         try { bridgeManaged = !!(window.__BWDD_CLI__ && window.__BWDD_CLI__.bridgeManaged); } catch (e) {}
         if (!bridgeManaged) {
@@ -3101,14 +3251,12 @@
         }
         const start = Date.now();
         while (Date.now() - start < timeoutMs) {
-            await new Promise(r => setTimeout(r, 600));
+            await backgroundDelay(600);
             if (await bridgeHealth()) return true;
         }
         return false;
     }
-    // Wait for the bridge to report idle (busy=false, which also covers
-    // ocr_queue_depth > 0) before starting a capture, so a new run cannot
-    // interleave with OCR/upload work already in flight.
+
     async function waitForBridgeIdle(timeoutMs = 30000) {
         const start = Date.now();
         while (Date.now() - start < timeoutMs) {
@@ -3119,9 +3267,9 @@
                     if (!h.busy) return true;
                 }
             } catch (e) {}
-            await new Promise(res => setTimeout(res, 1000));
+            await backgroundDelay(1000);
         }
-        return false;   // still busy after the timeout, caller decides
+        return false;
     }
 
     function bridgeSessionPath(sessionId, suffix) {
@@ -3133,32 +3281,45 @@
         const fd = new FormData();
         fd.append('title', title || 'manga');
         const res = await mokuroBridgePost(MOKURO_BRIDGE_URL + '/session/start', 15000, fd);
-        const d = await res.json().catch(() => ({}));
-        if (!res.ok) throw new Error(d.detail || 'HTTP ' + res.status);
-        return d;
+        if (!res.ok) throw await bridgeError(res, 'session start');
+        return await res.json().catch(() => ({}));
     }
+
+    const PAGE_PUSH_RETRIES = 4;
     async function mokuroStreamPage(sessionId, blob, filename, pageNum) {
         const fd = new FormData();
         fd.append('page', blob, filename);
         fd.append('filename', filename);
         fd.append('page_num', String(pageNum));
-        const res = await mokuroBridgePost(bridgeSessionPath(sessionId, '/page'), 60000, fd);
-        const d = await res.json().catch(() => ({}));
-        if (!res.ok) throw new Error(d.detail || 'HTTP ' + res.status);
-        return d;
+        const url = bridgeSessionPath(sessionId, '/page');
+        for (let attempt = 0; ; attempt++) {
+            const res = await mokuroBridgePost(url, 60000, fd);
+            if (res.ok) {
+                const d = await res.json().catch(() => ({}));
+                if (d && d.already_present) d.cached = true;
+                return d;
+            }
+            const detail = await bridgeErrorDetail(res);
+            if (res.status === 409 && /already has completed OCR|already queued or present/i.test(detail)) {
+                return { ok: true, cached: true, already_present: true, detail: detail };
+            }
+            if (res.status === 409 && /currently being (OCR'd|ingested)/i.test(detail) &&
+                attempt < PAGE_PUSH_RETRIES) {
+                await backgroundDelay(250 * (attempt + 1));
+                continue;
+            }
+            throw bridgeHttpError(res.status, detail, 'page ' + pageNum + ' upload');
+        }
     }
-    // Early cover upload: push the first page to the destination as
-    // <title>.webp immediately, before OCR finishes, so the user sees upload
-    // activity at once. {method, localDir} must match the run's destination.
+
     async function mokuroUploadCover(sessionId, blob, opts = {}) {
         const fd = new FormData();
         fd.append('cover', blob, 'cover.jpg');
         if (opts.method) fd.append('upload_method', opts.method);
         if (opts.method === 'local' && opts.localDir) fd.append('local_dir', opts.localDir);
         const res = await mokuroBridgePost(bridgeSessionPath(sessionId, '/cover'), 120000, fd);
-        const d = await res.json().catch(() => ({}));
-        if (!res.ok) throw new Error((d && d.detail) || 'HTTP ' + res.status);
-        return d;
+        if (!res.ok) throw await bridgeError(res, 'cover upload');
+        return await res.json().catch(() => ({}));
     }
     async function mokuroStatus(sessionId) {
         try {
@@ -3167,13 +3328,9 @@
             return await res.json();
         } catch (e) { return null; }
     }
-    // Frames of the bridge's finalize NDJSON, shared so the live streaming
-    // reader and the buffered GM fallback emit exactly the same callbacks for
-    // exactly the same frames.
+
     function makeNdjsonSink(onStage, onUpload) {
-        // Collect per-file storage URLs the bridge reports (upload_file's third
-        // value, and/or done.uploads[]). Deduped, exposed as
-        //   uploadUrls: [{file, url}]   storedUrl: first http(s).
+
         const uploadUrls = [];
         let storedUrl = null;
         let finalResult = null;
@@ -3188,9 +3345,7 @@
                 seen.add(key);
                 if (uploadUrls.some(e => e.file === f && e.url === u)) return;
                 uploadUrls.push({ file: f, url: u });
-                // Prefer the .cbz (the volume archive itself) for the "Open
-                // stored file" action; the cover .webp uploads first, so
-                // without this preference the button would point at an image.
+
                 if (/^https?:\/\//i.test(u)) {
                     if (!storedUrl || /\.cbz$/i.test(f)) storedUrl = u;
                 }
@@ -3228,36 +3383,36 @@
                 }
             }
             if (msg.stage === 'done') finalResult = msg;
-            if (msg.stage === 'error') throw new Error(msg.message || 'Mokuro bridge pipeline error');
+            if (msg.stage === 'error') {
+
+                const err = new Error(msg.message || 'Mokuro bridge pipeline error');
+                err.status = msg.status || 'bridge_error';
+                throw err;
+            }
         }
         return {
             processLine,
-            // Terminal bookkeeping every caller has always relied on.
             finish() {
-                if (!finalResult) throw new Error('Mokuro bridge closed stream without completing.');
+
+                if (!finalResult) throw new Error('Mokuro bridge ended the finalize stream without a terminal done frame.');
+
+                if (finalResult.status === 'partial_upload') finalResult.partialUpload = true;
                 if (uploadUrls.length) finalResult.uploadUrls = uploadUrls;
                 if (storedUrl) finalResult.storedUrl = storedUrl;
                 return finalResult;
             },
         };
     }
-    // Reads the bridge's finalize NDJSON stream (page fetch; has res.body).
-    //   onStage(stage, msg)  , every frame
-    //   onUpload(ev), live upload progress {file, percent, speed, currentBytes,
-    //     totalBytes, method, remotePath}. The bridge streams one file at a time
-    //     with that file's own bytes, so the caller must accumulate across
-    //     files: use makeUploadBarUpdater() below.
+
     async function readNdjsonStream(res, onStage, onUpload) {
         if (!res.body) throw new Error('No streaming response body from bridge');
         const reader = res.body.getReader();
         const decoder = new TextDecoder();
         const sink = makeNdjsonSink(onStage, onUpload);
         let buffer = '';
-        // Force-flush a partially-buffered line if nothing arrives for a while:
-        // a slow upload's trailing NDJSON line (no newline yet) would otherwise
-        // sit in `buffer`, making the bar look stuck.
+
         let lastLineAt = Date.now();
-        const flushTimer = setInterval(() => {
+        const flushTimer = setBackgroundInterval(() => {
             if (!buffer.trim() || Date.now() - lastLineAt < 4000) return;
             const lines = buffer.split('\n');
             buffer = lines.pop() || '';
@@ -3274,44 +3429,33 @@
                 buffer = lines.pop() || '';
                 for (const line of lines) { sink.processLine(line); }
             }
-            // The tail goes through the same sink as every split line, so a
-            // trailing frame without its newline still reaches onUpload.
+
             if (buffer.trim()) { sink.processLine(buffer); }
             return sink.finish();
         } finally {
-            // An error frame or a reader failure must not leave the flush
-            // interval (or the stream reader) alive in a Puppeteer page.
-            clearInterval(flushTimer);
+
+            clearBackgroundInterval(flushTimer);
             try { if (reader.cancel) await reader.cancel(); } catch (e) {}
         }
     }
-    // Buffered twin of readNdjsonStream for the GM path, where the whole
-    // responseText arrives at once: every line goes through the same sink, so
-    // onStage/onUpload see the same frames, just in one burst.
+
     function readNdjsonText(text, onStage, onUpload) {
         const sink = makeNdjsonSink(onStage, onUpload);
         const lines = String(text == null ? '' : text).split('\n');
         for (const line of lines) { sink.processLine(line); }
         return sink.finish();
     }
-    // Multi-file upload progress for the Store/Upload bar. Tracks a list of
-    // files in upload order (seeded up front from the bridge's "upload" frame
-    // `files:` list, then fed live per-file progress). The label reads
-    //   "1/3 · 62% · 65.0 MB / 104.8 MB · 5.1 MiB/s"
-    // i.e. file k of N · overall % · bytes · speed, no file name clutter. The
-    // fill is the byte-weighted overall %, monotonic because every file's total
-    // is known before it uploads; the k/N and size totals are kept after
-    // completion rather than blanking the bar.
+
     function makeUploadBarUpdater(bar) {
-        const order = [];              // file names in first-seen (upload) order
-        const byName = new Map();      // name -> {cur, tot}
+        const order = [];
+        const byName = new Map();
         const rec = (name) => {
             let r = byName.get(name);
             if (!r) { r = { cur: 0, tot: 0 }; byName.set(name, r); order.push(name); }
             return r;
         };
-        let seeded = false;            // full plan announced by the bridge
-        let done = 0;                  // files fully uploaded (tot>0 && cur>=tot)
+        let seeded = false;
+        let done = 0;
         const feed = function onUploadFrame(ev) {
             if (!bar) return;
             bar.wrap.style.display = 'flex';
@@ -3334,8 +3478,7 @@
             else overall = 0;
             let parts = [];
             if (seeded && order.length > 0) {
-                // Always show k/N against the full plan: k = files fully done,
-                // never a premature "1/3" just because one file was announced.
+
                 parts.push(Math.min(done, order.length) + '/' + order.length);
             }
             parts.push(overall.toFixed(0) + '%');
@@ -3344,9 +3487,7 @@
             if (ev.speed && overall < 100) parts.push(ev.speed);
             setBar(bar, overall, parts.join(' · '));
         };
-        // Pre-register the whole upload plan from the initial "upload" frame
-        // ({file, total_bytes}[]): a full denominator up front keeps the overall
-        // % honest and makes k/N always count against N.
+
         feed.seed = function seed(list) {
             if (!Array.isArray(list)) return;
             for (const it of list) {
@@ -3357,10 +3498,8 @@
             }
             if (list.length) seeded = true;
         };
-        // True once any file has been registered (used to avoid clobbering
-        // early-cover progress when the finalize phase reuses this feed).
+
         feed.hasAny = function hasAny() { return order.length > 0; };
-        // Summary accessors: keep the final k/N and total size readable.
         feed.summary = function summary() {
             let sumCur = 0, sumTot = 0, d = 0;
             for (const n of order) {
@@ -3372,13 +3511,7 @@
         };
         return feed;
     }
-    // Ask the bridge to finalize + store a volume.
-    //   opts.method   , upload_method id ('local' | 'mega' | 'drive' | 'onedrive' | 'webdav');
-    //                   null/omitted → let the bridge decide (env default).
-    //   opts.localDir , when method is 'local', write output to this folder.
-    //   opts.forceMega, legacy fallback: when the bridge rejects upload_method,
-    //                   retry once with upload_to_mega=true (old bridges).
-    // Protocol: github.com/GolyBidoof/mokuro-bridge.
+
     async function mokuroFinalize(sessionId, opts = {}, onStage, onUpload) {
         const method = opts.method || null;
         const fd = new FormData();
@@ -3389,155 +3522,36 @@
             fd.append('upload_to_mega', 'true');
         }
         fd.append('delete_after_upload', 'true');
+
+        const overwrite = typeof opts.overwrite === 'string' ? opts.overwrite.trim() : '';
+        if (/^(fail|skip|overwrite)$/.test(overwrite)) fd.append('overwrite', overwrite);
         const url = bridgeSessionPath(sessionId, '/finalize');
-        let res = await mokuroBridgePost(url, 3600000, fd);
-        // Legacy fallback: if the new bridge rejects an unknown upload_method
-        // (error frame), retry once with the old upload_to_mega flag.
-        if (method && !res.ok) {
-            const fd2 = new FormData();
-            fd2.append('upload_to_mega', method === 'local' ? 'false' : 'true');
-            fd2.append('delete_after_upload', 'true');
-            res = await mokuroBridgePost(url, 3600000, fd2);
-        }
-        // The page fetch has a real ReadableStream body, so BookWalker/CMOA keep
-        // the live streaming reader; the GM response has none, so its whole NDJSON
-        // body is parsed in one pass through the same sink.
+        const res = await mokuroBridgePost(url, 3600000, fd);
+
+        if (!res.ok) throw await bridgeError(res, 'finalize');
+
         if (res.body && typeof res.body.getReader === 'function') {
             return readNdjsonStream(res, onStage, onUpload);
         }
         return readNdjsonText(await res.text(), onStage, onUpload);
     }
-    // Where the post-OCR "Open Reader Mokuro" button points: the reader URL the
-    // bridge reported when its done frame carries one, otherwise the reader home.
     function readerJumpUrl(result) {
         const u = result && result.reader_url;
         if (typeof u === 'string' && /^https?:\/\//i.test(u.trim())) return u.trim();
         return 'https://reader.mokuro.app/';
     }
 
-    // =====================================================================
-    // 9. Cross-store availability ("also available on ...")
-    // =====================================================================
-    // Asks each store's own search page whether it carries the book and links
-    // to that store's product page - never to a viewer. The stores are external
-    // facts rather than adapter concerns, so they live here as a catalog; the
-    // module is in the combined target ("Omnimanga Native Downloader") only, so
-    // the single-store scripts carry none of these hosts either.
-    //
-    // Matching is necessarily fuzzy (BookWalker appends the imprint in brackets,
-    // ebookjapan wraps the whole card in one anchor), so it is scored in tiers
-    // (exact > prefix > contains) and reported honestly: a confirmed match links
-    // to the product page, anything else to the store's search.
-    const AVAILABILITY_STORES = [
-        {
-            id: 'bookwalker', siteId: 'bookwalker', label: 'BookWalker', short: 'B',
-            color: '#0f7dc4', origin: 'https://bookwalker.jp', hosts: ['bookwalker.jp'],
-            search: (q) => 'https://bookwalker.jp/search/?word=' + encodeURIComponent(q),
-            // /series/<id>/ lists every volume, so prefer it over a /de<uuid> page.
-            product: (p) => /^\/series\/\d+\//.test(p) || /^\/de[0-9a-f-]{6,}\/?$/i.test(p),
-            rank: (p) => (/^\/series\//.test(p) ? 0.5 : 0),
-            // One card per edition, each with its own price; a 0-yen card is
-            // the free 無料お試し版 and also says 無料で読む. Volumes 8 and 6 each
-            // exist as 通常版 and 特装版, so a volume can have several rows.
-            volumes: (doc) => {
-                const out = [];
-                for (const a of doc.querySelectorAll('a.m-book-item__title')) {
-                    const title = (a.getAttribute('title') || a.textContent || '').trim();
-                    let url = '';
-                    try { url = new URL(a.getAttribute('href') || '', 'https://bookwalker.jp/').href; } catch (e) { continue; }
-                    let num = null, free = false, row = a;
-                    for (let i = 0; i < 6 && row; i++, row = row.parentElement) {
-                        const el = row.querySelector('.m-book-item__price-num');
-                        if (!el) continue;
-                        const n = parseInt(String(el.textContent).replace(/[^0-9]/g, ''), 10);
-                        num = isFinite(n) ? n : null;
-                        free = /無料で読む/.test(row.textContent || '') || num === 0;
-                        break;
-                    }
-                    out.push({ title: title, url: url, vol: extractVolumeNumber(title), price: num, free: free, until: '' });
-                }
-                return out;
-            },
-        },
-        {
-            id: 'cmoa', siteId: 'cmoa', label: 'CMOA', short: 'C',
-            color: '#e2574c', origin: 'https://www.cmoa.jp', hosts: ['cmoa.jp'],
-            search: (q) => 'https://www.cmoa.jp/search/result/?search_word=' + encodeURIComponent(q),
-            product: (p) => /^\/title\/\d+\/?/.test(p),
-            rank: () => 0,
-            // A free volume keeps its regular 720pt/792円(税込) price on the same
-            // row, so "free" must be read from the 無料で読む block, never from the
-            // price. The expiry ("9/27まで") rides along in the same block.
-            volumes: (doc) => {
-                const out = [];
-                for (const row of doc.querySelectorAll('.title_vol_vox_vols_i')) {
-                    const a = row.querySelector('h3.title_details_title_name_h2 a') || row.querySelector('a[href*="/title/"]');
-                    const img = row.querySelector('img[alt]');
-                    const title = ((a && a.textContent) || (img && img.getAttribute('alt')) || '').trim();
-                    let url = '';
-                    if (a) { try { url = new URL(a.getAttribute('href') || '', 'https://www.cmoa.jp/').href; } catch (e) {} }
-                    // GA_free alone is NOT a free marker: every volume row also
-                    // carries an empty <div class="title_vol_each_free_btn GA_free">
-                    // placeholder, so matching the class marks the whole series free.
-                    // A free volume is one whose free button says something, or
-                    // whose row shows a 0 price.
-                    let freeEl = null;
-                    for (const el of row.querySelectorAll('.GA_free')) {
-                        if ((el.textContent || '').trim()) { freeEl = el; break; }
-                    }
-                    const markEl = row.querySelector('.mark .em');
-                    const zeroMarked = !!markEl && (markEl.textContent || '').replace(/[^0-9]/g, '') === '0';
-                    let until = '';
-                    if (freeEl) {
-                        for (const sp of freeEl.querySelectorAll('span')) {
-                            const t = (sp.textContent || '').trim();
-                            if (/まで/.test(t)) until = t;
-                        }
-                    }
-                    let price = null;
-                    const point = row.querySelector('.price .point');
-                    if (point) {
-                        const m = /([0-9][0-9,]*)円/.exec(point.textContent || '');
-                        if (m) price = parseInt(m[1].replace(/,/g, ''), 10);
-                    }
-                    let vol = NaN;
-                    const vm = /\/vol\/([0-9]+)\//.exec(url);
-                    if (vm) vol = parseInt(vm[1], 10);
-                    if (!isFinite(vol) || !vol) vol = extractVolumeNumber(title);
-                    out.push({ title: title, url: url, vol: vol, price: price, free: !!(freeEl || zeroMarked), until: until });
-                }
-                return out;
-            },
-        },
-        {
-            id: 'ebookjapan', siteId: 'ebookjapan', label: 'ebookjapan', short: 'e',
-            color: '#e8820c', origin: 'https://ebookjapan.yahoo.co.jp', hosts: ['ebookjapan.yahoo.co.jp'],
-            search: (q) => 'https://ebookjapan.yahoo.co.jp/search/?keyword=' + encodeURIComponent(q),
-            product: (p) => /^\/books\/\d+\/?/.test(p),
-            rank: () => 0,
-            // ebookjapan is a Vue app: its series and search pages carry no
-            // server-rendered prices or per-volume rows at all, so the only
-            // price/free fact available is the campaign badge on the search
-            // card ("2冊無料"). Everything else stays blank rather than guessed.
-            freeBadge: (html) => {
-                const all = [];
-                const re = /([0-9]+)\s*冊無料/g;
-                let m;
-                while ((m = re.exec(String(html || '')))) all.push(parseInt(m[1], 10));
-                return all.length ? Math.max.apply(null, all) : 0;
-            },
-        },
-    ];
-    // One lookup per title per page: the panel re-renders, the answers do not.
+    const AVAILABILITY_STORES = [];
+    function registerAvailabilityStore(store) {
+        if (!store || !store.id) throw new Error('availability store needs an id');
+        AVAILABILITY_STORES.push(store);
+    }
+
     const availabilityMemory = new Map();
-    // One shared in-flight promise per key: the boot poll often asks again while
-    // the first round-trip is still running, and the same three stores must not
-    // be queried twice.
+
     const availabilityInflight = new Map();
     const AVAILABILITY_CACHE_MAX = 50;
 
-    // A viewer's document title often carries the shop's own branding
-    // ("... | BOOK☆WALKER"); searching for that finds nothing.
     function cleanStoreSeed(t) {
         let s = String(t || '');
         s = s.replace(/[\s|｜\-\u2013\u2014]*(?:BOOK\s*[☆★]?\s*WALKER|ブックウォーカー|ebookjapan|イーブックジャパン|コミックシーモア|CMOA|シーモア)\s*$/i, '');
@@ -3547,9 +3561,18 @@
 
     function availabilityNorm(s) {
         return String(s || '')
+
+            .replace(/[\uff01-\uff5e]/g, c => String.fromCharCode(c.charCodeAt(0) - 0xfee0))
             .replace(/[\s\u3000]+/g, '')
             .replace(/[（）()【】\[\]「」『』]/g, '')
             .toLowerCase();
+    }
+
+    function titleFollows(rowTitle, base) {
+        const t = availabilityNorm(rowTitle);
+        if (!base || !t.startsWith(base)) return false;
+        const rest = t.slice(base.length);
+        return rest === '' || /^[0-9巻]/.test(rest);
     }
 
     function availabilityScore(anchorText, candidates, bonus) {
@@ -3561,9 +3584,7 @@
             if (n.length < 3) continue;
             if (t === n) tier = Math.max(tier, 3);
             else if (t.startsWith(n)) tier = Math.max(tier, 2);
-            // A bare "contains" is the only signal ebookjapan offers, so it
-            // counts - but only for a title long enough that a stray mention of
-            // it in another book's card is unlikely.
+
             else if (n.length >= 4 && t.includes(n)) tier = Math.max(tier, 1);
         }
         if (!tier) return null;
@@ -3589,84 +3610,165 @@
                 url = u.origin + u.pathname;
             } catch (e) { continue; }
             const text = (a.textContent || '').replace(/\s+/g, ' ').trim();
-            const s = availabilityScore(text, candidates, store.rank(new URL(url).pathname));
+
+            const titleEl = a.querySelector('.title-content__title, .m-book-item__title, h2, h3, h4');
+            const titleText = titleEl
+                ? ((titleEl.getAttribute('title') || titleEl.textContent || '').replace(/\s+/g, ' ').trim())
+                : '';
+            const s = availabilityScore(titleText || text, candidates, store.rank(new URL(url).pathname));
             if (!s) continue;
             if (!best || s.score > best.score || (s.score === best.score && s.len < best.len)) {
-                best = { score: s.score, len: s.len, url: url, text: text, card: a.outerHTML || '' };
+
+                const cardEl = a.closest('[data-component-type="s-search-result"][data-asin]') || a;
+                best = { score: s.score, len: s.len, url: url, text: text, card: cardEl.outerHTML || '' };
             }
         }
         return best;
     }
 
-    // Price and free-volume detail for the book the user is actually reading,
-    // read from the store page we just linked to. Stores that have no such page
-    // (ebookjapan) contribute only their search-page badge.
     function blankDetail() {
-        return { freeCount: 0, volTotal: 0, freeMine: false, price: null, until: '', volFound: false, rows: 0 };
+        return { freeCount: 0, volTotal: 0, freeMine: false, price: null, priceUnit: '', until: '',
+            ku: false, kuCount: 0, kuSeen: 0, volFound: false, rows: 0, matchUrl: '' };
     }
 
-    async function storeDetail(store, url, cardHtml, volNum, bookTitle) {
+    async function storeDetail(store, url, cardHtml, searchHtml, volNum, bookTitle, matchText) {
         const d = blankDetail();
-        // Scoped to the matched result card, never the whole results page: a
-        // "N冊無料" badge belongs to one title's card, and the other cards on the
-        // page carry their own badges, often larger ones.
+
         if (typeof store.freeBadge === 'function' && cardHtml) {
             try { d.freeCount = store.freeBadge(cardHtml) || 0; } catch (e) {}
         }
-        if (typeof store.volumes !== 'function' || !url) return d;
-        let page = null;
-        try { page = await gmFetch(url, 15000); } catch (e) { return d; }
-        if (!page || page.status !== 200 || !page.text) return d;
-        let doc = null;
-        try { doc = new DOMParser().parseFromString(page.text, 'text/html'); } catch (e) { return d; }
-        if (!doc) return d;
-        let items = [];
-        try { items = store.volumes(doc) || []; } catch (e) { return d; }
-        d.rows = items.length;
-        if (!items.length) return d;
+        if (typeof store.volumes !== 'function') return d;
 
-        // How many distinct volumes can be read free. A volume with no readable
-        // number still counts as one, so a free row is never silently dropped.
-        const freeKeys = new Set();
-        for (const it of items) {
-            if (it.free) freeKeys.add(isFinite(it.vol) && it.vol ? 'v' + it.vol : 't' + it.title);
+        const parse = (html) => {
+            try { return new DOMParser().parseFromString(html, 'text/html'); } catch (e) { return null; }
+        };
+
+        const readPage = async (pageUrl) => {
+            for (let attempt = 0; attempt < 2; attempt++) {
+                let page = null;
+                try { page = await gmFetch(pageUrl, 15000); } catch (e) { page = null; }
+                if (page && page.status === 200 && page.text) {
+                    const doc = parse(page.text);
+                    if (doc) return { url: pageUrl, html: page.text, doc: doc };
+                }
+            }
+            return null;
+        };
+        const rowsOf = (page) => {
+            try { return store.volumes(page.doc, page.html) || []; } catch (e) { return []; }
+        };
+
+        let first = null;
+        if (store.fromSearch && searchHtml) first = { url: url, html: searchHtml, doc: parse(searchHtml) };
+        else if (url) first = await readPage(url);
+        if (!first) return d;
+
+        let items = rowsOf(first);
+
+        if (typeof store.listPages === 'function') {
+            let more = [];
+            try { more = store.listPages(first.doc, first.html, first.url) || []; } catch (e) { more = []; }
+            const followed = Object.create(null);
+            followed[first.url] = true;
+            for (const pageUrl of more.slice(0, 8)) {
+                if (!pageUrl || followed[pageUrl]) continue;
+                followed[pageUrl] = true;
+                const page = await readPage(pageUrl);
+                if (page) items = items.concat(rowsOf(page));
+            }
         }
-        d.freeCount = Math.max(d.freeCount, freeKeys.size);
-        const vols = new Set();
-        for (const it of items) { if (isFinite(it.vol) && it.vol) vols.add(it.vol); }
-        d.volTotal = vols.size;
+        d.rows = items.length;
+        if (!items.length) {
 
-        // Match the row this book actually is. A numbered volume matches on its
-        // number; a book with no number (a one-shot, or an unnumbered first
-        // volume) can only be matched on its exact title.
+            if (typeof store.pagePrice === 'function') {
+                try {
+                    const p = store.pagePrice(first.doc, first.html);
+                    if (isFinite(p) && p > 0) d.price = p;
+                } catch (e) {}
+            }
+            return d;
+        }
+
         const want = Number(volNum);
         const wantTitle = availabilityNorm(bookTitle || '');
+
+        let wantSeries = null;
+        if (typeof store.seriesOf === 'function' && cardHtml) {
+            try { wantSeries = store.seriesOf(cardHtml); } catch (e) { wantSeries = null; }
+        }
+
+        if (!(wantSeries > 0) && matchText) {
+            const base = availabilityNorm(matchText);
+            const from = items.filter(it => isFinite(it.vol) && it.vol === want &&
+                isFinite(it.series) && titleFollows(it.title, base));
+            if (from.length) wantSeries = from[0].series;
+        }
+        const sameSeries = (it) => !(wantSeries > 0) || !isFinite(it.series) || it.series === wantSeries;
         let mine = [];
-        if (isFinite(want) && want > 0) mine = items.filter(it => isFinite(it.vol) && it.vol === want);
-        if (!mine.length && wantTitle) mine = items.filter(it => availabilityNorm(it.title) === wantTitle);
+        if (isFinite(want) && want > 0) mine = items.filter(it => isFinite(it.vol) && it.vol === want && sameSeries(it));
+        if (!mine.length && wantTitle) mine = items.filter(it => availabilityNorm(it.title) === wantTitle && sameSeries(it));
+
+        if (store.noSeriesCounts !== true) {
+
+            const rowsFor = wantSeries > 0 ? items.filter(sameSeries) : (store.fromSearch ? [] : items);
+
+            const freeKeys = new Set();
+            for (const it of rowsFor) {
+                if (it.free) freeKeys.add(isFinite(it.vol) && it.vol ? 'v' + it.vol : 't' + it.title);
+            }
+            d.freeCount = Math.max(d.freeCount, freeKeys.size);
+            const vols = new Set();
+            const kuVols = new Set();
+            for (const it of rowsFor) {
+                if (!isFinite(it.vol) || !it.vol) continue;
+                vols.add(it.vol);
+                if (it.ku) kuVols.add(it.vol);
+            }
+
+            d.volTotal = wantSeries > 0 ? wantSeries : vols.size;
+            d.kuCount = kuVols.size;
+            d.kuSeen = vols.size;
+        }
+
         if (!mine.length) return d;
         d.volFound = true;
+
+        if (store.fromSearch && mine[0].url) d.matchUrl = mine[0].url;
+
+        if (mine[0].page && mine[0].url) {
+            const own = await readPage(mine[0].url);
+            if (own) {
+                const rows = rowsOf(own);
+                if (rows.length) mine = [rows[0]];
+            }
+        }
+
+        d.ku = mine.some(it => it.ku === true);
+
         const freeOne = mine.find(it => it.free);
         if (freeOne) {
             d.freeMine = true;
             d.until = freeOne.until || '';
             return d;
         }
-        const prices = mine.map(it => it.price).filter(p => isFinite(p) && p > 0);
-        if (prices.length) d.price = Math.min.apply(null, prices);
+
+        const priced = mine.filter(it => isFinite(it.price) && it.price > 0);
+        if (priced.length) {
+            let best = priced[0];
+            for (const it of priced) if (it.price < best.price) best = it;
+            d.price = best.price;
+            d.priceUnit = best.unit || '';
+        }
         return d;
     }
 
-    // Walk the title candidates until one search page yields a match, so a
-    // decorated title ("... 1巻 (ビッグガンガンコミックス)") still lands.
     async function checkStoreAvailability(store, candidates, volNum, bookTitle) {
         for (const cand of candidates) {
             if (!cand) continue;
             let res = null;
             try { res = await gmFetch(store.search(cand), 15000); }
             catch (e) {
-                // Every transport failed; do not hammer. Say so, because an
-                // unreachable shop and an absent book look identical otherwise.
+
                 if (BWDD_DEBUG) { try { console.info('[bwdd] availability: ' + store.id + ' fetch failed: ' + ((e && e.message) || e)); } catch (_) {} }
                 return null;
             }
@@ -3676,38 +3778,43 @@
             }
             const hit = bestStoreMatch(res.text, store, candidates);
             if (hit) {
-                const detail = await storeDetail(store, hit.url, hit.card, volNum, bookTitle);
+                const detail = await storeDetail(store, hit.url, hit.card, res.text, volNum, bookTitle, hit.text);
+                if (detail.matchUrl) hit.url = detail.matchUrl;
                 return Object.assign({}, hit, detail);
             }
         }
         return null;
     }
 
-    // CMOA's speed-reader URL carries the store page it was opened from as
-    // rurl, which is an exact answer for free - no search, no guessing.
-    function exactStorePageUrl(store) {
-        if (store.id !== 'cmoa') return null;
-        try {
-            const rurl = new URLSearchParams(location.search).get('rurl');
-            if (!rurl) return null;
-            const u = new URL(rurl);
-            if (!hostMatches(u.hostname, store.hosts)) return null;
-            if (!store.product(u.pathname)) return null;
-            return u.origin + u.pathname;
-        } catch (e) { return null; }
+    function freeVolumeText(n, total) {
+        if (isFinite(total) && total > 1) return n + '/' + total + ' free';
+        return n + (n === 1 ? ' vol free' : ' vols free');
     }
 
-    // "free" when this volume is free; otherwise the price for this volume,
-    // alongside how many volumes in the series are free.
+    function seriesCountAddsNothing(r) {
+        return r.freeMine && r.freeCount <= 1 && !(r.volTotal > 1);
+    }
+
+    function priceLabel(amount, unit) {
+        return unit ? amount.toLocaleString('en-US') + unit : '\u00a5' + amount.toLocaleString('en-US');
+    }
+
     function storeMetaText(r) {
         const bits = [];
         if (r.freeMine) bits.push('free');
-        else if (isFinite(r.price) && r.price > 0) bits.push('\u00a5' + r.price.toLocaleString('en-US'));
-        // The series count is a separate fact from this volume's own state, so it
-        // is reported either way; it is only dropped when it would just repeat
-        // "free" for a single free volume.
-        if (r.freeCount > 0 && !(r.freeMine && r.freeCount <= 1)) {
-            bits.push(r.freeCount + (r.freeCount === 1 ? ' vol free' : ' vols free'));
+        else if (isFinite(r.price) && r.price > 0) bits.push(priceLabel(r.price, r.priceUnit));
+
+        if (r.ku && !r.freeMine) bits.unshift('KU');
+
+        if (r.ku && r.volTotal > 1) {
+            if (r.kuSeen >= r.volTotal) bits.push(r.kuCount + '/' + r.volTotal + ' on KU');
+            else bits.push(r.volTotal + ' vols');
+        }
+
+        if (!r.ku && r.volTotal > 1 && !(r.freeCount > 0)) bits.push(r.volTotal + ' vols');
+
+        if (r.freeCount > 0 && !seriesCountAddsNothing(r)) {
+            bits.push(freeVolumeText(r.freeCount, r.volTotal));
         }
         return bits.join(' \u00b7 ');
     }
@@ -3715,12 +3822,23 @@
     function storeTipFacts(r, store) {
         const facts = [];
         if (r.freeMine) facts.push('this volume is free' + (r.until ? ' (' + r.until + ')' : ''));
-        else if (isFinite(r.price) && r.price > 0) facts.push('this volume is \u00a5' + r.price.toLocaleString('en-US'));
-        if (r.freeCount > 0 && !(r.freeMine && r.freeCount <= 1)) {
+        else if (isFinite(r.price) && r.price > 0) facts.push('this volume is ' + priceLabel(r.price, r.priceUnit));
+        if (r.ku && !r.freeMine) facts.push('included with Kindle Unlimited, which is a subscription');
+        if (r.ku && r.volTotal > 1) {
+            if (r.kuSeen >= r.volTotal) {
+                facts.push(r.kuCount === r.volTotal
+                    ? 'all ' + r.volTotal + ' volumes are on Kindle Unlimited'
+                    : r.kuCount + ' of ' + r.volTotal + ' volumes are on Kindle Unlimited');
+            } else {
+
+                facts.push('the series has ' + r.volTotal + ' volumes, and ' + r.kuCount +
+                    ' of the ' + r.kuSeen + ' listed are on Kindle Unlimited');
+            }
+        }
+        if (r.freeCount > 0 && !seriesCountAddsNothing(r)) {
             const n = r.freeCount;
-            if (typeof store.freeBadge === 'function') {
-                // ebookjapan renders nothing per-volume, so this number is the
-                // shop's own campaign badge rather than rows we counted.
+            if (typeof store.freeBadge === 'function' && !(r.volTotal > 0)) {
+
                 facts.push('its campaign badge offers ' + n + (n === 1 ? ' volume' : ' volumes') + ' free');
             } else if (r.volTotal > n) {
                 facts.push(n + ' of ' + r.volTotal + ' volumes can be read free');
@@ -3729,34 +3847,85 @@
             } else {
                 facts.push('1 volume can be read free');
             }
+        } else if (!r.ku && r.volTotal > 1) {
+            facts.push('the series has ' + r.volTotal + ' volumes');
         }
         if (!facts.length && r.rows) facts.push('no price or free-volume marker for this volume');
         return facts;
     }
 
-    // The card's CSS travels with the feature: a build that does not include
-    // this module carries neither the markup nor the styling.
+    const STORE_GRID_TRACKS = 6;
+    const STORE_MAX_PER_ROW = 3;
+
+    function storeRowSizes(count) {
+        const n = Math.max(0, Number(count) || 0);
+        if (!n) return [];
+        const rows = Math.ceil(n / STORE_MAX_PER_ROW);
+        const base = Math.floor(n / rows);
+        const extra = n % rows;
+        const out = [];
+        for (let i = 0; i < rows; i++) out.push(base + (i >= rows - extra ? 1 : 0));
+        return out;
+    }
+
+    function storeLayout(count) {
+        const rows = storeRowSizes(count);
+        const spans = [];
+        for (const size of rows) for (let i = 0; i < size; i++) spans.push(STORE_GRID_TRACKS / size);
+        return { rows: rows, spans: spans, compact: rows.some(size => size >= 3) };
+    }
+
     const STORE_CSS = `
-.bwdd-store-row { display: flex; flex-wrap: wrap; gap: 6px; }
-.bwdd-store-link {
-  display: inline-flex; align-items: center; gap: 5px;
+/* Card sizing. The row is a ${STORE_GRID_TRACKS}-track grid and each pill spans
+   STORE_GRID_TRACKS / (pills in its row) tracks, set inline by storeLayout().
+   The compact values apply when a row holds three pills, the only row whose
+   cells are a third of the card wide. These are the knobs for the whole card:
+   change them here and every count follows. */
+.bwdd-store-row { display: grid; grid-template-columns: repeat(${STORE_GRID_TRACKS}, minmax(0, 1fr)); gap: 6px; }
+.bwdd-store-row.is-compact { gap: 4px; }
+.bwdd-store-row.is-compact > .bwdd-store-link,
+.bwdd-store-row.is-compact > .bwdd-store-pending { padding: 3px 4px; column-gap: 3px; }
+.bwdd-store-row.is-compact .bwdd-store-badge { width: 12px; height: 12px; font-size: 9px; }
+.bwdd-store-link, .bwdd-store-pending {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  grid-template-areas: "badge name" "state state";
+  align-items: center; column-gap: 5px; min-width: 0;
   border: 1px solid var(--bwdd-border);
-  border-radius: 999px;
-  padding: 2px 8px 2px 3px;
-  font-size: 11px; font-weight: 600; line-height: 1.7;
+  border-radius: 10px;
+  padding: 3px 6px;
+  font-size: 11px; font-weight: 600; line-height: 1.5;
   text-decoration: none; color: var(--bwdd-text);
   background: var(--bwdd-bg);
 }
+/* A shop whose search has not answered yet. It keeps the shop's place in the
+   grid so the pill count never jumps as answers land, but it carries no price,
+   no link and no claim; the state line is an empty bar while it waits. */
+.bwdd-store-pending { cursor: default; }
+.bwdd-store-pending .bwdd-store-name { color: var(--bwdd-text-muted); }
+.bwdd-store-pending .bwdd-store-state { height: 8px; width: 70%; border-radius: 4px; background: var(--bwdd-border); }
+.bwdd-store-pending { animation: bwdd-store-wait 1.2s ease-in-out infinite; }
+@keyframes bwdd-store-wait { 0%, 100% { opacity: 0.45; } 50% { opacity: 0.85; } }
+@media (prefers-reduced-motion: reduce) { .bwdd-store-pending { animation: none; opacity: 0.6; } }
 .bwdd-store-link:hover { border-color: var(--bwdd-store, var(--bwdd-link)); background: var(--bwdd-link-hover-bg); text-decoration: none; }
 .bwdd-store-link:focus-visible { outline: 2px solid var(--bwdd-link); outline-offset: 2px; }
 .bwdd-store-badge {
+  grid-area: badge;
   display: inline-flex; align-items: center; justify-content: center;
   width: 16px; height: 16px; border-radius: 50%;
   background: var(--bwdd-store, #6b7280); color: #fff;
   font-size: 10px; font-weight: 700; line-height: 1; flex: 0 0 auto;
 }
-.bwdd-store-state { color: var(--bwdd-text-muted); font-weight: 500; }
+.bwdd-store-name { grid-area: name; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.bwdd-store-state {
+  grid-area: state;
+  color: var(--bwdd-text-muted); font-weight: 500;
+  font-size: 10px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
 .bwdd-store-link.is-free .bwdd-store-state { color: #15803d; font-weight: 700; }
+/* Kindle Unlimited is readable on subscription, not free, so it is not green. */
+.bwdd-store-link.is-ku .bwdd-store-state { color: #0e7490; font-weight: 700; }
 `;
     let storeStylesMounted = false;
     function mountStoreStyles() {
@@ -3769,27 +3938,53 @@
         } catch (e) {}
     }
 
-    function renderStoresCard(statsEl, results) {
-        if (!statsEl || !results || !results.length) return null;
+    function markStoresSettled(statsEl, done) {
+        if (!BWDD_DEBUG || !statsEl) return;
+        try { statsEl.setAttribute('data-stores-done', done ? '1' : '0'); } catch (e) {}
+    }
+
+    function renderStoresCard(statsEl, results, pending) {
+        if (!statsEl) return null;
+        const shown = (results || []).filter(r => r.available);
+        const waiting = pending || [];
+
+        if (!shown.length) return upsertCard(statsEl, 'stores', () => null);
         mountStoreStyles();
         return upsertCard(statsEl, 'stores', () => {
-            // Only shops that actually carry it. A pill for a shop that does not
-            // have the book is not an availability badge, it is a search link,
-            // and a card with nothing in it is not worth a frame.
-            const shown = results.filter(r => r.available);
-            if (!shown.length) return null;
             const card = emptyCard('Also available on');
-            const row = el('div', 'bwdd-store-row');
+            const byId = new Map(shown.map(r => [r.store.id, r]));
+            const waitingIds = new Set(waiting.map(s => s.id));
+
+            const slots = AVAILABILITY_STORES.filter(s => byId.has(s.id) || waitingIds.has(s.id));
+
+            const layout = storeLayout(slots.length);
+            const row = el('div', 'bwdd-store-row' + (layout.compact ? ' is-compact' : ''));
             const activeId = (ACTIVE_SITE && ACTIVE_SITE.id) || '';
-            for (const r of shown) {
-                const store = r.store;
+            slots.forEach((store, index) => {
+                const span = 'span ' + (layout.spans[index] || STORE_GRID_TRACKS);
+                const r = byId.get(store.id);
+                if (!r) {
+                    const ph = el('div', 'bwdd-store-pending');
+                    ph.style.gridColumn = span;
+                    ph.style.setProperty('--bwdd-store', store.color);
+                    ph.setAttribute('aria-busy', 'true');
+                    ph.title = 'Checking ' + store.label + '\u2026';
+                    const badge = el('span', 'bwdd-store-badge', store.short);
+                    badge.setAttribute('aria-hidden', 'true');
+                    ph.append(badge, el('span', 'bwdd-store-name', store.pill || store.label),
+                        el('span', 'bwdd-store-state'));
+                    row.appendChild(ph);
+                    return;
+                }
                 const here = store.siteId && store.siteId === activeId;
                 const meta = storeMetaText(r);
                 const a = el('a', 'bwdd-store-link is-found' +
-                    ((r.freeMine || r.freeCount > 0) ? ' is-free' : ''));
+                    ((r.freeMine || r.freeCount > 0) ? ' is-free' : '') +
+                    ((r.ku && !r.freeMine) ? ' is-ku' : ''));
                 a.href = r.url;
                 a.target = '_blank';
                 a.rel = 'noopener noreferrer';
+                a.style.gridColumn = span;
                 a.style.setProperty('--bwdd-store', store.color);
                 let tip = (r.why === 'exact')
                     ? store.label + ' \u2014 the store page for this book'
@@ -3801,11 +3996,11 @@
                 a.setAttribute('aria-label', tip);
                 const badge = el('span', 'bwdd-store-badge', store.short);
                 badge.setAttribute('aria-hidden', 'true');
-                a.append(badge, el('span', null, store.label));
-                // No "available" filler: an empty state is left empty.
+                a.append(badge, el('span', 'bwdd-store-name', store.pill || store.label));
+
                 if (meta) a.appendChild(el('span', 'bwdd-store-state', meta));
                 row.appendChild(a);
-            }
+            });
             card.appendChild(row);
             return card;
         });
@@ -3817,7 +4012,7 @@
         if (!seed || !statsEl) return null;
         const cacheKey = seed + '|' + (volNum == null ? '' : volNum);
         const cached = availabilityMemory.get(cacheKey);
-        if (cached) { renderStoresCard(statsEl, cached); return cached; }
+        if (cached) { markStoresSettled(statsEl, true); renderStoresCard(statsEl, cached); return cached; }
         const candidates = [];
         for (const base of [seed, raw]) {
             if (!base) continue;
@@ -3825,34 +4020,55 @@
                 if (c && candidates.indexOf(c) === -1) candidates.push(c);
             }
         }
-        let work = availabilityInflight.get(cacheKey);
-        if (!work) {
-            work = Promise.all(AVAILABILITY_STORES.map(async (store) => {
+        let entry = availabilityInflight.get(cacheKey);
+        if (!entry) {
+
+            const settled = new Array(AVAILABILITY_STORES.length).fill(null);
+            const state = { el: statsEl };
+            const paint = () => {
+                const known = settled.filter(Boolean);
+                const pending = AVAILABILITY_STORES.filter((s, i) => settled[i] === null);
+                try { renderStoresCard(state.el, known, pending); } catch (e) {}
+            };
+            const tasks = AVAILABILITY_STORES.map(async (store, i) => {
                 const base = Object.assign(blankDetail(), { store: store });
-                const exact = exactStorePageUrl(store);
-                if (exact) {
-                    // The viewer told us the store page outright, so go straight to
-                    // it for the price and free-volume rows.
-                    const d = await storeDetail(store, exact, '', volNum, bookTitle);
-                    return Object.assign(base, d, { available: true, url: exact, why: 'exact' });
+                let result = null;
+                let exact = null;
+                if (typeof store.exactPage === 'function') {
+                    try { exact = store.exactPage(); } catch (e) { exact = null; }
                 }
-                try {
-                    const hit = await checkStoreAvailability(store, candidates, volNum, bookTitle);
-                    if (hit) return Object.assign(base, hit, { available: true, url: hit.url, why: 'match' });
-                } catch (e) { /* fall through to the search link */ }
-                base.available = false;
-                base.why = 'search';
-                base.url = store.search(candidates[0] || seed);
-                return base;
-            }));
-            availabilityInflight.set(cacheKey, work);
+                if (exact) {
+
+                    const d = await storeDetail(store, exact, '', '', volNum, bookTitle);
+                    result = Object.assign(base, d, { available: true, url: exact, why: 'exact' });
+                } else {
+                    try {
+                        const hit = await checkStoreAvailability(store, candidates, volNum, bookTitle);
+                        if (hit) result = Object.assign(base, hit, { available: true, url: hit.url, why: 'match' });
+                    } catch (e) { }
+                    if (!result) {
+                        base.available = false;
+                        base.why = 'search';
+                        base.url = store.search(candidates[0] || seed);
+                        result = base;
+                    }
+                }
+                settled[i] = result;
+                paint();
+                return result;
+            });
+            entry = { work: Promise.all(tasks), state: state };
+            availabilityInflight.set(cacheKey, entry);
+            markStoresSettled(statsEl, false);
+        } else {
+
+            entry.state.el = statsEl;
         }
         let results;
-        try { results = await work; }
-        finally { if (availabilityInflight.get(cacheKey) === work) availabilityInflight.delete(cacheKey); }
+        try { results = await entry.work; }
+        finally { if (availabilityInflight.get(cacheKey) === entry) availabilityInflight.delete(cacheKey); }
         availabilityMemory.set(cacheKey, results);
-        // Session-lifetime cache, one entry per series|volume: drop the oldest
-        // rather than letting a long browsing session grow it without bound.
+
         while (availabilityMemory.size > AVAILABILITY_CACHE_MAX) {
             availabilityMemory.delete(availabilityMemory.keys().next().value);
         }
@@ -3862,13 +4078,450 @@
                     ' -> ' + results.map(r => r.store.id + ':' + (r.available ? 'found' : 'not-carried')).join(' '));
             } catch (e) {}
         }
+        markStoresSettled(statsEl, true);
         renderStoresCard(statsEl, results);
         return results;
     }
-    // =====================================================================
-    // 11. Naming, messages and ZIP base name
-    // =====================================================================
-    function cleanTitle(t) {
+
+    if (BWDD_DEBUG) {
+        try {
+            debugRealm().__bwddAvailability = {
+                stores: AVAILABILITY_STORES,
+                register: registerAvailabilityStore,
+                layout: storeLayout,
+                render: renderStoresCard,
+            };
+        } catch (e) {}
+    }
+
+    registerAvailabilityStore({
+        id: 'bookwalker', siteId: 'bookwalker', label: 'BookWalker', short: 'B',
+        color: '#0f7dc4', origin: 'https://bookwalker.jp', hosts: ['bookwalker.jp'],
+        search: (q) => 'https://bookwalker.jp/search/?word=' + encodeURIComponent(q),
+
+        product: (p) => /^\/series\/\d+\//.test(p) || /^\/de[0-9a-f-]{6,}\/?$/i.test(p),
+        rank: (p) => (/^\/series\//.test(p) ? 0.5 : 0),
+
+        volumes: (doc) => {
+            const out = [];
+            for (const a of doc.querySelectorAll('a.m-book-item__title')) {
+                const title = (a.getAttribute('title') || a.textContent || '').trim();
+                let url = '';
+                try { url = new URL(a.getAttribute('href') || '', 'https://bookwalker.jp/').href; } catch (e) { continue; }
+                let num = null, free = false, row = a;
+                for (let i = 0; i < 6 && row; i++, row = row.parentElement) {
+                    const el = row.querySelector('.m-book-item__price-num');
+                    if (!el) continue;
+                    const n = parseInt(String(el.textContent).replace(/[^0-9]/g, ''), 10);
+                    num = isFinite(n) ? n : null;
+                    free = /無料で読む/.test(row.textContent || '') || num === 0;
+                    break;
+                }
+                out.push({ title: title, url: url, vol: extractVolumeNumber(title), price: num, free: free, until: '' });
+            }
+            return out;
+        },
+    });
+
+    function decodePayload(html) {
+        const m = /<script[^>]*type="application\/json"[^>]*>([\s\S]*?)<\/script>/i.exec(String(html || ''));
+        if (!m) return null;
+        let flat = null;
+        try { flat = JSON.parse(m[1]); } catch (e) { return null; }
+        if (!Array.isArray(flat) || !flat.length) return null;
+        const cache = new Map();
+        const hydrate = (ref) => {
+
+            if (typeof ref !== 'number') return ref;
+            if (!isFinite(ref) || Math.floor(ref) !== ref || ref < 0 || ref >= flat.length) return undefined;
+            if (cache.has(ref)) return cache.get(ref);
+            const value = flat[ref];
+            if (!value || typeof value !== 'object') { cache.set(ref, value); return value; }
+            if (Array.isArray(value)) {
+                const head = value[0];
+
+                if (head === 'ShallowReactive' || head === 'Reactive' ||
+                    head === 'ShallowRef' || head === 'Ref') return hydrate(value[1]);
+                if (head === 'Date' || head === 'BigInt' || head === 'RegExp') {
+                    cache.set(ref, value[1]);
+                    return value[1];
+                }
+                const out = [];
+                cache.set(ref, out);
+                for (const item of value) out.push(hydrate(item));
+                return out;
+            }
+            const out = {};
+            cache.set(ref, out);
+            for (const key of Object.keys(value)) out[key] = hydrate(value[key]);
+            return out;
+        };
+        return hydrate(0);
+    }
+
+    function isEbookjapanStore(value) {
+        return !!value && typeof value === 'object' && !Array.isArray(value) &&
+            !!(value.titleInfo || value.publication || value.purchasablePublications ||
+                value.sameTitlePublications || value.freePublications || value.branchPublications);
+    }
+
+    function payloadStore(payload) {
+        const seen = new Set();
+        const stack = [payload];
+        while (stack.length) {
+            const node = stack.pop();
+            if (!node || typeof node !== 'object' || seen.has(node)) continue;
+            seen.add(node);
+            if (Array.isArray(node)) {
+                for (const item of node) stack.push(item);
+                continue;
+            }
+            for (const key of Object.keys(node)) {
+                if (key.indexOf('books-title') === 0 && isEbookjapanStore(node[key])) return node[key];
+                stack.push(node[key]);
+            }
+        }
+        return null;
+    }
+
+    function ebjPublicationRows(payload, titleId) {
+        const lists = payload ? [payload.purchasablePublications, payload.sameTitlePublications,
+            payload.freePublications, payload.branchPublications] : [];
+        const byCd = new Map();
+        const out = [];
+        for (const list of lists) {
+            if (!Array.isArray(list)) continue;
+            for (const pub of list) {
+                if (!pub || !pub.publicationCd) continue;
+                const goods = pub.goods || {};
+                const title = String(pub.name || '').trim();
+                const price = Number(goods.price);
+                const row = {
+                    title: title,
+                    url: titleId ? ('https://ebookjapan.yahoo.co.jp/books/' + titleId + '/' + pub.publicationCd + '/') : '',
+                    vol: extractVolumeNumber(title),
+                    price: isFinite(price) && price > 0 ? price : null,
+                    free: !!(goods.isFree || goods.isBrowserSpecialFree) || price === 0,
+                    until: goods.saleEndDatetime || '',
+                };
+                const prev = byCd.get(pub.publicationCd);
+                if (!prev) { byCd.set(pub.publicationCd, row); out.push(row); continue; }
+
+                const better = (row.free && !prev.free) ||
+                    (row.free === prev.free && row.price != null && (prev.price == null || row.price < prev.price));
+                if (better) { byCd.set(pub.publicationCd, row); out[out.indexOf(prev)] = row; }
+            }
+        }
+        return out;
+    }
+
+    registerAvailabilityStore({
+        id: 'ebookjapan', siteId: 'ebookjapan', label: 'ebookjapan', short: 'e',
+        color: '#e8820c', origin: 'https://ebookjapan.yahoo.co.jp', hosts: ['ebookjapan.yahoo.co.jp'],
+        search: (q) => 'https://ebookjapan.yahoo.co.jp/search/?keyword=' + encodeURIComponent(q),
+        product: (p) => /^\/books\/\d+\//.test(p),
+
+        rank: (p) => (/^\/books\/\d+\/[A-Z]/.test(p) ? 0.5 : 0),
+
+        freeBadge: (html) => {
+            const all = [];
+            const re = /([0-9]+)\s*冊無料/g;
+            let m;
+            while ((m = re.exec(String(html || '')))) all.push(parseInt(m[1], 10));
+            return all.length ? Math.max.apply(null, all) : 0;
+        },
+        volumes: (doc, html) => {
+            const payload = payloadStore(decodePayload(html));
+            if (!payload) return [];
+            const titleId = payload.titleInfo && payload.titleInfo.titleId;
+            return ebjPublicationRows(payload, titleId);
+        },
+
+        listPages: (doc, html) => {
+            const payload = payloadStore(decodePayload(html));
+            if (!payload) return [];
+            if (payload.purchasablePublications || payload.sameTitlePublications) return [];
+            const titleId = payload.titleInfo && payload.titleInfo.titleId;
+            const first = payload.firstPublication || payload.titlePublicationMain || payload.lastPublication;
+            if (!titleId || !first || !first.publicationCd) return [];
+            return ['https://ebookjapan.yahoo.co.jp/books/' + titleId + '/' + first.publicationCd + '/'];
+        },
+    });
+
+    registerAvailabilityStore({
+        id: 'cmoa', siteId: 'cmoa', label: 'CMOA', short: 'C',
+        color: '#e2574c', origin: 'https://www.cmoa.jp', hosts: ['cmoa.jp'],
+
+        search: (q) => 'https://www.cmoa.jp/search/result/?header_word=' + encodeURIComponent(q),
+        product: (p) => /^\/title\/\d+\/?/.test(p),
+        rank: () => 0,
+
+        exactPage() {
+            try {
+                const rurl = new URLSearchParams(location.search).get('rurl');
+                if (!rurl) return null;
+                const u = new URL(rurl);
+                if (!hostMatches(u.hostname, this.hosts)) return null;
+                if (!this.product(u.pathname)) return null;
+                const title = /^\/title\/(\d+)/.exec(u.pathname);
+                if (!title) return null;
+                return u.origin + '/title/' + title[1] + '/';
+            } catch (e) { return null; }
+        },
+
+        volumes: (doc) => {
+            const out = [];
+            for (const row of doc.querySelectorAll('.title_vol_vox_vols_i')) {
+                const a = row.querySelector('h3.title_details_title_name_h2 a') || row.querySelector('a[href*="/title/"]');
+                const img = row.querySelector('img[alt]');
+                const title = ((a && a.textContent) || (img && img.getAttribute('alt')) || '').trim();
+                let url = '';
+                if (a) { try { url = new URL(a.getAttribute('href') || '', 'https://www.cmoa.jp/').href; } catch (e) {} }
+
+                let freeEl = null;
+                for (const el of row.querySelectorAll('.GA_free')) {
+                    if ((el.textContent || '').trim()) { freeEl = el; break; }
+                }
+                const markEl = row.querySelector('.mark .em');
+                const zeroMarked = !!markEl && (markEl.textContent || '').replace(/[^0-9]/g, '') === '0';
+                let until = '';
+                if (freeEl) {
+                    for (const sp of freeEl.querySelectorAll('span')) {
+                        const t = (sp.textContent || '').trim();
+                        if (/まで/.test(t)) until = t;
+                    }
+                }
+                let price = null;
+
+                const point = row.querySelector('.price .point') || row.querySelector('.point');
+                if (point) {
+                    const m = /([0-9][0-9,]*)円/.exec(point.textContent || '');
+                    if (m) price = parseInt(m[1].replace(/,/g, ''), 10);
+                }
+                let vol = NaN;
+                const vm = /\/vol\/([0-9]+)\//.exec(url);
+                if (vm) vol = parseInt(vm[1], 10);
+                if (!isFinite(vol) || !vol) vol = extractVolumeNumber(title);
+                out.push({ title: title, url: url, vol: vol, price: price, free: !!(freeEl || zeroMarked), until: until });
+            }
+            if (out.length) return out;
+            for (const row of doc.querySelectorAll('.title_vol_easy_box_in_th')) {
+                const a = row.querySelector('.title_check_box h3 a') || row.querySelector('.thum_box3 a[href*="/title/"]');
+                const img = row.querySelector('img[alt]');
+                const title = ((a && a.textContent) || (img && img.getAttribute('alt')) || '').trim();
+                let url = '';
+                if (a) { try { url = new URL(a.getAttribute('href') || '', 'https://www.cmoa.jp/').href; } catch (e) {} }
+
+                const cam = row.querySelector('.book_last_cam');
+                const free = !!cam && /無料/.test(cam.textContent || '');
+                let until = '';
+                if (free) {
+                    const m = /([0-9]{1,2}\/[0-9]{1,2})\s*まで/.exec(cam.textContent || '');
+                    if (m) until = m[1];
+                }
+
+                let price = null, unit = '';
+                const val = row.querySelector('.book_cam_value');
+                if (val) {
+                    const m = /([0-9][0-9,]*)\s*pt/.exec(val.textContent || '');
+                    if (m) { price = parseInt(m[1].replace(/,/g, ''), 10); unit = 'pt'; }
+                }
+                let vol = NaN;
+                const vm = /\/vol\/([0-9]+)\//.exec(url);
+                if (vm) vol = parseInt(vm[1], 10);
+                if (!isFinite(vol) || !vol) vol = extractVolumeNumber(title);
+                out.push({ title: title, url: url, vol: vol, price: price, free: free, until: until, unit: unit });
+            }
+            return out;
+        },
+
+        pagePrice: (doc) => {
+            for (const el of doc.querySelectorAll('.price .point, .point')) {
+                const m = /([0-9][0-9,]*)円/.exec(el.textContent || '');
+                if (m) return parseInt(m[1].replace(/,/g, ''), 10);
+            }
+            return null;
+        },
+
+        listPages: (doc, html, url) => {
+            const out = [];
+            let base = null;
+            try { base = new URL(url); } catch (e) { return out; }
+
+            const series = /^\/title\/(\d+)(?:\/|$)/.exec(base.pathname);
+            if (!series) return out;
+            const seriesPath = '/title/' + series[1] + '/';
+            const seen = Object.create(null);
+            for (const a of doc.querySelectorAll('a[href*="page="]')) {
+                let u = null;
+                try { u = new URL(a.getAttribute('href') || '', base); } catch (e) { continue; }
+                if (u.hostname !== base.hostname) continue;
+                const paged = /^\/title\/(\d+)\/?$/.exec(u.pathname);
+                if (!paged || paged[1] !== series[1]) continue;
+                const pager = parseInt(u.searchParams.get('page') || '', 10);
+                if (!(pager > 1)) continue;
+                u.hash = '';
+                const s = u.origin + seriesPath + u.search;
+                if (s === url || seen[s]) continue;
+                seen[s] = true;
+                out.push(s);
+            }
+            return out;
+        },
+    });
+
+    function amazonSeriesSize(title, pageText) {
+        const t = String(pageText || '') + ' ' + String(title || '');
+        const m = /全(\d+)巻中第?\d+巻/.exec(t);
+        return m ? Number(m[1]) : null;
+    }
+
+    function amazonKindleUnlimited(text) {
+
+        return /Kindle\s*Unlimited/i.test(String(text || ''));
+    }
+
+    function amazonYen(text) {
+        const t = String(text || '');
+        const patterns = [
+
+            /ご請求額\s*[:：]?\s*(?:JPY|￥|¥)\s*([0-9][0-9,]*)/,
+            /JPY\s*([0-9][0-9,]*)\s*が請求されます/,
+
+            /(?:または|or)\s*[、,]?\s*(?:JPY|￥|¥)\s*([0-9][0-9,]*)/,
+        ];
+
+        if (!/Kindle Unlimited/i.test(t)) patterns.push(/(?:￥|¥)\s*([0-9][0-9,]*)/);
+        for (const re of patterns) {
+            const m = re.exec(t);
+            if (!m) continue;
+            const n = parseInt(m[1].replace(/,/g, ''), 10);
+            if (isFinite(n)) return n;
+        }
+        return null;
+    }
+
+    function amazonVolumeNumber(title, pageText) {
+        const m = /全\s*[0-9,]+\s*巻中\s*第?\s*([0-9]+)\s*巻/.exec(String(pageText || ''));
+        if (m) return parseInt(m[1], 10);
+        return extractVolumeNumber(title);
+    }
+
+    registerAvailabilityStore({
+        id: 'kindle', siteId: 'kindle', label: 'Amazon Kindle', pill: 'Kindle', short: 'A',
+        color: '#c45500', origin: 'https://www.amazon.co.jp',
+        hosts: ['www.amazon.co.jp', 'amazon.co.jp'],
+        search: (q) => 'https://www.amazon.co.jp/s?k=' + encodeURIComponent(q) + '&i=digital-text',
+
+        product: (p) => /\/dp\/[A-Z0-9]{10}(?:\/|$)/i.test(p) || /^\/gp\/product\/[A-Z0-9]{10}/i.test(p),
+        rank: () => 0,
+
+        fromSearch: true,
+
+        seriesOf: (cardHtml) => amazonSeriesSize('', cardHtml),
+        volumes: (doc) => {
+            const cards = doc.querySelectorAll('[data-component-type="s-search-result"][data-asin]');
+            const out = [];
+            for (const card of cards) {
+                const asin = (card.getAttribute('data-asin') || '').trim().toUpperCase();
+                if (!/^[A-Z0-9]{10}$/.test(asin)) continue;
+                const h2 = card.querySelector('h2');
+                const title = ((h2 && h2.textContent) || '').replace(/\s+/g, ' ').trim();
+                if (!title) continue;
+                const text = card.textContent || '';
+                const price = amazonYen(text);
+                const ku = amazonKindleUnlimited(text);
+                out.push({
+                    title: title, url: 'https://www.amazon.co.jp/dp/' + asin + '/',
+                    vol: amazonVolumeNumber(title, text),
+
+                    price: price, free: price === 0 && !ku, ku: ku, until: '',
+                    series: amazonSeriesSize(title, text),
+
+                    page: price == null,
+                });
+            }
+            if (out.length) return out;
+
+            const main = doc.querySelector('#productTitle, #title');
+            const title = ((main && main.textContent) || '').replace(/\s+/g, ' ').trim();
+            if (!title) return [];
+            const text = (doc.body && doc.body.textContent) || '';
+            const price = amazonYen(text);
+            const ku = amazonKindleUnlimited(text);
+            return [{
+                title: title, url: '', vol: amazonVolumeNumber(title, text),
+                price: price, free: price === 0 && !ku, ku: ku, until: '',
+                series: amazonSeriesSize(title, text),
+            }];
+        },
+    });
+
+    registerAvailabilityStore({
+        id: 'kmanga', siteId: 'kmanga', label: 'k-manga', short: 'k',
+        color: '#b8860b', origin: 'https://comic.k-manga.jp', hosts: ['comic.k-manga.jp'],
+
+        search: (q) => 'https://comic.k-manga.jp/search/word/'
+            + encodeURIComponent(String(q || '').replace(/(\u3000|\s)+/g, ' ').trim()),
+
+        product: (p) => /^\/title\/\d+\/(?:pv|vol\/\d+)\/?$/.test(p),
+        rank: (p) => (/\/pv\/?$/.test(p) ? 0.5 : 0),
+
+        volumes: (doc) => {
+            const out = [];
+            for (const row of doc.querySelectorAll('.book-chapter--target')) {
+                const a = row.querySelector('.book-chapter--title a') || row.querySelector('a[href*="/vol/"]');
+                const img = row.querySelector('img[alt]');
+                const num = row.querySelector('.book-chapter--num');
+                const title = ((a && a.textContent) || (img && img.getAttribute('alt')) || '').trim();
+                let url = '';
+                if (a) { try { url = new URL(a.getAttribute('href') || '', 'https://comic.k-manga.jp/').href; } catch (e) {} }
+                let vol = NaN;
+                const vm = /\/vol\/(\d+)/.exec(url);
+                if (vm) vol = parseInt(vm[1], 10);
+                if (!isFinite(vol) || !vol) vol = extractVolumeNumber((num && num.textContent) || title);
+
+                let price = null;
+                const pt = row.querySelector('.book-chapter--page-price .book-chapter--pt');
+                if (pt) {
+                    const m = /([0-9][0-9,]*)\s*pt/.exec(pt.textContent || '');
+                    if (m) price = parseInt(m[1].replace(/,/g, ''), 10);
+                }
+                const free = !!row.querySelector('.book-chapter--btn__jikuri, .gaevent-detail-chapter-read-jikkuri');
+                let until = '';
+                const bottom = row.querySelector('.book-chapter--bottom');
+                if (bottom) {
+                    const m = /([0-9]{1,2}\/[0-9]{1,2}(?:\s+[0-9]{1,2}:[0-9]{2})?)\s*まで/.exec(bottom.textContent || '');
+                    if (m) until = m[1];
+                }
+                out.push({ title: title, url: url, vol: vol, price: price, free: free, until: until, unit: 'pt' });
+            }
+            return out;
+        },
+
+        listPages: (doc, html, url) => {
+            const out = [];
+            let base = null;
+            try { base = new URL(url); } catch (e) { return out; }
+            const m = /^\/title\/(\d+)\/pv(?:\/\d+)?\/?$/.exec(base.pathname);
+            if (!m) return out;
+            const page = new RegExp('^/title/' + m[1] + '/pv/\\d+/?$');
+            const seen = Object.create(null);
+            seen[base.origin + base.pathname] = true;
+            for (const a of doc.querySelectorAll('a[href*="/pv/"]')) {
+                let u = null;
+                try { u = new URL(a.getAttribute('href') || '', base); } catch (e) { continue; }
+                if (u.hostname !== base.hostname || !page.test(u.pathname)) continue;
+                const s = u.origin + u.pathname;
+                if (seen[s]) continue;
+                seen[s] = true;
+                out.push(s);
+            }
+            return out;
+        },
+    });
+
+function cleanTitle(t) {
         if (!t) return '';
         let s = String(t).replace(/^【[^】]*】\s*/g, '').trim();
         s = s.replace(/[\\/:*?"<>|\x00-\x1f]/g, '').trim();
@@ -3896,42 +4549,27 @@
         const volumeTitle = (series + ' ' + (volNum != null ? volNum : '')).trim();
         return { series, volNum, volumeTitle };
     }
-    // ── Cross-platform (Windows / Linux / macOS) output naming ────────────
-    // Everything the user saves to disk must also be legal on Windows, the
-    // worst case. cleanTitle() above already drops the characters Windows
-    // forbids in file names (\/:*?"<>| plus C0 controls); fsSafePath() covers
-    // the rules that only bite there: trailing dots/spaces (NTFS strips them
-    // silently, so a name that is only dots fails), reserved device names
-    // (CON, PRN, NUL, COM1–9, LPT1–9), and a length cap of 190 code points so
-    // the whole extraction path stays inside the legacy 260-char limit.
-    // Linux/macOS tolerate all of this output unchanged.
+
     const BWDD_RESERVED_DEVICE = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9]|conin\$|conout\$)(?:\..*)?$/i;
     function fsSafePath(name) {
         let s = cleanTitle(name);
         if (!s) return '';
-        // Strip trailing ASCII dots/spaces (Windows drops them on create).
+
         s = s.replace(/[. ]+$/, '').trim();
         if (!s || s === '.' || s === '..') return '';
-        if (BWDD_RESERVED_DEVICE.test(s)) s = '_' + s;   // CON → _CON
+        if (BWDD_RESERVED_DEVICE.test(s)) s = '_' + s;
         const cps = Array.from(s);
         if (cps.length > 190) s = cps.slice(0, 190).join('').replace(/[. ]+$/, '');
         return s;
     }
-    // Default archive/output name for the current book: the volume's own
-    // displayed title (series + volume kept in the store's own format, e.g.
-    // "…1巻", "（１）"), with store labels in 【…】 removed wherever they sit.
-    // cleanTitle() only strips a *leading* 【…】 group, so a mid/suffix label
-    // like "…1巻【無料お試し版】" would leak, and splitSeriesVolume() normalizes
-    // digits ("1巻"→"1") for the stat lookups, losing the store's format.
+
     function archiveDefaultName(rawTitle) {
         let s = String(rawTitle || '').trim();
-        s = s.replace(/【[^】]*】/g, ' ');       // drop 【…】 groups, keep word separation
-        s = s.replace(/[ \t　]+/g, ' ').trim();  // tidy the whitespace the removal leaves behind
+        s = s.replace(/【[^】]*】/g, ' ');
+        s = s.replace(/[ \t　]+/g, ' ').trim();
         return fsSafePath(s);
     }
-    // ZIPs are flat: every page sits at the archive root as page-NNNN.jpg, which
-    // is what manga readers expect. The series→volume nesting the bridge builds
-    // for OCR/upload runs happens bridge-side from the session title.
+
     function zipBaseName(sv, fallbackTitle) {
         return fsSafePath(sv && sv.series) || fsSafePath(fallbackTitle) || 'book';
     }
@@ -3940,8 +4578,7 @@
         if (n < 1048576) return (n / 1024).toFixed(1) + ' KB';
         return (n / 1048576).toFixed(1) + ' MB';
     }
-    // Outcome messages shared by the trial and full download/OCR pipelines,
-    // so the two code paths can never drift apart in wording again.
+
     function msgZipSaved(n, size, secs) {
         return 'ZIP saved: ' + n + ' pages (' + size + ') in ' + secs + 's.';
     }
@@ -3959,19 +4596,20 @@
     function msgStoredLocal(p) { return 'Stored locally to: ' + p; }
     function msgUploadedTo(label, p) { return 'Uploaded to ' + label + ' → ' + p; }
 
-    // Best filesystem/destination path the bridge reported for a finished
-    // volume (output_dir for local forks, staging/remote_path otherwise).
+    function msgPartialUpload(result) {
+        const detail = result && typeof result.message === 'string' ? result.message.trim() : '';
+        return 'The volume files reached the destination, but the bridge could not finish the upload' +
+            (detail ? ': ' + detail : '.');
+    }
+
     function storedPathOf(result) {
         return (result && (result.output_dir || result.staging || result.remote_path)) || null;
     }
-    // Short user-facing label for an upload-method id ('mega' → 'MEGA'…).
     function methodShortLabel(method) {
         const t = { mega: 'MEGA', drive: 'Google Drive', onedrive: 'OneDrive', webdav: 'WebDAV', local: 'Local' };
         return (t && t[method]) || method || '';
     }
-    // The WebDAV base URL as reported by the bridge (/upload-methods extras or
-    // /health upload_methods), used to rebuild direct file URLs, since WebDAV
-    // has no share-link concept to attach to upload frames.
+
     function webdavBaseUrl() {
         const lists = [];
         if (uploadMethods && Array.isArray(uploadMethods.methods)) lists.push(uploadMethods.methods);
@@ -3983,10 +4621,6 @@
         }
         return '';
     }
-    // Best openable per-file target for a finished OCR run: the http(s) links the
-    // bridge attached (uploadUrls / uploads[].url), else a rebuilt direct WebDAV
-    // URL (base + remote_path/<volume>.cbz). .cbz is preferred over .mokuro /
-    // .webp. Returns {file, url} or null.
     function storedOpenTarget(result) {
         if (!result) return null;
         const cands = [];
@@ -4020,7 +4654,8 @@
         }
         return null;
     }
-    let __crcTable = null;
+
+let __crcTable = null;
     function crc32Bytes(buf) {
         if (!__crcTable) {
             __crcTable = new Int32Array(256);
@@ -4102,13 +4737,13 @@
             const size = ent.blob.size;
             let crc = Number.isInteger(ent.crc) ? (ent.crc >>> 0) : null;
             if (crc === null) crc = crc32Bytes(await ent.blob.arrayBuffer());
-            // Worker already read the page for its CRC: keep the original Blob as
-            // the part rather than a second full-size ArrayBuffer per page.
+
             parts.push(localHeader(nameB, crc, size, dos), ent.blob);
             centralParts.push(centralEntry(nameB, crc, size, dos, offset));
             offset += 30 + nameB.length + size;
             if (onProgress) onProgress(i + 1, ordered.length);
-            if ((i & 15) === 15) await new Promise(r => setTimeout(r, 0));
+
+            if ((i & 15) === 15) await yieldToTasks();
         }
         const cd = new Blob(centralParts);
         const cdBytes = new Uint8Array(await cd.arrayBuffer());
@@ -4124,24 +4759,10 @@
         return new Blob(parts, { type: 'application/zip' });
     }
 
-    // =====================================================================
-    // 12. Stylesheet Injection
-    // =====================================================================
-    // 12a. Light/dark scheme detection (environment / browser / OS)
-    // =====================================================================
-    // Real detection of the current color scheme, not a styling guess: we ask
-    // the platform through prefers-color-scheme, which reflects the OS "dark
-    // mode" toggle, the browser's own theme and any per-site override, and make
-    // that decision the single authority - <html data-bwdd-theme> mirrors it,
-    // bwddTheme gives the script a live value and onChange() subscribers, and
-    // the dark palette <style> created in injectStyles() is gated on it, so the
-    // theme follows the environment instead of relying on the page honouring a
-    // media query. A 'change' listener keeps it in sync while the viewer is
-    // already open, no reload needed.
     const bwddTheme = (() => {
-        let scheme = 'light';          // resolved value: 'dark' | 'light'
+        let scheme = 'light';
         let started = false;
-        let styleEl = null;            // dark-palette <style> gated by detection
+        let styleEl = null;
         const subscribers = [];
 
         function mql(pref) {
@@ -4151,9 +4772,7 @@
             } catch (e) { return null; }
         }
         function readScheme() {
-            // 'dark' wins; an explicit 'light' wins over nothing; anything
-            // else (unsupported browser, "no-preference") resolves to light,
-            // matching the script's default styling.
+
             const dark = mql('dark');
             if (dark && dark.matches) return 'dark';
             const light = mql('light');
@@ -4167,11 +4786,7 @@
             for (const fn of subscribers) { try { fn(scheme); } catch (e) {} }
         }
         function gateStyle() {
-            // The dark-palette <style> is in the document only while the
-            // environment reports dark: attaching/removing the element is the most
-            // widely supported gate (no reliance on CSSOM .disabled semantics) and
-            // costs nothing - light mode has no dark sheet, dark mode appends one
-            // after the base sheet.
+
             if (!styleEl) return;
             const host = (typeof document !== 'undefined' && (document.head || document.documentElement)) || null;
             if (!host) return;
@@ -4202,7 +4817,7 @@
                     if (!mq) return;
                     const fn = () => onMediaChange();
                     if (typeof mq.addEventListener === 'function') mq.addEventListener('change', fn);
-                    else if (typeof mq.addListener === 'function') mq.addListener(fn);   // legacy Safari
+                    else if (typeof mq.addListener === 'function') mq.addListener(fn);
                 };
                 attach(dark); attach(light);
                 if (BWDD_DEBUG) { try { console.info('[bwdd] light/dark scheme:', scheme); } catch (e) {} }
@@ -4310,6 +4925,11 @@
   transition: height 0.2s ease, opacity 0.15s ease, width 0.25s ease, transform 0.25s ease;
 }
 #bwdd-root * { box-sizing: border-box; }
+/* A store page's own font rules land directly on the panel's divs, so a leaf
+   rule like .bwdd-btn { font-family: inherit } picks up the shop's font
+   (Meiryo on CMOA) instead of ours. Make the whole subtree inherit from
+   #bwdd-root; the only deliberate exception is monospace for code/pre. */
+#bwdd-root *:not(code):not(pre):not(kbd):not(samp) { font-family: inherit; }
 #bwdd-root.collapsed { height: auto !important; max-height: none !important; }
 #bwdd-root.collapsed .bwdd-body { display: none; }
 #bwdd-root.bwdd-stats-visible { width: 640px; }   /* two-column width, once there is a stats column to show */
@@ -4374,6 +4994,18 @@
 .bwdd-gh svg { width: 12px; height: 12px; fill: currentColor; display: block; }
 .bwdd-gh:hover { color: var(--bwdd-link); background: var(--bwdd-link-hover-bg); }
 .bwdd-gh:focus-visible { outline: 2px solid var(--bwdd-link); outline-offset: 1px; }
+/* The shared script mark: a small, quiet link home beside the version line. */
+.bwdd-mark {
+  flex-shrink: 0;
+  white-space: nowrap;
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--bwdd-text-muted);
+  text-decoration: none;
+  padding: 0 2px;
+}
+.bwdd-mark:hover { color: var(--bwdd-link); text-decoration: underline; }
+.bwdd-mark:focus-visible { outline: 2px solid var(--bwdd-link); outline-offset: 1px; }
 .bwdd-head-controls { display: flex; align-items: center; gap: 2px; flex-shrink: 0; }
 .bwdd-ctrl-btn {
   background: transparent;
@@ -4839,16 +5471,47 @@
 .bwdd-fmt-summary:focus-visible { outline: 2px solid var(--bwdd-link); outline-offset: 1px; }
 .bwdd-fmt[open] > .bwdd-fmt-summary { margin-bottom: 2px; }
 
-.bwdd-dest-select, .bwdd-dest-input {
-  font: 12px inherit;
+/* The panel's own form controls must look the same on every store. A shop's
+   stylesheet lands on bare input/select/textarea elements, and exactly which
+   properties it touches differs per store, so this is a scoped reset rather
+   than a list tuned to one leak: every property a host page realistically sets
+   is pinned once for the whole panel subtree. The #bwdd-root prefix outranks a
+   page selector that is an element, a class, or an element plus an attribute,
+   so a host rule only wins with !important, which no store stylesheet uses for
+   generic form controls. The prefix is also what keeps the reset off the host
+   page's own fields. */
+#bwdd-root input,
+#bwdd-root select,
+#bwdd-root textarea {
+  box-sizing: border-box;
+  height: auto;
+  min-height: 0;
+  max-height: none;
+  margin: 0;
   padding: 5px 7px;
   border: 1px solid var(--bwdd-border-strong);
   border-radius: 6px;
   background: var(--bwdd-bg);
   color: var(--bwdd-root-fg);
+  font-family: inherit;
+  font-size: 12px;
+  font-style: normal;
+  font-weight: 400;
+  line-height: 1.4;
+  letter-spacing: normal;
+  text-transform: none;
+  text-indent: 0;
+  vertical-align: middle;
   width: 100%;
+  appearance: none;
+  -webkit-appearance: none;
 }
-.bwdd-dest-select:focus-visible, .bwdd-dest-input:focus-visible { outline: 2px solid var(--bwdd-link); outline-offset: 1px; }
+/* appearance: none would take the native dropdown affordance with it, and the
+   panel draws no caret of its own, so a select keeps the platform control. */
+#bwdd-root select { appearance: auto; -webkit-appearance: auto; }
+#bwdd-root input:focus-visible,
+#bwdd-root select:focus-visible,
+#bwdd-root textarea:focus-visible { outline: 2px solid var(--bwdd-link); outline-offset: 1px; }
 .bwdd-dest-localdir { display: flex; flex-direction: column; gap: 3px; }
 .bwdd-dest-hint { font-size: 11px; color: var(--bwdd-warn-text); background: var(--bwdd-warn-bg); border: 1px solid var(--bwdd-warn-border); border-radius: 6px; padding: 5px 7px; line-height: 1.4; }
 .bwdd-dest-hint code { font-family: ui-monospace, monospace; font-size: 10px; background: var(--bwdd-warn-code-bg); border-radius: 3px; padding: 0 3px; }
@@ -4861,7 +5524,9 @@
   gap: 6px;
 }
 .bwdd-name .bwdd-dest-label { flex: 0 0 auto; }
-.bwdd-name .bwdd-dest-input { flex: 1 1 auto; width: auto; min-width: 0; padding-top: 4px; padding-bottom: 4px; }
+/* Higher specificity than the subtree reset above, so the name field keeps its
+   compact row sizing (natural width, tighter vertical padding). */
+#bwdd-root .bwdd-name .bwdd-dest-input { flex: 1 1 auto; width: auto; min-width: 0; padding-top: 4px; padding-bottom: 4px; }
 .bwdd-name .bwdd-info-dot {
   flex: 0 0 auto;
   width: 18px;
@@ -4970,9 +5635,9 @@
   gap: 6px;
   margin-top: 6px;
 }
-.bwdd-reader-row > .bwdd-ghost-btn {
-  min-width: 0;
-  width: 100%;
+/* The quiet outline button is a component, not a child of one row. Only the
+   row's own sizing stays scoped there. */
+.bwdd-ghost-btn {
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -4993,12 +5658,16 @@
   cursor: pointer;
   transition: background 0.15s, color 0.15s, border-color 0.15s;
 }
-.bwdd-reader-row > .bwdd-ghost-btn:hover {
+.bwdd-reader-row > .bwdd-ghost-btn {
+  min-width: 0;
+  width: 100%;
+}
+.bwdd-ghost-btn:hover {
   background: var(--bwdd-bg-sunken);
   color: var(--bwdd-link);
   border-color: var(--bwdd-link);
 }
-.bwdd-reader-row > .bwdd-ghost-btn:focus-visible {
+.bwdd-ghost-btn:focus-visible {
   outline: 2px solid var(--bwdd-link);
   outline-offset: 1px;
 }
@@ -5110,16 +5779,6 @@
 `;
         (document.head || document.documentElement).appendChild(css);
 
-        // Dark palette (only active while bwddTheme detects dark, section 12a).
-        // This is a deliberate per-rule remap, not a blanket inversion: the
-        // chrome and surfaces get a dark palette chosen for contrast, and the
-        // LearnNatively / Manga-Kotoba stat cards get brand-matched dark variants
-        // below. The only elements left alone are the Natively difficulty level
-        // rectangles (.bwdd-nlvl-pill), whose semantic colors are set inline and
-        // already read correctly on dark. The rules have no @media wrapper on
-        // purpose: the stylesheet element is attached/removed by
-        // bwddTheme.attachStyle() above, so the environment detection is the one
-        // gate.
         const darkCss = document.createElement('style');
         darkCss.textContent = `
 #bwdd-root {
@@ -5231,24 +5890,24 @@
 .bwdd-edge-tab:hover { background: #60a5fa; }
 .bwdd-edge-tab:focus-visible { outline-color: #60a5fa; }
 /* Quiet reader/stored row (dark), colors come from --bwdd-* tokens */
-.bwdd-reader-row > .bwdd-ghost-btn { background: var(--bwdd-bg); color: var(--bwdd-text-muted); border-color: var(--bwdd-border-strong); }
-.bwdd-reader-row > .bwdd-ghost-btn:hover { background: var(--bwdd-bg-sunken); color: var(--bwdd-link); border-color: var(--bwdd-link); }
+.bwdd-ghost-btn { background: var(--bwdd-bg); color: var(--bwdd-text-muted); border-color: var(--bwdd-border-strong); }
+.bwdd-ghost-btn:hover { background: var(--bwdd-bg-sunken); color: var(--bwdd-link); border-color: var(--bwdd-link); }
 
 `;
         (document.head || document.documentElement).appendChild(darkCss);
-        bwddTheme.attachStyle(darkCss);   // removed from the DOM unless dark is detected
+        bwddTheme.attachStyle(darkCss);
     }
-    const PANEL_POS_KEY = 'bwdd-panel-pos';
+
+const PANEL_POS_KEY = 'bwdd-panel-pos';
     const PANEL_COLLAPSED_KEY = 'bwdd-panel-collapsed';
-    const PANEL_WIDTH_KEY = 'bwdd-panel-width';   // manual resize, if any
-    const PANEL_HEIGHT_KEY = 'bwdd-panel-height';   // manual vertical resize, if any
+    const PANEL_WIDTH_KEY = 'bwdd-panel-width';
+    const PANEL_HEIGHT_KEY = 'bwdd-panel-height';
 
     function buildUI() {
         injectStyles();
         const root = document.createElement('section');
         root.id = 'bwdd-root';
-        // A labelled region, not a modal dialog: the panel never traps focus
-        // or blocks the viewer behind it, and Esc collapses rather than closes.
+
         root.setAttribute('role', 'region');
         root.setAttribute('aria-labelledby', 'bwdd-panel-title');
 
@@ -5279,10 +5938,16 @@
         ghLink.setAttribute('aria-label', 'Open the GitHub repository in a new tab');
         ghLink.title = 'GitHub repository: ' + BWDD_REPO_URL;
         ghLink.innerHTML = '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>';
-        titleSub.append(sub, ghLink);
+        const mark = document.createElement('a');
+        mark.className = 'bwdd-mark';
+        mark.href = BWDD_REPO_URL;
+        mark.target = '_blank';
+        mark.rel = 'noopener noreferrer';
+        mark.textContent = BWDD_SCRIPT_NAME;
+        mark.title = BWDD_SCRIPT_NAME + ' \u2014 the combined downloader: ' + BWDD_REPO_URL;
+        mark.setAttribute('aria-label', 'Open the ' + BWDD_SCRIPT_NAME + ' repository in a new tab');
+        titleSub.append(sub, mark, ghLink);
 
-        // A single-store build also points at the combined script. The module
-        // that defines this is not in every target, so check before calling.
         if (typeof unifiedDownloaderLink === 'function') {
             const unified = unifiedDownloaderLink();
             if (unified) titleSub.appendChild(unified);
@@ -5315,10 +5980,7 @@
         closeBtn.setAttribute('aria-label', 'Close downloader panel');
         closeBtn.setAttribute('title', 'Close panel');
         closeBtn.textContent = '×';
-        // Close tears the panel down completely: it stops the bridge-health poll
-        // and removes the window-level listener + observer, so nothing keeps
-        // hitting 127.0.0.1:62642 or mutating detached DOM after the user closes
-        // the panel. (The edge-tab "flap" is the non-destructive alternative.)
+
         closeBtn.onclick = () => {
             try { if (bridgeTimer) { clearTimeout(bridgeTimer); bridgeTimer = null; } } catch (e) {}
             try { window.removeEventListener('keydown', onPanelKeydown); } catch (e) {}
@@ -5328,8 +5990,6 @@
             try { if (edgeTab) edgeTab.remove(); } catch (e) {}
         };
 
-        // "Flap" control: slides the whole panel off the right edge of the
-        // screen (a small tab on the right edge brings it back).
         const flapBtn = document.createElement('button');
         flapBtn.type = 'button';
         flapBtn.className = 'bwdd-ctrl-btn';
@@ -5340,12 +6000,10 @@
 
         ctrlGroup.append(flapBtn, minBtn, closeBtn);
 
-        // Visible drag grip at the left of the header (the whole header also
-        // drags, this just makes the affordance obvious).
         const dragGrip = document.createElement('span');
         dragGrip.className = 'bwdd-drag-grip';
         dragGrip.setAttribute('aria-hidden', 'true');
-        dragGrip.textContent = '\u283F';   // braille dots: grab handle look
+        dragGrip.textContent = '\u283F';
         head.append(dragGrip, titleGroup, ctrlGroup);
 
         const body = document.createElement('div');
@@ -5363,17 +6021,11 @@
         bridgeRow.title = 'mokuro-bridge: a small local app (github.com/GolyBidoof/mokuro-bridge) that runs mokuro OCR on the downloaded pages and can upload the results.';
         bridgeRow.append(dot, bridgeText);
 
-        // Red alert shown below the bridge row when the bridge runs but mokuro
-        // itself is not installed, the OCR button is unusable in that state.
         const mokuroAlert = document.createElement('div');
         mokuroAlert.className = 'bwdd-mokuro-alert';
         mokuroAlert.style.display = 'none';
         mokuroAlert.setAttribute('role', 'alert');
 
-        // "?" dot beside the bridge status row: opens an infobox under the row.
-        // Popovers open from inside `.bwdd-col-main`, which scrolls and so clips
-        // absolutely positioned children (the bridge one is taller than the
-        // column), so they are fixed to the viewport instead.
         function placePopover(pop, anchor, align) {
             pop.hidden = false;
             const a = anchor.getBoundingClientRect();
@@ -5402,9 +6054,6 @@
         infoTitle.className = 'bwdd-bridge-info-title';
         infoTitle.textContent = 'What is the Mokuro Bridge?';
 
-        // Section 1, the mokuro OCR engine installed on this machine
-        // (version + custom-fork marker), or a red note when it's missing.
-        // Updated from /health on each status tick.
         const mokuroSection = document.createElement('div');
         mokuroSection.className = 'bwdd-bridge-info-section';
         const mokuroSectionHeading = document.createElement('span');
@@ -5436,9 +6085,6 @@
         const divider3 = document.createElement('hr');
         divider3.className = 'bwdd-bridge-info-divider';
 
-        // Section 3, how many connections this run will actually get. Filled by
-        // renderCapabilities() on every bridge poll, so it is accurate whether or
-        // not the bridge is running.
         const connSection = document.createElement('div');
         connSection.className = 'bwdd-bridge-info-section';
         const connHeading = document.createElement('span');
@@ -5466,13 +6112,10 @@
             infoDot.setAttribute('aria-expanded', String(open));
         });
 
-        // Anchor for the bridge status row and its "?" infobox, so the infobox
-        // overlays just below the row instead of pushing content down.
         const bridgeAnchor = document.createElement('div');
         bridgeAnchor.className = 'bwdd-bridge-anchor';
         bridgeAnchor.append(bridgeRow, bridgeInfoPop);
 
-        // Human-readable busy reason from the bridge's /health fields.
         function busyReason(info) {
             if (!info) return '';
             const stage = info.busy_stage;
@@ -5484,23 +6127,19 @@
             return '';
         }
         async function updateBridgeDot() {
-            if (!root.isConnected) return;   // panel closed, skip the tick entirely
+            if (!root.isConnected) return;
             const ok = await bridgeHealth();
             let mokuroMissing = false;
             let mokuroDetailText = '';
             let bridgeBusy = false;
             let bridgeBusyStage = '';
             let bridgeBusyDetail = '';
-            // The bridge answers /health even when mokuro isn't installed
-            // (mokuro_installed:false), so that is "online but unusable for OCR",
-            // not offline.
+
             if (ok && bridgeReachableNow) {
                 const info = await refreshBridgeInfo().catch(() => null);
                 const hasBridgePorts = !!(info && Array.isArray(info.fetchProxyPorts) && info.fetchProxyPorts.length);
                 if (!hasBridgePorts) clearProxySource('bridge');
-                // Take the proxy ports from this same /health payload: re-probing
-                // separately fired two extra requests at a closed port every 10 s,
-                // and the browser logs each refused connection to the console.
+
                 try {
                     if (info && (Array.isArray(info.fetchUpstreams) || info.upstream)) {
                         setProxyUpstreams(info.fetchUpstreams, info.upstream);
@@ -5531,14 +6170,12 @@
             infoMokuro.textContent = mokuroDetailText;
             bridgeOnline = ok && !mokuroMissing;
             if (ok && mokuroMissing) {
-                // Bridge up but no OCR engine: block OCR, show a red alert.
                 dot.className = 'bwdd-indicator-dot offline';
                 mokuroAlert.style.display = 'block';
                 mokuroAlert.textContent = 'Mokuro is not installed on this machine. ' +
                     'OCR cannot run until you install it — e.g. run “pip install mokuro” (or point ' +
                     'the bridge at your mokuro checkout) in the mokuro-bridge folder, then restart the bridge.';
             } else if (ok && bridgeBusy) {
-                // Bridge is working (OCR/upload), amber dot + reason.
                 dot.className = 'bwdd-indicator-dot busy';
                 mokuroAlert.style.display = 'none';
             } else {
@@ -5547,18 +6184,14 @@
             }
             if (ok && bridgeReachableNow && !mokuroMissing) {
                 destWrap.style.display = 'flex';
-                // Refresh the destination list only while idle: mid-run the
-                // dropdown must keep exactly the pick the run started with
-                // (the run reads it again at finalize time).
+
                 if (!runBusy) { try { populateDestMethods(); } catch (e) {} }
                 if (bridgeBusy) {
-                    // While the bridge is busy, say what it's doing instead of
-                    // re-asserting "online" (the dot is already amber).
+
                     bridgeText.textContent = 'Mokuro Bridge busy — ' + (busyReason({ busy: true, busy_stage: bridgeBusyStage, busy_detail: bridgeBusyDetail }) || 'working');
                     bridgeRow.title = 'mokuro-bridge: ' + (bridgeBusyDetail ? bridgeBusyDetail + ' · ' : '') + 'github.com/GolyBidoof/mokuro-bridge';
                 } else {
-                    // Idle: describe the destination from the panel's own pick, so
-                    // the status line cannot contradict what finalize will use.
+
                     try {
                         const hasOptions = !!(destSelect.options && destSelect.options.length);
                         const method = hasOptions ? (destSelect.value || 'local') : 'local';
@@ -5586,12 +6219,9 @@
                     ? 'Mokuro Bridge is online but mokuro is missing — install it to enable OCR'
                     : 'Mokuro Bridge is not found on port 62642 — start it to enable OCR';
             }
-            // OCR button + destination pickers derive from the run lock, so this
-            // periodic tick can never re-enable them mid-run.
+
             setRunLock(runBusy);
-            // Poll fast (1 s) while the bridge is busy - ours or background work
-            // it reports via /health - so the UI notices the moment it goes idle;
-            // otherwise settle to 10 s.
+
             bridgePollFast = !!(bridgeBusy || runBusy);
             laneBridgeOnline = bridgeReachableNow;
             renderCapabilities();
@@ -5609,8 +6239,6 @@
         const statsEl = document.createElement('div');
         statsEl.className = 'bwdd-cards';
 
-        // Run status area: live region so screen readers announce new
-        // outcome/warning messages the moment they land here.
         const details = document.createElement('div');
         details.className = 'bwdd-hint-box';
         details.setAttribute('aria-live', 'polite');
@@ -5629,8 +6257,7 @@
 
             const track = document.createElement('div');
             track.className = 'bwdd-bar-track';
-            // faint background segment (used by the Mokuro bar to show "received
-            // but not yet OCR'd"); stays 0-width for the other bars
+
             const fillBg = document.createElement('div');
             fillBg.className = 'bwdd-bar-fill-bg';
             fillBg.style.width = '0%';
@@ -5653,8 +6280,6 @@
         const barDescramble = mkBar('2. Tile Descramble', 'linear-gradient(90deg, #3b82f6, #1d4ed8)', 'Descramble Progress');
         const barMokuro = mkBar('3. Mokuro Bridge', 'linear-gradient(90deg, #f59e0b, #d97706)', 'OCR Pipeline Progress');
         const barUpload = mkBar('4. Upload', 'linear-gradient(90deg, #8b5cf6, #6d28d9)', 'Upload Progress');
-        // What each bar counts (hover/AT hint; the Mokuro rate reads done/received/total,
-        // and the faint amber underlay is pages the bridge received but hasn't OCR'd yet).
         barDownload.wrap.title = 'Pages fetched from ' + siteLabel() + '\u2019s CDN';
         barDescramble.wrap.title = 'Pages reassembled from their scrambled tiles';
         barMokuro.wrap.title = 'Pages OCR\u2019d / pages received by the bridge / total pages \u2014 faint amber = received but not yet OCR\u2019d';
@@ -5683,13 +6308,6 @@
 
         btnRow.append(btnZip, btnOcr);
 
-        // --- Archive name (above the download buttons) ---------------------
-        // One compact row (label + textbox + "?" tooltip button) that sets the
-        // name of the archive the buttons below generate: the .zip "Save as ZIP"
-        // downloads, or the volume the bridge stores/uploads (.cbz) when OCR
-        // runs. Auto-filled with this book's displayed title and refreshed when
-        // the reader moves to another book, but a name the user typed is never
-        // overwritten; empty = back to the default.
         const nameWrap = document.createElement('div');
         nameWrap.className = 'bwdd-name';
         const nameLabel = document.createElement('label');
@@ -5712,7 +6330,7 @@
         nameInfoDot.setAttribute('aria-controls', 'bwdd-archive-name-pop');
         nameInfoDot.title = 'What this field does';
         nameInfoDot.textContent = '?';
-        // The popover overlays the buttons below rather than taking layout space.
+
         const namePop = document.createElement('div');
         namePop.className = 'bwdd-name-pop';
         namePop.id = 'bwdd-archive-name-pop';
@@ -5726,7 +6344,6 @@
         namePopP3.textContent = 'ZIP pages sit flat inside the archive; OCR uploads still land under the series folder. Invalid file-name characters are stripped.';
         namePop.append(namePopP1, namePopP2, namePopP3);
         nameWrap.append(nameLabel, nameInput, nameInfoDot, namePop);
-        // Click the "?" to toggle the popover; click elsewhere to dismiss it.
         function setArchivePop(open) {
             if (open) placePopover(namePop, nameWrap, 'right');
             else namePop.hidden = true;
@@ -5736,23 +6353,14 @@
             e.stopPropagation();
             setArchivePop(namePop.hidden);
         });
-        // Hoisted declaration so the panel's close button can detach it.
+
         function onNameDocClick(e) {
             if (!namePop.hidden && !nameWrap.contains(e.target)) setArchivePop(false);
         }
         document.addEventListener('click', onNameDocClick);
 
-        // The default the field was last auto-filled with (null = never, or the
-        // user has typed their own name since), so syncArchiveDefault can tell
-        // "still showing the auto default" from "user's own text".
         let archiveAutoDefault = null;
-        // Keep the field's default in sync with the book shown in the reader and
-        // return the effective archive name for the current run (never empty):
-        //   • Empty field → fill with this book's default.
-        //   • Field still holding the previous auto default → swap in the new one.
-        //   • Anything the user typed → never touched.
-        // Self-corrects while the title arrives in stages (document.title first,
-        // then the richer state.cti).
+
         function syncArchiveDefault(rawTitle) {
             const dflt = archiveDefaultName(rawTitle);
             const cur = nameInput.value;
@@ -5770,12 +6378,9 @@
             return dflt || fsSafePath(siteCid() || '') || 'book';
         }
 
-        // --- Upload destination picker (OCR mode) ---
-        // Lets the user choose where mokuro-bridge stores the finished volume, per
-        // request: any configured remote method, or 'local' + a directory.
         const destWrap = document.createElement('div');
         destWrap.className = 'bwdd-dest';
-        destWrap.style.display = 'none';   // shown only while the bridge is running
+        destWrap.style.display = 'none';
         const destLabel = document.createElement('label');
         destLabel.className = 'bwdd-dest-label';
         destLabel.textContent = 'Mokuro output destination';
@@ -5797,9 +6402,7 @@
         localDirInput.className = 'bwdd-dest-input';
         localDirInput.placeholder = 'absolute path on this computer — e.g. C:\\Users\\you\\manga or /home/you/manga';
         localDirInput.title = 'Where mokuro-bridge should write the finished volume. This is a path on the machine running the bridge (your computer).';
-        // A web page cannot read your filesystem path via a folder picker
-        // (showDirectoryPicker yields an opaque handle), so we fill the path from
-        // the bridge's own configured output_dir and let you edit it freely.
+
         const localDirFill = document.createElement('button');
         localDirFill.type = 'button';
         localDirFill.className = 'bwdd-btn-fill';
@@ -5817,23 +6420,16 @@
         destHint.style.display = 'none';
         destWrap.append(destLabel, destSelect, localDirRow, destHint);
 
-        // Which method the user actually picked, kept separate from
-        // destSelect.value because populateDestMethods() rebuilds the dropdown on
-        // every 10s bridge-health tick: a refresh that cannot represent the
-        // current pick must not forget it and fall back to the default forever.
         let userMethod = null;
-        // A value is "usable" only when it maps to a configured, enabled option
-        //, an unconfigured provider is selectable (to read its setup hint) but
-        // must never be restored/seeded as the effective destination.
+
         const hasUsableOption = (v) => v != null && [...destSelect.options]
             .some(o => o.value === v && !o.disabled && !(o.dataset && o.dataset.unconfigured));
 
         async function populateDestMethods() {
             const methods = await fetchUploadMethods().catch(() => null);
-            // A run may have started while this fetch was in flight: never
-            // repopulate (and thereby change) the pick it will finalize with.
+
             if (runBusy) return;
-            const prevValue = destSelect.value;   // keep the user's visible pick
+            const prevValue = destSelect.value;
             destSelect.textContent = '';
             let def = 'local';
             if (methods && Array.isArray(methods.methods) && methods.methods.length) {
@@ -5846,9 +6442,7 @@
                     } else if (m.configured) {
                         opt.textContent = m.name + (m.current_folder ? ' — ' + m.current_folder : '');
                     } else {
-                        // Unconfigured methods stay selectable so the user can read
-                        // about them: choosing one shows the setup hint below and
-                        // disables OCR until the provider is set up.
+
                         opt.textContent = m.name + ' — needs setup';
                         opt.dataset.unconfigured = '1';
                         opt.title = 'Not set up yet — enable it once in the mokuro-bridge terminal (from its folder): python server.py --setup-upload ' + (m.id || '');
@@ -5862,19 +6456,14 @@
                     destSelect.appendChild(opt);
                 }
             }
-            // Seed the remembered method from localStorage on the first
-            // population; later rebuilds preserve the visible pick instead.
+
             if (!userMethod && !prevValue) {
                 try {
                     const saved = localStorage.getItem('bwdd-upload-method');
                     if (saved && hasUsableOption(saved)) userMethod = saved;
                 } catch (e) {}
             }
-            // Pick the value to show after the rebuild:
-            //   1. the current selection, if it still exists (a "needs setup" pick
-            //      must survive a tick so its hint keeps showing),
-            //   2. else the remembered usable method (seeded from localStorage),
-            //   3. else the bridge's usable default, else 'local'.
+
             let picked = null;
             if (prevValue) {
                 const stillThere = [...destSelect.options].some(o => o.value === prevValue);
@@ -5905,15 +6494,11 @@
             updateDestHint();
             refreshOcrButton();
         }
-        // Whether the destination currently chosen in the dropdown is one the
-        // bridge hasn't been set up for yet.
         function selectedNeedsSetup() {
             const o = destSelect.selectedOptions && destSelect.selectedOptions[0];
             return !!(o && o.dataset && o.dataset.unconfigured);
         }
-        // OCR button availability = not busy ∧ bridge online ∧ destination is
-        // actually usable. While a not-yet-configured destination is selected
-        // the button is disabled so a run can't start toward a dead end.
+
         function refreshOcrButton() {
             const blockedBySetup = selectedNeedsSetup();
             btnOcr.disabled = runBusy || !bridgeOnline || blockedBySetup;
@@ -5922,10 +6507,6 @@
                 ? 'This destination is not set up yet — run the command below once, then it will be usable here.'
                 : ((runBusy || bridgeOnline) ? btnOcrTip : 'Start the Mokuro Bridge to enable OCR');
         }
-        // The setup hint is tied to the selection: it appears only when the
-        // chosen destination isn't configured yet (and the OCR button stays
-        // disabled until it is). Once the provider is set up, the next health
-        // tick lists it as configured and the hint disappears.
         function updateDestHint() {
             const selOpt = destSelect.selectedOptions && destSelect.selectedOptions[0];
             if (!selOpt || !selOpt.dataset || !selOpt.dataset.unconfigured) {
@@ -5944,19 +6525,30 @@
         localDirInput.addEventListener('change', () => { try { localStorage.setItem('bwdd-local-dir', localDirInput.value); } catch (e) {} });
         try { const saved = localStorage.getItem('bwdd-local-dir'); if (saved) localDirInput.value = saved; } catch (e) {}
         populateDestMethods();
-        // --- Run-state lock --------------------------------------------------
-        // While a run is in progress the action buttons and the destination
-        // section are disabled: no second download, and no changing the
-        // destination an OCR run re-reads at finalize time.
-        let bridgeOnline = false;   // last known bridge /health result
-        let runBusy = false;        // a download/OCR run is in progress
 
+        let bridgeOnline = false;
+        let runBusy = false;
+
+        let unloadGuardArmed = false;
+        function onBeforeUnload(e) {
+            e.preventDefault();
+
+            e.returnValue = '';
+            return '';
+        }
+        function setUnloadGuard(active) {
+            if (active === unloadGuardArmed) return;
+            unloadGuardArmed = active;
+            try {
+                if (active) window.addEventListener('beforeunload', onBeforeUnload);
+                else window.removeEventListener('beforeunload', onBeforeUnload);
+            } catch (e) {}
+        }
         function setRunLock(busy) {
             runBusy = busy;
+            setUnloadGuard(busy);
             btnZip.disabled = busy;
             btnZip.setAttribute('aria-disabled', String(busy));
-            // OCR availability folds in the destination-setup state too, see
-            // refreshOcrButton (kept in sync on every selection change).
             refreshOcrButton();
             const destLocked = busy || !bridgeOnline;
             destSelect.disabled = destLocked;
@@ -5971,9 +6563,7 @@
                 destWrap.removeAttribute('aria-busy');
                 destWrap.title = '';
             }
-            // Closing or flapping the panel mid-run would orphan the pipeline
-            // (auth timers, OCR polls, the finalize stream) that keeps posting
-            // into a detached DOM, hold both header buttons until it finishes.
+
             closeBtn.disabled = busy;
             flapBtn.disabled = busy;
             if (busy) {
@@ -5985,9 +6575,6 @@
             }
         }
 
-        // Post-run actions, "Open Reader Mokuro" + "Open stored file / Copy path":
-        // one quiet row of secondary (ghost) buttons after a successful OCR run,
-        // each spanning the row when the other has nothing to offer (grid auto-fit).
         const postRunRow = document.createElement('div');
         postRunRow.className = 'bwdd-reader-row';
         postRunRow.style.display = 'none';
@@ -6077,18 +6664,11 @@
             syncPostRunRow();
         }
 
-        // Two-column layout: download & bridge controls on the left, reading stats
-        // on the right. The stats column mounts only once the first card lands in
-        // statsEl; until then the panel is a single controls column.
-        // ---- pre-flight readout ------------------------------------------
-        // These numbers live in the bridge row's "?" popover, not the panel body:
-        // they matter before a run, but not often enough to earn permanent space.
         function renderCapabilities() {
             const c = capabilitySummary();
             connSection.classList.toggle('on', c.bridgeOnline);
             connSection.classList.toggle('off', !c.bridgeOnline);
-            // "no bridge", not "page only": the count can still include the GM and
-            // trailing-dot lanes, so naming just the page lane would be wrong.
+
             const speed = c.bridgeOnline ? c.ports + ' ports'
                 : (c.ports ? 'bridge offline' : 'no bridge');
             connNumbers.textContent = speed + ' · ' + c.effectiveSockets +
@@ -6101,13 +6681,19 @@
                     'this run has up to ' + c.sockets + ' network sockets instead of ' +
                     c.withoutBridge + '. Up to ' + c.decodePages + ' pages decode concurrently; ' +
                     'the fetch window is bounded separately to avoid retaining the whole volume.';
+
+                if (c.socketsClamped) {
+                    explain += ' Those ports would add up to ' + c.rawSockets + ', but the browser ' +
+                        'caps a profile at ' + CHROMIUM_SOCKETS_PER_PROCESS + ' sockets in total, so ' +
+                        'the run uses ' + c.sockets + ' and keeps ' + CONTROL_PLANE_SOCKET_RESERVE +
+                        ' in reserve for the manifest, policy refresh and bridge checks.';
+                }
             } else if (c.ports) {
                 explain = 'mokuro-bridge answered earlier (' + c.ports + ' ports) but is not ' +
                     'reachable now, so this run would use ' + c.effectiveSockets + ' connections. ' +
                     'Restart it to get the extra ports back.';
             } else {
-                // Quote the real count, not "6": the GM and trailing-dot lanes
-                // already add more than the page's own 6.
+
                 explain = 'mokuro-bridge is not running, so this run uses ' + c.effectiveSockets +
                     ' browser connections. Starting it adds its advertised local ports, ' +
                     'worth up to six connections each. Downloads work the same either way.';
@@ -6116,7 +6702,6 @@
                 workerBatchSize(IMAGE_CODEC.type) + ' page each concurrently as they arrive; that number follows your CPU, not the bridge.';
         }
 
-        // ---- page image format (advanced, collapsed) ----------------------
         const fmtDetails = document.createElement('details');
         fmtDetails.className = 'bwdd-fmt';
         const fmtSummary = document.createElement('summary');
@@ -6169,8 +6754,7 @@
                 } catch (e) {}
             }
             const c = refreshImageCodec();
-            // Quality does nothing for the lossless settings, so hide it rather
-            // than offer a control with no effect.
+
             qCtl.row.style.display = c.lossless ? 'none' : 'flex';
             fmtSummary.textContent = 'Image format · ' + FORMAT_LABELS[c.fmt] +
                 (c.lossless ? '' : ' q' + c.quality);
@@ -6180,7 +6764,6 @@
             renderCapabilities();
         }
 
-        // Reflect whatever is already configured (console or a previous visit).
         {
             const wantedFmt = IMAGE_CODEC.fmt;
             if (![...fmtCtl.sel.options].some(o => o.value === wantedFmt)) {
@@ -6216,15 +6799,12 @@
         const colSep = document.createElement('div');
         colSep.className = 'bwdd-col-sep';
 
-        // Mount the stats column (+ separator) and widen the panel to its
-        // two-column size the moment the first card lands.
         function mountStatsColumn() {
             const manual = parseFloat(root.style.width);
             const manualWide = isFinite(manual) && manual >= 620;
             body.append(colSep, colStats);
             root.classList.add('bwdd-stats-visible');
-            // A manual width only sticks once it is wide enough for two columns;
-            // otherwise fall back to the auto two-column width.
+
             if (!manualWide) root.style.width = '';
         }
         let statsMounted = false;
@@ -6235,43 +6815,35 @@
             mountStatsColumn();
         });
         statsObs.observe(statsEl, { childList: true });
-        if (statsEl.childElementCount) { statsMounted = true; mountStatsColumn(); }   // safety net
+        if (statsEl.childElementCount) { statsMounted = true; mountStatsColumn(); }
 
         body.append(colMain);
         root.append(head, body);
         document.documentElement.appendChild(root);
-        // updateBridgeDot() ran above, before root was connected, and bailed at
-        // the `!root.isConnected` guard, so refresh it now instead of waiting for
-        // the first 10 s interval tick.
+
         try { updateBridgeDot(); } catch (e) {}
 
-        // "Flap": slide the whole panel off the right edge of the screen. A
-        // small tab stays docked on the right edge to bring it back.
         const edgeTab = document.createElement('button');
         edgeTab.type = 'button';
         edgeTab.className = 'bwdd-edge-tab';
         edgeTab.setAttribute('aria-label', 'Show the ' + sitePanelTitle() + ' panel');
         edgeTab.title = 'Show the ' + sitePanelTitle() + ' panel';
-        edgeTab.textContent = '\u00AB';   // fancy "<<", pull the panel back in from the right
+        edgeTab.textContent = '\u00AB';
         edgeTab.style.display = 'none';
         document.documentElement.appendChild(edgeTab);
 
         function flapOut() {
-            if (edgeTab.style.display === 'flex') return;   // already away
+            if (edgeTab.style.display === 'flex') return;
             const r = root.getBoundingClientRect();
-            // Push the panel fully past the right edge. Its left/top position is
-            // untouched, so clearing the transform returns it exactly where it was.
+
             const shift = Math.max(24, Math.ceil(window.innerWidth - r.left) + 4);
             root.style.transform = 'translateX(' + shift + 'px)';
             root.classList.add('bwdd-flapped');
             root.setAttribute('aria-hidden', 'true');
-            // inert takes every control out of the tab order / a11y tree, so a
-            // keyboard user can't Tab into invisible controls (aria-hidden
-            // alone does not do that).
+
             root.inert = true;
-            // Anchor the restore tab to the panel's own vertical span, so a
-            // bottom-docked panel leaves its tab near the bottom edge.
-            const tabH = 76;   // .bwdd-edge-tab height
+
+            const tabH = 76;
             const vh = window.innerHeight || document.documentElement.clientHeight || 800;
             const tabTop = Math.max(0, Math.min(r.top + (r.height - tabH) / 2, vh - tabH - 8));
             edgeTab.style.top = tabTop + 'px';
@@ -6285,7 +6857,7 @@
             root.classList.remove('bwdd-flapped');
             root.style.transform = '';
             root.removeAttribute('aria-hidden');
-            root.inert = false;   // restore tab order + focusability
+            root.inert = false;
             edgeTab.style.display = 'none';
             flapBtn.setAttribute('aria-expanded', 'true');
             flapBtn.setAttribute('aria-label', 'Hide the panel to the right edge');
@@ -6294,7 +6866,6 @@
         edgeTab.addEventListener('click', () => flapIn());
         flapBtn.onclick = () => flapOut();
 
-        // --- Manual resize (corner handle) + remembered width -------------
         const resizeHandle = document.createElement('div');
         resizeHandle.className = 'bwdd-resize';
         resizeHandle.setAttribute('aria-hidden', 'true');
@@ -6320,14 +6891,13 @@
             e.preventDefault();
             e.stopPropagation();
             const r = root.getBoundingClientRect();
-            // Anchor by the top-left so the bottom-right corner follows the
-            // pointer while resizing (works for both docked and dragged states).
+
             root.style.left = r.left + 'px';
             root.style.top = r.top + 'px';
             root.style.right = 'auto';
             resizing = true;
             resizeStartX = e.clientX; resizeStartY = e.clientY;
-            resizeStartW = r.width;   resizeStartH = r.height;
+            resizeStartW = r.width; resizeStartH = r.height;
             try { resizeHandle.setPointerCapture(e.pointerId); } catch (err) {}
         });
         resizeHandle.addEventListener('pointermove', (e) => {
@@ -6340,8 +6910,7 @@
             const maxW = Math.max(minW, Math.min(1200, vw - left - 12));
             const w = Math.max(minW, Math.min(maxW, resizeStartW + (e.clientX - resizeStartX)));
             root.style.width = Math.round(w) + 'px';
-            // The panel is top-anchored, so growing downward is what the user
-            // expects; clamp to the viewport too.
+
             const minH = resizeMinH();
             const maxH = Math.max(minH, Math.min(1000, vh - top - 12));
             const h = Math.max(minH, Math.min(maxH, resizeStartH + (e.clientY - resizeStartY)));
@@ -6370,7 +6939,6 @@
         } catch (e) {}
         try { if (localStorage.getItem(PANEL_COLLAPSED_KEY) === '1') setCollapsed(true); } catch (e) {}
 
-        // Draggable Functionality (pointer + keyboard; Esc collapses)
         let dragging = false;
         let dragPointerId = null;
         let pos = { x: 0, y: 0 };
@@ -6387,8 +6955,7 @@
             root.style.top = clampPanelY(clientY - pos.y) + 'px';
             root.style.right = 'auto';
         }
-        // Pointer events cover mouse, touch and pen (with capture so the drag keeps
-        // tracking even when the pointer leaves the header).
+
         head.addEventListener('pointerdown', (e) => {
             if (e.pointerType === 'mouse' && e.button !== 0) return;
             if (e.target.closest('button, a')) return;
@@ -6416,19 +6983,12 @@
             dragging = false;
             dragPointerId = null;
         });
-        // The panel deliberately does NOT capture arrow keys: the viewer uses
-        // Left/Right to flip pages, so arrow handling must never be eaten or
-        // preventDefault'ed while the panel holds focus. Reposition by dragging the
-        // header, resize with the corner grip.
 
-        // Keyboard shortcut: Escape toggles collapse. Named so the close button can
-        // remove it: a closed panel must not keep a window-level listener alive.
         function onPanelKeydown(e) {
             if (e.key !== 'Escape') return;
-            // An open archive-name popover is closed by Esc first, then a second
-            // Esc collapses the panel as usual.
+
             if (!namePop.hidden) { setArchivePop(false); return; }
-            // don't hijack Esc while the user is typing in a form control
+
             const t = e.target;
             if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable)) return;
             if (document.contains(root) && !e.defaultPrevented) {
@@ -6437,15 +6997,12 @@
         }
         window.addEventListener('keydown', onPanelKeydown);
 
-        // Exposed last: this names elements (fmtCtl/qCtl) created further down, so
-        // publishing it any earlier hits the TDZ and exports nothing.
         if (BWDD_DEBUG) {
             try {
                 window.__bwddUI = Object.assign(window.__bwddUI || {}, {
                     populateDestMethods, onDestChange,
                     renderCapabilities, capabilitySummary, workerPoolSize, discoverProxyPorts,
                     fmtSelect: fmtCtl.sel, qSelect: qCtl.sel,
-                    // programmatic control, for tests and console use
                     setImageFormat(fmt, quality) {
                         if (fmt) fmtCtl.sel.value = fmt;
                         if (quality != null) qCtl.sel.value = String(quality);
@@ -6455,12 +7012,9 @@
                 });
             } catch (e) { try { console.error('[bwdd] UI export failed:', safeLogText(e)); } catch (e2) {} }
         }
-        return { root, details, statsEl, barWrap, barDownload, barDescramble, barMokuro, barUpload, btnZip, btnOcr, destSelect, localDirInput, destHint, populateDestMethods, setRunLock, showReaderButton, hideReaderButton, showStoredButton, hideStoredButton, syncArchiveDefault };
+        return { root, details, statsEl, barWrap, barDownload, barDescramble, barMokuro, barUpload, btnZip, btnOcr, btnRow, nameWrap, destSelect, localDirInput, destHint, populateDestMethods, setRunLock, showReaderButton, hideReaderButton, showStoredButton, hideStoredButton, syncArchiveDefault };
     }
 
-    // Three-value Mokuro progress: done / received / total.
-    // fillBg (faint) = pages received by the bridge; fill (solid) = pages
-    // actually OCR'd. No flicker, every update sets all three consistently.
     function updateMokuroBar(bar, done, received, total) {
         if (!bar || !bar.fill) return;
         const t = total || 1;
@@ -6481,9 +7035,7 @@
         bar.fill.setAttribute('aria-valuetext', `${p}% complete`);
         if (text != null) bar.labRate.textContent = text;
     }
-    // Build (but don't insert) the collapsible raw-error block; returns null
-    // when there is nothing to show. Both setRunDetails and the success paths
-    // use it so recovered/retried errors surface without dominating the copy.
+
     function makeTechDetails(rawLines, label) {
         const lines = (rawLines || []).filter(Boolean);
         const capped = lines.slice(0, 15);
@@ -6497,9 +7049,6 @@
         det.append(sum, pre);
         return det;
     }
-    // Show a run outcome in the status area: a plain summary plus (when the
-    // caller has raw per-page error lines) a collapsible "technical details"
-    // block so the raw internals never dominate the message.
     function setRunDetails(el, summary, rawLines) {
         if (!el) return;
         el.textContent = '';
@@ -6507,8 +7056,6 @@
         const det = makeTechDetails(rawLines);
         if (det) el.appendChild(det);
     }
-    // Append diagnostics to an already-set status line (used when a run fully
-    // succeeded but some pages needed retries, nothing silently swallowed).
     function appendRunDetails(el, rawLines, label) {
         if (!el) return;
         const det = makeTechDetails(rawLines, label);
@@ -6522,18 +7069,9 @@
         setBar(ui.barDescramble, 0, '0%');
     }
 
-    // =====================================================================
-    // 13. Orchestration & Token Lifecycle
-    // =====================================================================
-    let authRefreshPromise = null;
+let authRefreshPromise = null;
     let pbCounter = 0;
-    // Refresh the CloudFront auth policy, coalesced so concurrent callers share
-    // one in-flight request. A fresh public viewer must use its native opening
-    // exchange first; rolling renewal uses the viewer's bookmark channel:
-    //   'c' , GET /browserWebApi/c with the params the viewer sends when
-    //          opening a book; a fresh reply replaces auth/baseUrl/cti.
-    //   'pb', POST a reading-position bookmark to the viewer's own
-    //          token-renewal channel; only used after capture starts.
+
     function refreshAuthOnce(mode) {
         if (!authRefreshPromise) {
             authRefreshPromise = (async () => {
@@ -6564,8 +7102,7 @@
                     }, isPublicBootstrapPage() ? 12000 : 20000);
                     d = await res.json();
                     if (d && d.auth_info) {
-                        // pb merges over the current auth; only a changed
-                        // policy/signature resets the request-count budget.
+
                         const before = authPolicySig();
                         state.auth = Object.assign({}, state.auth || {}, d.auth_info);
                         if (authPolicySig() !== before) resetAuthBudget();
@@ -6574,11 +7111,7 @@
                     const cr = Math.floor(Math.random() * 9e18);
                     const u1 = getU1();
                     const bid = getBID();
-                    // The native viewer's opening exchange sends only cid/BID/cr.
-                    // It has no u1 cookie on this route, so u1 is optional and must
-                    // never fail the request closed. (The previous guard returned a
-                    // fabricated status 503 whenever u1 was absent, which is why the
-                    // free-volume capture never reached the server.)
+
                     let url = apiBase() + '/browserWebApi/c?cid=' + encodeURIComponent(state.cid);
                     if (u1) url += '&u1=' + encodeURIComponent(u1);
                     url += '&BID=' + encodeURIComponent(bid) + '&cr=' + cr;
@@ -6592,10 +7125,7 @@
                 }
                 return d;
             })();
-            // Attach both cleanup branches explicitly. A bare finally() returns
-            // a second promise that can become an unhandled rejection when the
-            // refresh request itself fails, even though its caller catches the
-            // original promise.
+
             authRefreshPromise.then(
                 () => { authRefreshPromise = null; },
                 () => { authRefreshPromise = null; }
@@ -6718,12 +7248,13 @@
     }
 
     async function ensureStateFresh() {
-        // The CLI intentionally defers the wrappers until the document-start
-        // viewer bootstrap has passed. Activate them here, before inspecting
-        // resources and issuing explicit auth/manifest refreshes, so later
-        // viewer requests are still captured without wrapping bootstrap itself.
+
         if (shouldDeferNetworkCapture()) {
             try { installNetworkCapture(); } catch (_) {}
+        }
+
+        if (bwHeadlessWanted()) {
+            await bwHeadlessOpenFree(bwHeadlessCid());
         }
         snapshotViewerResources();
         const publicBootstrap = (() => {
@@ -6763,10 +7294,7 @@
                 }
             } catch (e) {}
             if (!state.auth || !state.baseUrl) {
-                // A fresh viewer boot obtains its signed CloudFront policy from
-                // /c. Do not send a synthetic bookmark (and advance a public
-                // reader's position) before that first native auth exchange.
-                // /pb remains the rolling renewal path after capture starts.
+
                 const cFirst = publicBootstrap && (publicBootstrap.route === 'free' || location.hostname.indexOf('trial') === -1);
                 if (cFirst) {
                     try { d = await refreshAuthViaC(); } catch (e) { d = null; }
@@ -6780,11 +7308,7 @@
                         if (e && e.status != null) attemptStatuses.push(String(e.status));
                     }
                 }
-                // v1.5.1 called /c at most once per sequence, and only after /pb
-                // had left us still missing (see the nested guards in its run
-                // loop). When cFirst already made that call above, this would be
-                // a second identical request; && binds tighter than ||, so the
-                // still-missing guard needs its own parentheses to mean that.
+
                 if ((!state.auth || !state.baseUrl) && !cFirst) {
                     try { d = await refreshAuthViaC(); } catch (e) { d = null; }
                     if (d && d.status != null) attemptStatuses.push(String(d.status));
@@ -6818,7 +7342,8 @@
             state.configFromUrl = state.baseUrl;
         }
     }
-    async function uploadCoverEarly(opts) {
+
+async function uploadCoverEarly(opts) {
         const { ui, barUpload, feed, mokuroSessionId, safeTitle, blob } = opts;
         if (!mokuroSessionId || !blob) return null;
         const plan = await resolveUploadChoice(ui).catch(() => ({ method: null, label: null, localDir: null }));
@@ -6826,30 +7351,22 @@
         try {
             barUpload.labName.textContent = '4. ' + (plan.method === 'local' ? 'Store' : 'Upload');
             barUpload.wrap.style.display = 'flex';
-            // Seed the 1-file plan up front so the bar reads "1/1 · 0%" from
-            // the very first moment (no bare "0%" without a file count).
+
             if (feed.seed) feed.seed([{ file: coverName, total_bytes: blob.size }]);
             feed({ file: coverName, currentBytes: 0, totalBytes: blob.size, percent: 0 });
             const res = await mokuroUploadCover(mokuroSessionId, blob, { method: plan.method || null, localDir: plan.localDir });
             feed({ file: res && res.file ? res.file : coverName, currentBytes: res && res.size ? res.size : blob.size, totalBytes: res && res.size ? res.size : blob.size, percent: 100 });
             return res;
         } catch (e) {
-            // A failed early cover must never break the download/OCR run.
+
             if (BWDD_DEBUG) console.warn('[bwdd] Early cover upload skipped:', safeLogText(e && e.message || e));
             return null;
         }
     }
 
-    // Finalize phase shared by the trial and full OCR pipelines (kept in one
-    // place so the two paths can never drift apart again): ask the bridge to
-    // finalize the session (store locally or upload), stream live byte/percent
-    // progress into the Store/Upload bar via the NDJSON frames, and keep the
-    // Mokuro bar polled until the stream closes. Returns { result, plan }.
     async function finalizeOcrSession(mokuroSessionId, ui, barUpload, barMokuro, total, sharedFeed, options = {}) {
         const plan = await resolveUploadChoice(ui).catch(() => ({ method: null, label: null, localDir: null }));
-        // The 4th stage only uploads when the destination is remote, so name the
-        // bar honestly. If the early cover upload already started this feed, keep
-        // the visible progress and just seed the rest.
+
         barUpload.labName.textContent = '4. ' + (plan.method === 'local' ? 'Store' : 'Upload');
         const uploadFeed = sharedFeed || makeUploadBarUpdater(barUpload);
         if (!sharedFeed || !sharedFeed.hasAny || !sharedFeed.hasAny()) {
@@ -6857,14 +7374,17 @@
             setBar(barUpload, 0, '0%');
         }
         const result = await new Promise((resolve, reject) => {
-            const fp = mokuroFinalize(mokuroSessionId, { method: plan.method || null, localDir: plan.localDir }, (stage, msg) => {
+            const fp = mokuroFinalize(mokuroSessionId, {
+                method: plan.method || null,
+                localDir: plan.localDir,
+
+                overwrite: options.overwrite || null,
+            }, (stage, msg) => {
                 if (stage === 'upload_progress' || stage === 'upload') barUpload.wrap.style.display = 'flex';
-                // The initial "upload" frame announces every file + size, so
-                // pre-size the bar before the first byte arrives.
+
                 if (stage === 'upload' && msg && Array.isArray(msg.files) && uploadFeed.seed) {
                     uploadFeed.seed(msg.files);
                 }
-                // Keep the file count + total size on the bar when done.
                 if (stage === 'done' && uploadFeed.summary) {
                     const s = uploadFeed.summary();
                     if (barUpload.wrap.style.display === 'flex' && s.total > 0) {
@@ -6875,14 +7395,10 @@
                 }
                 if (options.automation) reportRunProgress(options, 'finalize', { stage: stage || null });
             }, uploadFeed);
-            // Poll the bridge's OCR status ~2.5/s so the Mokuro bar keeps moving
-            // while the finalize stream is open; the bridge also publishes live
-            // upload progress to the same /status endpoint, which keeps the bar
-            // moving even with older bridges that buffer their NDJSON frames.
-            // Headless callers can opt out.
+
             let poll = null;
             if (options.pollBridgeStatus !== false) {
-                poll = setInterval(async () => {
+                poll = setBackgroundInterval(async () => {
                     try {
                         const st = await mokuroStatus(mokuroSessionId);
                         if (!st) return;
@@ -6902,36 +7418,14 @@
                 }, 400);
             }
             if (poll && options.registerRunCleanup) {
-                options.registerRunCleanup(() => { if (poll) { clearInterval(poll); poll = null; } });
+                options.registerRunCleanup(() => { if (poll) { clearBackgroundInterval(poll); poll = null; } });
             }
-            fp.then(r => { if (poll) { clearInterval(poll); poll = null; } resolve(r); },
-                   e => { if (poll) { clearInterval(poll); poll = null; } reject(e); });
+            fp.then(r => { if (poll) { clearBackgroundInterval(poll); poll = null; } resolve(r); },
+                   e => { if (poll) { clearBackgroundInterval(poll); poll = null; } reject(e); });
         });
         return { result, plan };
     }
 
-    // =====================================================================
-    // Shared run harness
-    // =====================================================================
-    // Driven by the CMOA and ebookjapan pipelines; BookWalker's full and trial
-    // pipelines never call it and keep their own plumbing. It owns everything the
-    // user can see and everything the Mokuro bridge is told - same bars, same
-    // progress reporting, same session/finalize conversation, same ZIP assembly
-    // and naming - so the stores cannot drift apart.
-    //
-    // What stays site-specific is only *how* pages are fetched: BookWalker's
-    // lane/worker/descramble engine and CMOA's token/quality/quality-blacklist
-    // retry loop have nothing in common, and forcing them through one generic
-    // fetch loop would mean rewriting the tuned path that already works.
-    //
-    // Usage:
-    //   const H = createRunHarness(ui, mode, options, { title, archiveName, cid });
-    //   await H.mokuro.open();          // OCR runs only
-    //   H.showBars();
-    //   ...per page: H.notePage(idx, blob, crc) / H.noteFailure(idx, message)
-    //   await H.finishZip();  |  await H.finishOcr();
-    //   return H.outcome(missing === 0);
-    //   ...always: await H.cleanup()
     function createRunHarness(ui, mode, options, meta) {
         options = options || {};
         meta = meta || {};
@@ -6948,21 +7442,12 @@
         let finishedOk = false;
         let cleanedUp = false;
 
-        // Cleanup registry. run() used to own this list; the harness owns it now
-        // so a site pipeline cannot forget to unwind a poll or a worker pool.
         const cleanups = [];
         const registerCleanup = fn => { if (typeof fn === 'function') cleanups.push(fn); };
         options.registerRunCleanup = registerCleanup;
 
-        // Hold the panel for the whole run; cleanup() releases it, and both
-        // callers (cmoa/02-run.js, ebookjapan/05-run.js) run cleanup() in a
-        // finally, so the lock cannot outlive a failed run either. Without this
-        // only BookWalker locked, and the other two stores could start a second
-        // run over the same book while the first was still fetching.
         if (typeof ui.setRunLock === 'function') ui.setRunLock(true);
 
-        // One upload-bar feed shared by the early cover upload and finalize, so
-        // the bar tracks the whole multi-file upload (cover = file 1/N).
         const uploadFeed = makeUploadBarUpdater(barUpload);
         const coverState = { fired: false };
 
@@ -6977,16 +7462,12 @@
             setBar(barDescramble, 0, '0%');
         }
 
-        // Download bar = pages fetched from the CDN; Descramble bar = pages
-        // actually processed (zipped / handed to OCR). They diverge naturally.
         function refreshProgress() {
             const done = okIdx.size;
             const dl = Math.min(fetched, total);
             setBar(barDownload, total ? (dl / total) * 100 : 0, dl + '/' + total);
             setBar(barDescramble, total ? (done / total) * 100 : 0, done + '/' + total);
-            // The Mokuro bar is owned by the bridge status poll (updateMokuroBar,
-            // done/received/total). Never write it from here or the two writers
-            // fight and the label flickers.
+
         }
 
         const bumpFetched = n => { fetched += (Number(n) || 0); refreshProgress(); };
@@ -7013,14 +7494,6 @@
             refreshProgress();
         }
 
-        // ---------------------------------------------------------------
-        // Mokuro bridge conversation
-        // ---------------------------------------------------------------
-        // Pages are streamed to the bridge in strict page order (buffered until
-        // the gaps fill) rather than in completion order: BookWalker's lane engine
-        // settles pages out of order and CMOA's retry loop skips forward, so
-        // completion order is not a reliable sequence. A failed page is skipped,
-        // which keeps the volume contiguous.
         const mokuro = (mode !== 'ocr') ? null : (() => {
             let sessionId = null;
             let safeTitle = '';
@@ -7052,9 +7525,7 @@
             }
 
             function schedule() {
-                // Keep the concurrent GUI behaviour, but serialize the headless
-                // stream so the returned promise cannot race a POST that is
-                // still in flight after the last page is decoded.
+
                 if (!options.headless) { sendOrdered(); return; }
                 chain = chain.then(sendOrdered, sendOrdered).catch(e => {
                     errors.push('OCR stream: ' + safeLogText((e && e.message) || e));
@@ -7063,7 +7534,8 @@
 
             function startPoll() {
                 if (!sessionId || poll) return;
-                poll = setInterval(async () => {
+
+                poll = setBackgroundInterval(async () => {
                     const st = await mokuroStatus(sessionId);
                     if (!st) return;
                     const done = st.pages_ocr_done ?? 0;
@@ -7073,7 +7545,7 @@
                         pageCount: got, ocrPageCount: done, total: total
                     });
                 }, 700);
-                registerCleanup(() => { if (poll) { clearInterval(poll); poll = null; } });
+                registerCleanup(() => { if (poll) { clearBackgroundInterval(poll); poll = null; } });
             }
 
             return {
@@ -7081,8 +7553,6 @@
                 get safeTitle() { return safeTitle; },
                 get sent() { return sent; },
 
-                // Opening the session is deliberately identical for both stores:
-                // same bridge health gate, same idle gate, same session title.
                 async open() {
                     barWrap.style.display = 'flex';
                     barMokuro.wrap.style.display = 'flex';
@@ -7090,9 +7560,7 @@
                     if (!(await ensureBridgeRunning(25000))) {
                         throw new Error(MOKURO_BRIDGE_OFFLINE_MSG);
                     }
-                    // Never start a capture while the bridge is still working on a
-                    // previous run, unless an automation caller owns the bridge
-                    // lifecycle and asks us to skip this wait.
+
                     if (!options.skipBridgeIdleWait && !(await waitForBridgeIdle(60000))) {
                         throw new Error('The Mokuro Bridge is still busy with a previous OCR/upload — wait for it to finish, then try again.');
                     }
@@ -7118,10 +7586,6 @@
                     if (idx === nextIdx) schedule();
                 },
 
-                // Cover = first page: push it to the destination immediately
-                // (before OCR finishes) so the folder and upload bar show life right
-                // away. Headless/deferred runs stream pages only, with no cover
-                // side effect.
                 cover(idx, blob) {
                     if (options.skipCover || idx !== 1 || coverState.fired || !sessionId) return;
                     coverState.fired = true;
@@ -7149,37 +7613,41 @@
                             errors.push('Final OCR send page ' + i + ': ' + safeLogText((e && e.message) || e));
                         }
                     }
-                    if (poll) { clearInterval(poll); poll = null; }
+
                 },
 
                 async finalize() {
                     barMokuro.wrap.style.display = 'flex';
                     const { result, plan } = await finalizeOcrSession(
                         sessionId, ui, barUpload, barMokuro, total, uploadFeed, options);
+
+                    const partial = !!(result && result.partialUpload);
+                    if (partial) errors.push(msgPartialUpload(result));
                     const missing = total - okIdx.size;
                     if (missing > 0) {
                         if (!options.headless) setRunDetails(details, msgOcrPartial(missing, total), errors);
                         return { result, plan, missing, ok: false };
                     }
                     if (!options.headless) {
-                        if (plan && plan.method === 'local') {
-                            const localPath = storedPathOf(result) || plan.localDir;
-                            if (localPath) details.textContent = msgStoredLocal(localPath);
-                        } else if (plan && plan.method) {
-                            const rp = result && (result.remote_path || result.mega_path);
-                            if (rp) details.textContent = msgUploadedTo(methodShortLabel(plan.method), rp);
+                        if (partial) {
+                            setRunDetails(details, msgPartialUpload(result), errors);
+                        } else {
+                            if (plan && plan.method === 'local') {
+                                const localPath = storedPathOf(result) || plan.localDir;
+                                if (localPath) details.textContent = msgStoredLocal(localPath);
+                            } else if (plan && plan.method) {
+                                const rp = result && (result.remote_path || result.mega_path);
+                                if (rp) details.textContent = msgUploadedTo(methodShortLabel(plan.method), rp);
+                            }
+                            if (errors.length) appendRunDetails(details, errors, 'Issues during the run');
                         }
-                        if (errors.length) appendRunDetails(details, errors, 'Issues during the run');
                     }
-                    if (!options.headless) {
-                        ui.showReaderButton(result);
-                        ui.showStoredButton(result);
-                    }
-                    return { result, plan, missing, ok: true };
+
+                    ui.showReaderButton(result);
+                    ui.showStoredButton(result);
+                    return { result, plan, missing, ok: !partial };
                 },
 
-                // Deferred mode is deliberately page-stream-only: the external
-                // CLI owns /finalize (and any upload/delete policy) later.
                 deferred() {
                     if (runResult) {
                         runResult.pageCount = okIdx.size;
@@ -7197,14 +7665,6 @@
             };
         })();
 
-        // ---------------------------------------------------------------
-        // Page accounting
-        // ---------------------------------------------------------------
-        // A successfully fetched+processed page: counted for both bars, added to
-        // the archive, cached for a resume, and handed to OCR. Sites call this
-        // exactly once per page that produced usable output. `ext` overrides the
-        // archive extension for a page whose bytes could not be re-encoded to the
-        // selected codec (CMOA passes the real one when it kept raw bytes).
         function notePage(idx, blob, crc, ext) {
             okIdx.add(idx);
             failedIdx.delete(idx);
@@ -7224,8 +7684,6 @@
             refreshProgress();
         }
 
-        // A page served from the page cache: already correct, no fetch, no
-        // descramble, no re-upload of the source, so it counts as both.
         function noteCached(idx, blob, crc) {
             okIdx.add(idx);
             failedIdx.delete(idx);
@@ -7238,9 +7696,6 @@
             refreshProgress();
         }
 
-        // ---------------------------------------------------------------
-        // Finishing
-        // ---------------------------------------------------------------
         async function finishZip() {
             if (!zip || okIdx.size === 0) {
                 setRunDetails(details, msgAllFailedZip(), errors);
@@ -7278,19 +7733,11 @@
                 details.textContent = msgZipSaved(entries.length, fmtBytes(zipBlob.size), secs);
                 if (errors.length) appendRunDetails(details, errors, 'Issues during the run');
             }
-            // Matches the long-standing rule: an error-free run clears the page
-            // cache, any run that logged an error keeps it so the next attempt
-            // resumes instead of re-fetching the whole volume.
+
             finishedOk = errors.length === 0;
             return outcome(missing === 0);
         }
 
-        // ---------------------------------------------------------------
-        // Outcome + teardown
-        // ---------------------------------------------------------------
-        // Normalize the result object for automated callers. Sites pass whether
-        // the run was good; the page accounting is filled in here so every store
-        // reports identically.
         function outcome(ok) {
             if (!runResult) return ok;
             runResult.total = total;
@@ -7309,13 +7756,10 @@
             }
             cleanups.length = 0;
             if (finishedOk && options.usePageCache) { try { await clearPageCache(); } catch (e) {} }
-            // Guarded to match the acquire above: a reduced ui (the headless
-            // mirror) must degrade to "no lock", not throw during teardown.
+
             if (typeof ui.setRunLock === 'function') ui.setRunLock(false);
         }
 
-        // Report a thrown run: automation callers get a structured result, the
-        // panel gets the one-line message.
         function reportFailure(e) {
             const message = (e && e.message) ? safeLogText(e.message)
                 : 'something went wrong — see the browser console for details.';
@@ -7344,26 +7788,7 @@
             details,
         };
     }
-    // =====================================================================
-    // Site adapters — one userscript, three stores
-    // =====================================================================
-    // A site adapter supplies only the four things that genuinely differ between
-    // the stores: detection (which store is this page?), metadata (title,
-    // series/volume, page count, archive name), page enumeration (what to fetch,
-    // in reading order), and fetch + descramble (one page → finished image Blob).
-    // Everything else - panel, controls, bars, Mokuro conversation, stat cards,
-    // ZIP naming/assembly, page cache, headless automation - lives in core and is
-    // shared verbatim, which is what keeps the paths from drifting apart.
-    //
-    // Contract:
-    //   id, label, panelTitle      identity shown in the panel
-    //   matches()                  true when this adapter owns the page
-    //   install()                  page hooks; called once, at load
-    //   refresh()                  optional: top up metadata before it is read
-    //   getBook()                  { rawTitle, title, series, volNum } or null
-    //   getPreview()               { title, pages, resolution, type } or null
-    //   getCid()                   stable id, used for the page cache
-    //   run(ui, mode, options)     the download pipeline for this store
+
     const SITE_REGISTRY = [];
     let ACTIVE_SITE = null;
 
@@ -7372,15 +7797,32 @@
         return adapter;
     }
 
+    function storeOwnsHost() {
+        for (const adapter of SITE_REGISTRY) {
+            let owns = false;
+            try { owns = typeof adapter.ownsHost === 'function' && !!adapter.ownsHost(); } catch (e) { owns = false; }
+            if (owns) return true;
+        }
+        return false;
+    }
+
     function detectSite() {
         for (const adapter of SITE_REGISTRY) {
             let owned = false;
             try { owned = !!adapter.matches(); } catch (e) { owned = false; }
             if (owned) return adapter;
         }
-        // BookWalker is the default: it is the original site for this script,
-        // and its panel is also what a bare injected copy (tests, devtools)
-        // expects to get on a host no adapter claims.
+
+        if (isHeadlessPage()) {
+            for (const adapter of SITE_REGISTRY) {
+                let owned = false;
+                try { owned = typeof adapter.headlessMatches === 'function' && !!adapter.headlessMatches(); } catch (e) { owned = false; }
+                if (owned) return adapter;
+            }
+        }
+
+        if (storeOwnsHost()) return null;
+
         return SITE_REGISTRY.find(a => a.id === 'bookwalker') || SITE_REGISTRY[0] || null;
     }
 
@@ -7391,8 +7833,6 @@
         }
         return '';
     }
-    // detectSite() always yields an adapter, so naming one store's pipeline as a
-    // fallback here was dead code and a dependency the shared core should not have.
     function siteRun(ui, mode, options) {
         if (ACTIVE_SITE && typeof ACTIVE_SITE.run === 'function') {
             return ACTIVE_SITE.run(ui, mode, options);
@@ -7404,15 +7844,16 @@
         return (ACTIVE_SITE && ACTIVE_SITE.panelTitle) || 'BookWalker Native Downloader';
     }
 
-    // Shared panel bring-up. Both stores get the identical UI, the identical
-    // button wiring and the identical "wait for the viewer, then show the book
-    // card + reading stats" loop; only the adapter's own answers differ.
     function bootSharedPanel(site) {
         ACTIVE_SITE = site;
         installHeadlessAutomation();
-        // A headless/CLI page gets no panel, no bridge-health tick and no stats
-        // loop: the caller owns all of that.
+
         if (isHeadlessPage()) return null;
+
+        try {
+            const proto = location.protocol;
+            if (proto !== 'http:' && proto !== 'https:') return null;
+        } catch (e) {}
 
         const ui = buildUI();
         const launch = mode => {
@@ -7421,9 +7862,7 @@
                 .catch(e => {
                     const text = safeLogText((e && e.message) || e);
                     console.warn('[bwdd] ' + site.id + ' run failed: ' + text);
-                    // A rejected run must land on the panel, not only in the
-                    // console, or the bars sit at 0/0 and the click looks like it did
-                    // nothing. Un-hide the details box too.
+
                     try {
                         setRunDetails(ui.details, 'the run failed: ' + text, []);
                         if (ui.details) ui.details.hidden = false;
@@ -7442,13 +7881,10 @@
             let statsKicked = false;
             let lastStoresKey = null;
             let lastArchiveSource = null;
-            // The viewer fills its metadata in asynchronously, so poll briefly
-            // rather than reading the title once and settling for document.title.
+
             for (let i = 0; i < 40; i++) {
                 await new Promise(r => setTimeout(r, 500));
-                // Let the adapter top up its own metadata first: CMOA's viewer
-                // fills its page list in after the document is ready, so the
-                // answers below are only as good as the last refresh.
+
                 if (typeof site.refresh === 'function') {
                     try { await site.refresh(); } catch (e) {}
                 }
@@ -7465,12 +7901,7 @@
                         statsKicked = true;
                     } catch (e) {}
                 }
-                // Which other shops carry it, linked to their store pages. This
-                // re-runs when the title or volume changes rather than latching on the
-                // first pass: the viewer publishes metadata asynchronously, and a
-                // lookup fired against a placeholder title comes back "not found" at
-                // every shop. typeof, not try/catch: the availability module is in the
-                // combined build only, so the identifier may not exist at all.
+
                 if (typeof lookupAvailability === 'function' && book && (book.series || book.title)) {
                     const storesKey = String(book.series || book.title).trim() + '|' +
                         (book.volNum == null ? '' : book.volNum);
@@ -7490,7 +7921,8 @@
 
         return ui;
     }
-    async function downloadTrialZip(ui, config, contents, title, sv, mode, details, archiveName, options = {}) {
+
+async function downloadTrialZip(ui, config, contents, title, sv, mode, details, archiveName, options = {}) {
         const { barDownload, barDescramble, barMokuro, barUpload } = ui;
         const zip = mode === 'zip' ? { entries: [] } : null;
         const errors = options.errors || [];
@@ -7541,9 +7973,7 @@
             if (!(await ensureBridgeRunning(25000))) {
                 throw new Error(MOKURO_BRIDGE_OFFLINE_MSG);
             }
-            // Don't start a capture while the bridge is still working on a
-            // previous run, unless the automation caller explicitly owns the
-            // bridge lifecycle and asks us to skip this global wait.
+
             if (!options.skipBridgeIdleWait && !(await waitForBridgeIdle(60000))) {
                 throw new Error('The Mokuro Bridge is still busy with a previous OCR/upload — wait for it to finish, then try again.');
             }
@@ -7561,7 +7991,8 @@
                 sessionId: mokuroSessionId || null, safeTitle: runSafeTitle, total: total
             });
             if (options.pollBridgeStatus !== false) {
-                ocrPoll = setInterval(async () => {
+
+                ocrPoll = setBackgroundInterval(async () => {
                     const st = await mokuroStatus(mokuroSessionId);
                     if (!st) return;
                     const done = (st.pages_ocr_done ?? 0);
@@ -7572,15 +8003,14 @@
                     });
                 }, 700);
                 if (options.registerRunCleanup) options.registerRunCleanup(() => {
-                    if (ocrPoll) { clearInterval(ocrPoll); ocrPoll = null; }
+                    if (ocrPoll) { clearBackgroundInterval(ocrPoll); ocrPoll = null; }
                 });
             }
         }
 
         let fetched = 0;
         let nextIdx = 0;
-        // One upload-bar feed shared by the early cover upload and finalize so
-        // the bar tracks the whole multi-file upload (cover = file 1/N).
+
         const trialUploadFeed = makeUploadBarUpdater(barUpload);
         const trialCoverState = { fired: false };
         async function worker() {
@@ -7611,9 +8041,7 @@
                     fetched++;
                     if (zip) zip.entries.push({ path: 'page-' + String(pageIdx).padStart(4, '0') + '.' + IMAGE_CODEC.ext, blob });
                     if (mode === 'ocr' && mokuroSessionId) {
-                        // Cover = first page: push it before OCR finishes so the
-                        // folder + upload bar show life; deferred automation
-                        // intentionally sends pages only.
+
                         if (!options.skipCover && pageIdx === 1 && !trialCoverState.fired) {
                             trialCoverState.fired = true;
                             uploadCoverEarly({
@@ -7635,8 +8063,6 @@
                     errors.push(j.fid + '#' + j.no + ': ' + safeLogText((e && e.message) || e));
                 }
                 const el = (performance.now() - t1) / 1000;
-                // Download bar tracks pages fetched from the CDN; Descramble
-                // bar tracks pages processed (zipped / sent to OCR).
                 setBar(barDownload, (fetched / total) * 100, fetched + '/' + total);
                 setBar(barDescramble, (okIdx.size / total) * 100, okIdx.size + '/' + total);
                 reportRunProgress(options, 'page', {
@@ -7654,21 +8080,24 @@
             setRunDetails(details,
                 msgAllFailedZip(),
                 errors);
-            if (ocrPoll) { clearInterval(ocrPoll); ocrPoll = null; }
+            if (ocrPoll) { clearBackgroundInterval(ocrPoll); ocrPoll = null; }
             return outcome(false);
         }
         if (mode === 'ocr' && mokuroSessionId) {
-            if (ocrPoll) { clearInterval(ocrPoll); ocrPoll = null; }
+            if (ocrPoll) { clearBackgroundInterval(ocrPoll); ocrPoll = null; }
             const missingOcr = total - okIdx.size;
             if (options.deferFinalize) {
-                // Deferred mode is deliberately page-stream-only.  The external
-                // CLI owns /finalize (and any upload/delete policy) later.
+
                 reportRunProgress(options, 'deferred-finalize', {
                     pageCount: okIdx.size, total: total, deferredFinalize: true
                 });
                 return outcome(missingOcr === 0);
             }
             const { result, plan } = await finalizeOcrSession(mokuroSessionId, ui, barUpload, barMokuro, total, trialUploadFeed, options);
+
+            const partialUpload = !!(result && result.partialUpload);
+            const partialMsg = partialUpload ? msgPartialUpload(result) : '';
+            if (partialUpload) errors.push(partialMsg);
             barMokuro.fill.style.width = '100%';
             barMokuro.labRate.textContent = okIdx.size + '/' + okIdx.size;
             if (missingOcr > 0) {
@@ -7676,14 +8105,16 @@
                     msgOcrPartial(missingOcr, total),
                     errors);
             } else {
-                if (plan && plan.method === 'local') {
+                if (partialUpload) {
+                    setRunDetails(details, partialMsg, errors);
+                } else if (plan && plan.method === 'local') {
                     const localPath = storedPathOf(result) || plan.localDir;
                     if (localPath) details.textContent = msgStoredLocal(localPath);
                 } else if (plan && plan.method) {
                     const rp = result && (result.remote_path || result.mega_path);
                     if (rp) details.textContent = msgUploadedTo(methodShortLabel(plan.method), rp);
                 }
-                if (errors.length) appendRunDetails(details, errors, 'Issues during the run');
+                if (!partialUpload && errors.length) appendRunDetails(details, errors, 'Issues during the run');
             }
             ui.showReaderButton(result);
             ui.showStoredButton(result);
@@ -7711,8 +8142,7 @@
                 details.textContent = msgZipSaved(zipEntries.length, fmtBytes(zipBlob.size), secs);
                 if (errors.length) appendRunDetails(details, errors, 'Issues during the run');
             }
-            // Return success only when nothing is missing: a partial run keeps
-            // its page cache so the next run resumes the missing pages.
+
             return outcome(missing === 0);
         }
         return outcome(false);
@@ -7727,10 +8157,7 @@
         } catch (e) { state.viewerEntries = []; }
     }
     function resetRunState() {
-        // All captured state below is per-book. If this tab has moved to a
-        // different cid (SPA-style navigation), the cached config/keys belong
-        // to the previous book and would silently download the wrong pages
-        // (every CDN path 403s as "session auth expired").
+
         const currentCid = (new URLSearchParams(location.search)).get('cid') || '';
         const cidChanged = currentCid !== state.cid;
         state.cid = currentCid;
@@ -7749,7 +8176,7 @@
         }
     }
 
-    async function run(ui, mode, options) {
+async function run(ui, mode, options) {
         const runOptions = normalizeRunOptions(options, mode);
         const runResult = runOptions.automation
             ? (runOptions.result || newAutomationResult(mode, state.cid, runOptions.deferFinalize))
@@ -7760,10 +8187,7 @@
         }
         const { details, statsEl, barWrap, barDownload, barDescramble, barMokuro, barUpload } = ui;
         let finishedOk = false;
-        // Lock the buttons + destination pickers for the whole run: no second
-        // download can start concurrently (the 10 s bridge-health tick must
-        // never re-enable anything mid-run) and the destination cannot change
-        // under it. Previous reader/stored buttons and the Upload bar are cleared.
+
         ui.setRunLock(true);
         ui.hideReaderButton();
         ui.hideStoredButton();
@@ -7883,8 +8307,7 @@
             let mokuroSessionId = null;
             let ocrPoll = null;
             let runSafeTitle = '';
-            // One upload-bar feed shared by the early cover upload and finalize
-            // so the bar tracks the whole multi-file upload (cover = file 1/N).
+
             const runUploadFeed = makeUploadBarUpdater(barUpload);
             const runCoverState = { fired: false };
             if (mode === 'ocr') {
@@ -7896,9 +8319,7 @@
                 if (!bridgeOk) {
                     throw new Error(MOKURO_BRIDGE_OFFLINE_MSG);
                 }
-                // Don't start a capture while the bridge is still working on a
-                // previous run, unless an automation caller explicitly skips
-                // this global wait.
+
                 if (!runOptions.skipBridgeIdleWait && !(await waitForBridgeIdle(60000))) {
                     throw new Error('The Mokuro Bridge is still busy with a previous OCR/upload — wait for it to finish, then try again.');
                 }
@@ -7916,7 +8337,8 @@
                     sessionId: mokuroSessionId || null, safeTitle: runSafeTitle, total: total
                 });
                 if (runOptions.pollBridgeStatus) {
-                    ocrPoll = setInterval(async () => {
+
+                    ocrPoll = setBackgroundInterval(async () => {
                         const st = await mokuroStatus(mokuroSessionId);
                         if (!st) return;
                         const done = st.pages_ocr_done ?? 0;
@@ -7927,7 +8349,7 @@
                         });
                     }, 700);
                     registerRunCleanup(() => {
-                        if (ocrPoll) { clearInterval(ocrPoll); ocrPoll = null; }
+                        if (ocrPoll) { clearBackgroundInterval(ocrPoll); ocrPoll = null; }
                     });
                 }
             }
@@ -7957,7 +8379,7 @@
             startAuthTimers();
             registerRunCleanup(() => {
                 stopAuthTimers();
-                if (ocrPoll) { clearInterval(ocrPoll); ocrPoll = null; }
+                if (ocrPoll) { clearBackgroundInterval(ocrPoll); ocrPoll = null; }
                 if (pool) pool.terminate();
             });
 
@@ -7993,9 +8415,7 @@
                 }
             }
             function scheduleOcrStreaming() {
-                // Keep the existing concurrent GUI behavior, but serialize the
-                // headless stream so the returned promise cannot race a POST
-                // that is still in flight after the last page is decoded.
+
                 if (!runOptions.headless) {
                     sendOcrStreaming();
                     return;
@@ -8012,9 +8432,7 @@
                 const dlCount = Math.min(fetchedCount, total);
                 setBar(barDownload, (dlCount / total) * 100, dlCount + '/' + total);
                 setBar(barDescramble, (deCount / total) * 100, deCount + '/' + total);
-                // NOTE: the Mokuro bar is owned by the dedicated bridge status
-                // poll (updateMokuroBar, done/received/total), never write it
-                // from here or the two writers fight and the label flickers.
+
             }
 
             function settleJob(job, error, blob, crc) {
@@ -8034,9 +8452,7 @@
                         crc: Number.isInteger(crc) ? crc : undefined,
                     });
                     if (runOptions.usePageCache && state.cid) cachePage(state.cid, job.index, blob, crc);
-                    // Cover = first page: push it before OCR finishes so the
-                    // folder + upload bar show life; headless automation
-                    // suppresses this extra endpoint and streams pages only.
+
                     if (!runOptions.skipCover && mokuroSessionId && job.index === 1 && !runCoverState.fired) {
                         runCoverState.fired = true;
                         uploadCoverEarly({
@@ -8129,9 +8545,7 @@
                             const res = await cdnFetchWithFallback(j.rel, fKey, 45000);
                             if (!res.ok) throw new Error('HTTP ' + res.status);
                             const blob = await res.blob();
-                            // Time the whole fetch+body: GM_xhr's onload and
-                            // fetch()'s resolution fire at different points, so
-                            // header-only timing would under-report the gm lane.
+
                             recordLane(res._lane, performance.now() - t0, blob.size);
                             return { blob };
                         } catch (e) {
@@ -8159,8 +8573,7 @@
                         const msg = safeLogText((e && e.message) || e);
                         ready.push({ job: j, blob: null, error: msg });
                     } finally {
-                        // Exactly one progress tick per job, including the
-                        // 'blocked' path (which the old code silently skipped).
+
                         bumpFetched(1);
                         wake();
                         prefetchInFlight.delete(j.index);
@@ -8185,8 +8598,7 @@
 
                 async function consumeOne() {
                     while (consumed < totalJobs) {
-                        // Keep a small multiple of worker capacity buffered: an
-                        // unbounded pool queue would retain the whole volume.
+
                         while (pending.size >= PIPELINE_LIMIT) {
                             await Promise.race([
                                 waitForWake(),
@@ -8197,8 +8609,7 @@
                         while (!item) {
                             const idx = ready.length ? 0 : -1;
                             if (idx !== -1) {
-                                // Remove on dispatch: a `dispatched` flag alone
-                                // kept every source Blob alive until runJobs ended.
+
                                 item = ready.splice(idx, 1)[0];
                             } else if (prefetchInFlight.size === 0 && prefetchIdx >= jobList.length && ready.length === 0) {
                                 break;
@@ -8223,8 +8634,7 @@
                         const p = new Promise(res => { job._resolve = res; });
                         promises.push(p);
                         if (item.error) {
-                            // Prefetch already exhausted its retry/auth path; let
-                            // the outer retry round handle it.
+
                             settleJob(job, item.error, null);
                         } else if (pool && item.blob) {
                             pool.submit({ ...job, blob: item.blob });
@@ -8267,8 +8677,6 @@
                 await Promise.all(promises);
                 stopAuthTimers();
 
-                // What each transport lane delivered: a separate origin carries a
-                // real share at similar latency; one sharing a socket pool stays ~0%.
                 if (BWDD_DEBUG) console.info('[bwdd] transport lanes:', laneSummary());
                 } finally {
                     pipelineDrain = null;
@@ -8326,15 +8734,11 @@
                 reportRunProgress(runOptions, 'total', { total: total });
             }
             if (cachedCount) {
-                // Cache hits were fetched in an earlier run; count them so the
-                // Download bar shares the Descramble bar's baseline instead of
-                // showing only pages newly fetched this run.
+
                 fetchedCount += cachedCount;
                 refreshProgress();
             }
 
-            // Probe optional transport mirrors only for the normal panel path:
-            // headless callers own the browser/bridge lifecycle.
             if (!runOptions.headless) {
                 try { await probeFetchProxy(); } catch (e) {}
                 try { await probeEdgeMirror(); } catch (e) {}
@@ -8388,11 +8792,10 @@
                     }
                     catch (e) { errors.push('Final OCR send page ' + i + ': ' + safeLogText((e && e.message) || e)); }
                 }
-                if (ocrPoll) { clearInterval(ocrPoll); ocrPoll = null; }
+                if (ocrPoll) { clearBackgroundInterval(ocrPoll); ocrPoll = null; }
                 const missingOcr = total - okIdx.size;
                 if (runOptions.deferFinalize) {
-                    // Return only after every descrambled page POST has settled;
-                    // the external CLI owns the later /finalize request.
+
                     runResult.pageCount = okIdx.size;
                     runResult.total = total;
                     runResult.errors = errors;
@@ -8406,6 +8809,10 @@
                 }
                 barMokuro.wrap.style.display = 'flex';
                 const { result, plan } = await finalizeOcrSession(mokuroSessionId, ui, barUpload, barMokuro, total, runUploadFeed, runOptions);
+
+                const partialUpload = !!(result && result.partialUpload);
+                const partialMsg = partialUpload ? msgPartialUpload(result) : '';
+                if (partialUpload) errors.push(partialMsg);
                 const secs = ((performance.now() - t0) / 1000).toFixed(1);
                 if (failedIdx.size === 0 && errors.length === 0) finishedOk = true;
                 barMokuro.fill.style.width = '100%';
@@ -8415,14 +8822,16 @@
                         msgOcrPartial(missingOcr, total),
                         errors);
                 } else {
-                    if (!runOptions.headless && plan && plan.method === 'local') {
+                    if (!runOptions.headless && partialUpload) {
+                        setRunDetails(details, partialMsg, errors);
+                    } else if (!runOptions.headless && plan && plan.method === 'local') {
                         const localPath = storedPathOf(result) || plan.localDir;
                         if (localPath) details.textContent = msgStoredLocal(localPath);
                     } else if (!runOptions.headless && plan && plan.method) {
                         const rp = result && (result.remote_path || result.mega_path);
                         if (rp) details.textContent = msgUploadedTo(methodShortLabel(plan.method), rp);
                     }
-                    if (!runOptions.headless && errors.length) appendRunDetails(details, errors, 'Issues during the run');
+                    if (!runOptions.headless && !partialUpload && errors.length) appendRunDetails(details, errors, 'Issues during the run');
                 }
                 if (runResult) {
                     runResult.pageCount = okIdx.size;
@@ -8494,8 +8903,7 @@
             const secs = ((performance.now() - t0) / 1000).toFixed(1);
             if (errors.length === 0) finishedOk = true;
             const missing = total - okIdx.size;
-            // A missing manifest section contributes no page indices, so `missing`
-            // alone would still read "Saved 250 of 250" while a section failed.
+
             if (missing > 0 || missingSections.length) {
                 setRunDetails(details, msgZipPartial(okIdx.size, total), errors);
             } else {
@@ -8526,13 +8934,12 @@
         } finally {
             try { cleanupRun(); } catch (e) {}
             if (finishedOk && runOptions.usePageCache) await clearPageCache();
-            // Re-derive the enabled state from the bridge health, if the
-            // bridge dropped mid-run, the OCR button stays disabled afterwards.
+
             ui.setRunLock(false);
         }
     }
 
-    function decodeConfig(content) {
+function decodeConfig(content) {
         const c = String(content || '');
         if (c.indexOf('"data":"') === -1) {
             try {
@@ -8559,7 +8966,7 @@
         return JSON.parse(jsonStr);
     }
 
-    function buildBookPreview() {
+function buildBookPreview() {
         try {
             const rawTitle = state.cti || document.title || '';
             const title = cleanTitle(rawTitle) || state.cid || 'Unknown Book';
@@ -8590,23 +8997,28 @@
         } catch (e) { return null; }
     }
 
-    // =====================================================================
-    // BookWalker site adapter
-    // =====================================================================
-    // BookWalker is the original site, so its pipeline is unchanged; only its
-    // identity and metadata answers are exposed here.
+    function bwOwnsHost() {
+        try { return /(^|\.)bookwalker\.jp$/i.test(location.hostname); } catch (e) { return false; }
+    }
     registerSite({
         id: 'bookwalker',
         label: 'BookWalker',
         panelTitle: 'BookWalker Native Downloader',
+        ownsHost() {
+            return bwOwnsHost();
+        },
         matches() {
+
             try {
-                return /(^|\.)bookwalker\.jp$/i.test(location.hostname);
+                return bwOwnsHost() && /^viewer(-trial|-ptrial|-subscription)?\.bookwalker\.jp$/i.test(location.hostname);
             } catch (e) { return false; }
         },
+        headlessMatches() {
+
+            return bwOwnsHost();
+        },
         install() {
-            // A headless CLI run may deliberately defer the capture and call
-            // activateCapture() itself once the page is where it wants it.
+
             if (!shouldDeferNetworkCapture()) installNetworkCapture();
         },
         getBook() {
@@ -8620,42 +9032,212 @@
         archiveDefault(rawTitle) { return archiveDefaultName(rawTitle) || fsSafePath(state.cid || ''); },
         run(ui, mode, options) { return run(ui, mode, options); },
         state: state,
-        // Console surface for this store only; the entry point merges whatever
-        // the active adapter puts here into window.__bwdd.
+
         debug: {
             decodeConfig, pageSeedsNo, A9p, b8gNo, state, buildWorkerSource,
             fetchAndDescramble, cdnFetch, cdnFetchWithFallback,
+
+            bwHeadlessCrFromLoader, bwHeadlessCr, bwHeadlessOpenFree, bwHeadlessWanted,
         },
     });
-    // =====================================================================
-    // ebookjapan — page detection, the viewer URL, and the book manifest
-    // =====================================================================
-    // Ported from the standalone ebookjapan userscript, which had this working
-    // against live volumes. What it answers:
-    //
-    //   ebjParseTarget(href)   the volume code and the viewer path
-    //   ebjResolveCodes(spec)  cheap: the code and, when the page has it, a title
-    //   ebjResolvePages(...)   the real thing: session payloads, the book's own
-    //                          manifest, the page list and the canvas box
-    //
-    // ebjResolvePages also records the session payloads and the open_param
-    // arguments in ebjState, because a Web Worker has to install its own copy of
-    // the pack (the wasm module is single-shot) and can only do that if it is
-    // handed the same payloads this run used.
+
+    const BW_HEADLESS_API = 'https://viewer.bookwalker.jp';
+    const BW_HEADLESS_LOADER = '/browserWebApi/03/getLoader';
+    const BW_HEADLESS_CR_KEY = 'bwdd.bw.headless.cr';
+
+    const BW_PRODUCT_PATH = /^\/de([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\/?$/i;
+    function bwProductId(where) {
+        try {
+            const path = where ? new URL(where, location.href).pathname : location.pathname;
+            const m = BW_PRODUCT_PATH.exec(path);
+            return m ? m[1] : null;
+        } catch (e) { return null; }
+    }
+
+    function bwHeadlessCid() {
+        return bwProductId(location.href) || '';
+    }
+
+    function bwHeadlessWanted() {
+        try {
+            if (state.auth && state.baseUrl) return false;
+            return !!bwProductId(location.href);
+        } catch (e) { return false; }
+    }
+
+    const BW_HEADLESS_ARITH = /^(?:[0-9.eE+\-*/(),\s]|Math\.(?:asin|acos|atan2?|sin|cos|tan|sqrt|cbrt|pow|abs|round|floor|ceil|trunc|sign|exp|log|log2|log10|hypot|min|max|fround|sinh|cosh|tanh))*$/;
+
+    function bwHeadlessCrFromLoader(text) {
+        const src = String(text || '');
+        const m = /(?:^|[^A-Za-z0-9_$.])c9P\s*=\s*function\s*\(\s*\)\s*\{/.exec(src);
+        if (!m) return '';
+
+        const open = src.indexOf('{', m.index);
+        if (open < 0) return '';
+        let depth = 0;
+        let quote = '';
+        let end = -1;
+        for (let i = open; i < src.length; i++) {
+            const ch = src[i];
+            if (quote) {
+                if (ch === '\\') { i++; continue; }
+                if (ch === quote) quote = '';
+                continue;
+            }
+            if (ch === '"' || ch === "'" || ch === '`') { quote = ch; continue; }
+            if (ch === '{') depth++;
+            else if (ch === '}') { depth--; if (!depth) { end = i; break; } }
+        }
+        if (end < 0) return '';
+        const body = src.slice(open + 1, end);
+
+        const exprM = /(?:let|var|const)\s+[A-Za-z_$][A-Za-z0-9_$]*\s*=\s*([^;]+);/.exec(body);
+        if (!exprM) return '';
+        const expr = exprM[1].trim();
+        if (!BW_HEADLESS_ARITH.test(expr)) return '';
+        const precisionM = /toFixed\(\s*(\d{1,2})\s*\)/.exec(body);
+        const suffixM = /["']([0-9]{1,12})["']\s*;?\s*\}?\s*$/.exec(body.trim());
+        if (!precisionM || !suffixM) return '';
+        let r = NaN;
+        try {
+
+            r = Number(new Function('return (' + expr + ');')());
+        } catch (e) { return ''; }
+        if (!isFinite(r)) return '';
+        const s = '' + r.toFixed(parseInt(precisionM[1], 10));
+        const dot = s.indexOf('.');
+        if (dot < 0) return '';
+        const cr = s.substring(dot + 1, s.length - 1) + suffixM[1];
+        return /^[0-9]{6,32}$/.test(cr) ? cr : '';
+    }
+
+    async function bwHeadlessCr() {
+
+        let cached = '';
+        try { cached = sessionStorage.getItem(BW_HEADLESS_CR_KEY) || ''; } catch (e) { cached = ''; }
+        if (/^[0-9]{6,32}$/.test(cached)) return cached;
+        const res = await bwHeadlessGet(BW_HEADLESS_API + BW_HEADLESS_LOADER);
+        if (!res || res.status !== 200 || !res.text) {
+            throw new Error('BookWalker licence bootstrap failed: the reader loader answered HTTP ' +
+                ((res && res.status) || '?') + '.');
+        }
+        const cr = bwHeadlessCrFromLoader(res.text);
+        if (!cr) throw new Error('BookWalker licence bootstrap failed: the reader loader did not expose its licence nonce.');
+        try { sessionStorage.setItem(BW_HEADLESS_CR_KEY, cr); } catch (e) {}
+        return cr;
+    }
+
+    let bwHeadlessCookies = '';
+
+    function bwHeadlessHeaderValue(headers, name) {
+        const text = String(headers || '');
+        const re = new RegExp('^' + name + ':\\s*(.*)$', 'gim');
+        const m = re.exec(text);
+        return m ? m[1].trim() : '';
+    }
+
+    function bwHeadlessAbsorbCookies(headers) {
+        const text = String(headers || '');
+        const found = [];
+        const re = /^set-cookie:\s*([^=\s;]+)=([^;\s]*)/gim;
+        let m;
+        while ((m = re.exec(text))) found.push(m[1] + '=' + m[2]);
+        if (!found.length) return;
+        const jar = new Map();
+        for (const pair of (bwHeadlessCookies ? bwHeadlessCookies.split('; ') : [])) {
+            const eq = pair.indexOf('=');
+            if (eq > 0) jar.set(pair.slice(0, eq), pair.slice(eq + 1));
+        }
+        for (const pair of found) {
+            const eq = pair.indexOf('=');
+            if (eq > 0) jar.set(pair.slice(0, eq), pair.slice(eq + 1));
+        }
+        bwHeadlessCookies = Array.from(jar, ([k, v]) => k + '=' + v).join('; ');
+    }
+
+    function bwHeadlessRequest(url) {
+        const headers = { Accept: '*/*' };
+        if (bwHeadlessCookies) headers.Cookie = bwHeadlessCookies;
+        if (typeof GM_xmlhttpRequest === 'function') {
+            return new Promise((resolve, reject) => {
+                GM_xmlhttpRequest({
+                    method: 'GET', url: url, headers: headers, timeout: 20000,
+                    onload: r => {
+                        bwHeadlessAbsorbCookies(r && r.responseHeaders);
+                        resolve({ status: r && r.status, text: (r && r.responseText) || '' });
+                    },
+                    onerror: e => reject(new Error('GM_xhr: ' + ((e && e.error) || 'request failed'))),
+                    ontimeout: () => reject(new Error('GM_xhr: Timeout')),
+                });
+            });
+        }
+        return fetchWithTimeout(url, { credentials: 'include', headers: headers }, 20000)
+            .then(async r => {
+                try { bwHeadlessAbsorbCookies(Array.from(r.headers || []).map(p => 'set-cookie: ' + p[1]).join('\n')); } catch (e) {}
+                return { status: r.status, text: await r.text() };
+            });
+    }
+
+    function bwHeadlessGet(url) {
+        return bwHeadlessRequest(url);
+    }
+
+    const BW_HEADLESS_VIEW = '/browserWebApi/03/view?cid=';
+
+    async function bwHeadlessOpenFree(cid) {
+        state.cid = cid;
+
+        state.apiBase = BW_HEADLESS_API;
+        let last = null;
+        for (let attempt = 0; attempt < 2; attempt++) {
+
+            if (attempt) {
+                try { sessionStorage.removeItem(BW_HEADLESS_CR_KEY); } catch (e) {}
+                bwHeadlessCookies = '';
+            }
+            try {
+                await bwHeadlessGet(BW_HEADLESS_API + BW_HEADLESS_VIEW + encodeURIComponent(cid));
+                const cr = await bwHeadlessCr();
+                const url = BW_HEADLESS_API + '/browserWebApi/c?cid=' + encodeURIComponent(cid) +
+                    '&BID=' + encodeURIComponent(getBID()) + '&cr=' + encodeURIComponent(cr);
+                const res = await bwHeadlessGet(url);
+                let d = null;
+                try { d = res && res.text ? JSON.parse(res.text) : null; } catch (e) { d = null; }
+                if (d && d.auth_info && d.url) {
+                    state.auth = d.auth_info;
+                    state.baseUrl = d.url;
+                    if (d.cti) state.cti = d.cti;
+                    return d;
+                }
+                last = d && d.status != null ? String(d.status) : ('HTTP ' + ((res && res.status) || '?'));
+
+                if (last !== '503' && last !== '401' && last !== '403') break;
+            } catch (e) {
+                last = (e && e.message) || 'request failed';
+                if (attempt || !/HTTP 5|Failed|fetch|Timeout/i.test(String(last))) break;
+            }
+        }
+        const st = String(last || '?');
+        let why = '';
+        if (st === '401') why = ' This volume needs a signed-in session; open it once in the reader, then try the download again.';
+        else if (st === '995') why = ' The store did not offer this volume to an anonymous reader.';
+        else if (st === '503') why = ' The reader refused the licence nonce; if this repeats, open the volume in the reader once.';
+        const err = new Error('BookWalker refused the licence for ' + cid + ' (status ' + st + ').' + why);
+        if (st === '401' || st === '995') err.code = 'LOGIN_REQUIRED';
+        throw err;
+    }
+
     const ebjState = {
-        // The other stores publish their id as `cid` on the active debug
-        // surface; mirror the volume code there too.
+
         get cid() { return ebjState.code || ''; },
         code: '',
         fileId: '',
-        payload: null,      // { sessionId, code, fileId, openPayload, drmPayload }
-        params: null,       // the open_param arguments those payloads were opened with
-        book: null,         // { name, title, code, pages, canvas, direction, autograph }
+        payload: null,
+        params: null,
+        book: null,
         running: false,
     };
 
-    // ebjPage is the page realm when the userscript manager exposes one; every
-    // canvas the wasm draws into has to come from there (see 02-realms.js).
     const ebjPage = (typeof unsafeWindow !== 'undefined' && unsafeWindow) || window;
 
     const EBJ_BASE = 'https://ebookjapan.yahoo.co.jp';
@@ -8663,10 +9245,6 @@
     const EBJ_NAME_CONCURRENCY = 8;
     const EBJ_PARAM_PROBE = { dpr: 2, limit: 10000, size: 10000, flag: 0 };
 
-    // Request headers for the viewer's own API. This came across with the
-    // resolve helpers; dropping it with the standalone's GM layer left every
-    // resolve throwing a ReferenceError that only ever reached console.warn,
-    // so the panel's Save button looked like it did nothing at all.
     const apiHeaders = referer => ({
         'Content-Type': 'application/json',
         Origin: EBJ_BASE,
@@ -8712,11 +9290,6 @@
         };
     }
 
-    // The boot poll and the run can both ask for the same volume while the first
-    // resolve is still in flight: it makes three network calls and instantiates
-    // the wasm module, so it reliably outlives the timers that trigger it.
-    // Without a shared promise each caller opens its own open_book session and
-    // builds a second module to race over the same ebjState.
     let ebjResolveInflight = null;
 
     async function ebjResolvePages(target, opts) {
@@ -8767,18 +9340,11 @@
         say('decrypting configuration pack');
         const glue = await ebjLoadGlue();
         await glue.decrypt_session(open.session_id, drm.code, open.payload, drm.payload);
-        // Keep what it takes to install the pack again. The decrypted pack lives
-        // in the wasm module's own memory, and shuffle() traps with a bare
-        // "unreachable" when it is not there — a panic that names no cause and
-        // stops every page at once.
-        ebjAutographImg = null;   // a new book means a new overlay
+
+        ebjAutographImg = null;
         ebjState.payload = { sessionId: open.session_id, code: drm.code, fileId: drm.file_id,
                          openPayload: open.payload, drmPayload: drm.payload };
 
-        // Ask for the biggest box the book has, then scale to what comes back:
-        // open_param normalises to fit `limit`/`size`, so a probe with a huge
-        // limit reports the intrinsic size, and a second call at that size ends
-        // up as close to 1:1 as the manifest allows.
         const probe = await glue.open_param(EBJ_PARAM_PROBE);
         const probePages = (probe && probe.pages) || [];
         if (!probePages.length) throw new Error('the page manifest came back empty');
@@ -8808,10 +9374,6 @@
             }));
         }
 
-        // Canvas the whole book is composed into: big enough for its largest
-        // page. shuffle() places every tile at a destination offset derived from
-        // the intrinsic geometry, so one canvas size serves every page and the
-        // smaller pages simply carry transparent padding past their own box.
         let canvasW = 0, canvasH = 0;
         for (const p of pages) {
             if (Number(p.width) > canvasW) canvasW = Number(p.width);
@@ -8854,11 +9416,6 @@
         };
     }
 
-    /** ebookjapan's viewer is the only page this adapter owns. */
-    // A breadcrumb the instant this script is evaluated, before any adapter
-    // logic. If the attribute below never appears, Tampermonkey did not run the
-    // script at all (wrong URL, stale install, script disabled) — which looks
-    // exactly like a crash from the panel, and is the first thing to rule out.
     try {
         document.documentElement.setAttribute('data-bwdd-ebookjapan', 'evaluated');
         console.log('[ebookjapan] evaluated on ' + location.href);
@@ -8871,35 +9428,12 @@
             return /ebookjapan\.yahoo\.co\.jp/.test(String(href));
         }
     }
-    // =====================================================================
-    // ebookjapan — the viewer's wasm core, embedded and pinned
-    // =====================================================================
-    // The viewer descrambles a page with a small Rust/wasm module driven by a
-    // glue script. Both are embedded here as base64, for the same two reasons
-    // BookWalker's configuration_pack is captured rather than guessed: a run
-    // must not depend on the hashed asset names the site ships that week, and
-    // it must not race the viewer's own module load.
-    //
-    // The glue is embedded ALREADY PATCHED. Two edits make it survive outside
-    // the viewer's own bundler:
-    //   * the module's `import` / `import.meta` usage is removed, so the source
-    //     can be compiled with `new Function` instead of being a real module;
-    //   * `__wbg_instanceof_Window_def73ea0955fc569` is widened to accept any
-    //     window-shaped global, which is what lets the same glue run inside a
-    //     Web Worker (a worker's global is a DedicatedWorkerGlobalScope, not a
-    //     Window) and inside Tampermonkey's sandbox.
-    //
-    // EBJ_GLUE_SUM pins exactly that patched text. ebookjapan redeploys this
-    // viewer regularly, so the pin is a deliberate tripwire: when it stops
-    // matching, ebjLoadGlue says the site has probably moved on rather than
-    // silently descrambling nothing. Re-extract the glue and the wasm, drop
-    // them in and rebuild.
+
     const EBJ_GLUE_B64 = 'dmFyIGUsdD1BcnJheSgxMjgpLmZpbGwodm9pZCAwKTt0LnB1c2godm9pZCAwLG51bGwsITAsITEpO2Z1bmN0aW9uIG4oZSl7cmV0dXJuIHRbZV19dmFyIHI9dC5sZW5ndGg7ZnVuY3Rpb24gaShlKXtyPT09dC5sZW5ndGgmJnQucHVzaCh0Lmxlbmd0aCsxKTtsZXQgbj1yO3JldHVybiByPXRbbl0sdFtuXT1lLG59ZnVuY3Rpb24gYSh0LG4pe3RyeXtyZXR1cm4gdC5hcHBseSh0aGlzLG4pfWNhdGNoKHQpe2UuX193YmluZGdlbl9leG5fc3RvcmUoaSh0KSl9fWZ1bmN0aW9uIG8oZSl7cmV0dXJuIGU9PW51bGx9dmFyIHM9bnVsbDtmdW5jdGlvbiBjKCl7cmV0dXJuKHM9PT1udWxsfHxzLmJ5dGVMZW5ndGg9PT0wKSYmKHM9bmV3IFVpbnQ4QXJyYXkoZS5tZW1vcnkuYnVmZmVyKSksc31mdW5jdGlvbiBsKGUsdCl7cmV0dXJuIGU+Pj49MCxjKCkuc3ViYXJyYXkoZS8xLGUvMSt0KX12YXIgdT10eXBlb2YgVGV4dERlY29kZXI8YHVgP25ldyBUZXh0RGVjb2RlcihgdXRmLThgLHtpZ25vcmVCT006ITAsZmF0YWw6ITB9KTp7ZGVjb2RlOigpPT57dGhyb3cgRXJyb3IoYFRleHREZWNvZGVyIG5vdCBhdmFpbGFibGVgKX19O3R5cGVvZiBUZXh0RGVjb2RlcjxgdWAmJnUuZGVjb2RlKCk7ZnVuY3Rpb24gZChlLHQpe3JldHVybiBlPj4+PTAsdS5kZWNvZGUoYygpLnN1YmFycmF5KGUsZSt0KSl9ZnVuY3Rpb24gZihlKXtlPDEzMnx8KHRbZV09cixyPWUpfWZ1bmN0aW9uIHAoZSl7bGV0IHQ9bihlKTtyZXR1cm4gZihlKSx0fXZhciBtPXR5cGVvZiBGaW5hbGl6YXRpb25SZWdpc3RyeT5gdWA/e3JlZ2lzdGVyOigpPT57fSx1bnJlZ2lzdGVyOigpPT57fX06bmV3IEZpbmFsaXphdGlvblJlZ2lzdHJ5KHQ9PntlLl9fd2JpbmRnZW5fZXhwb3J0XzEuZ2V0KHQuZHRvcikodC5hLHQuYil9KTtmdW5jdGlvbiBoKHQsbixyLGkpe2xldCBhPXthOnQsYjpuLGNudDoxLGR0b3I6cn0sbz0oLi4udCk9PnthLmNudCsrO2xldCBuPWEuYTthLmE9MDt0cnl7cmV0dXJuIGkobixhLmIsLi4udCl9ZmluYWxseXstLWEuY250PT09MD8oZS5fX3diaW5kZ2VuX2V4cG9ydF8xLmdldChhLmR0b3IpKG4sYS5iKSxtLnVucmVnaXN0ZXIoYSkpOmEuYT1ufX07cmV0dXJuIG8ub3JpZ2luYWw9YSxtLnJlZ2lzdGVyKG8sYSxhKSxvfWZ1bmN0aW9uIGcoZSl7bGV0IHQ9dHlwZW9mIGU7aWYodD09YG51bWJlcmB8fHQ9PWBib29sZWFuYHx8ZT09bnVsbClyZXR1cm5gJHtlfWA7aWYodD09YHN0cmluZ2ApcmV0dXJuYCIke2V9ImA7aWYodD09YHN5bWJvbGApe2xldCB0PWUuZGVzY3JpcHRpb247cmV0dXJuIHQ9PW51bGw/YFN5bWJvbGA6YFN5bWJvbCgke3R9KWB9aWYodD09YGZ1bmN0aW9uYCl7bGV0IHQ9ZS5uYW1lO3JldHVybiB0eXBlb2YgdD09YHN0cmluZ2AmJnQubGVuZ3RoPjA/YEZ1bmN0aW9uKCR7dH0pYDpgRnVuY3Rpb25gfWlmKEFycmF5LmlzQXJyYXkoZSkpe2xldCB0PWUubGVuZ3RoLG49YFtgO3Q+MCYmKG4rPWcoZVswXSkpO2ZvcihsZXQgcj0xO3I8dDtyKyspbis9YCwgYCtnKGVbcl0pO3JldHVybiBuKz1gXWAsbn1sZXQgbj0vXFtvYmplY3QgKFteXF1dKylcXS8uZXhlYyh0b1N0cmluZy5jYWxsKGUpKSxyO2lmKG4mJm4ubGVuZ3RoPjEpcj1uWzFdO2Vsc2UgcmV0dXJuIHRvU3RyaW5nLmNhbGwoZSk7aWYocj09YE9iamVjdGApdHJ5e3JldHVybmBPYmplY3QoYCtKU09OLnN0cmluZ2lmeShlKStgKWB9Y2F0Y2h7cmV0dXJuYE9iamVjdGB9cmV0dXJuIGUgaW5zdGFuY2VvZiBFcnJvcj9gJHtlLm5hbWV9OiAke2UubWVzc2FnZX1cbiR7ZS5zdGFja31gOnJ9dmFyIF89MCx2PXR5cGVvZiBUZXh0RW5jb2RlcjxgdWA/bmV3IFRleHRFbmNvZGVyKGB1dGYtOGApOntlbmNvZGU6KCk9Pnt0aHJvdyBFcnJvcihgVGV4dEVuY29kZXIgbm90IGF2YWlsYWJsZWApfX0seT10eXBlb2Ygdi5lbmNvZGVJbnRvPT1gZnVuY3Rpb25gP2Z1bmN0aW9uKGUsdCl7cmV0dXJuIHYuZW5jb2RlSW50byhlLHQpfTpmdW5jdGlvbihlLHQpe2xldCBuPXYuZW5jb2RlKGUpO3JldHVybiB0LnNldChuKSx7cmVhZDplLmxlbmd0aCx3cml0dGVuOm4ubGVuZ3RofX07ZnVuY3Rpb24gYihlLHQsbil7aWYobj09PXZvaWQgMCl7bGV0IG49di5lbmNvZGUoZSkscj10KG4ubGVuZ3RoLDEpPj4+MDtyZXR1cm4gYygpLnN1YmFycmF5KHIscituLmxlbmd0aCkuc2V0KG4pLF89bi5sZW5ndGgscn1sZXQgcj1lLmxlbmd0aCxpPXQociwxKT4+PjAsYT1jKCksbz0wO2Zvcig7bzxyO28rKyl7bGV0IHQ9ZS5jaGFyQ29kZUF0KG8pO2lmKHQ+MTI3KWJyZWFrO2FbaStvXT10fWlmKG8hPT1yKXtvIT09MCYmKGU9ZS5zbGljZShvKSksaT1uKGkscixyPW8rZS5sZW5ndGgqMywxKT4+PjA7bGV0IHQ9YygpLnN1YmFycmF5KGkrbyxpK3IpLGE9eShlLHQpO28rPWEud3JpdHRlbixpPW4oaSxyLG8sMSk+Pj4wfXJldHVybiBfPW8saX12YXIgeD1udWxsO2Z1bmN0aW9uIFMoKXtyZXR1cm4oeD09PW51bGx8fHguYnVmZmVyLmRldGFjaGVkPT09ITB8fHguYnVmZmVyLmRldGFjaGVkPT09dm9pZCAwJiZ4LmJ1ZmZlciE9PWUubWVtb3J5LmJ1ZmZlcikmJih4PW5ldyBEYXRhVmlldyhlLm1lbW9yeS5idWZmZXIpKSx4fWZ1bmN0aW9uIEModCxuLHIsaSl7bGV0IGE9Yih0LGUuX193YmluZGdlbl9tYWxsb2MsZS5fX3diaW5kZ2VuX3JlYWxsb2MpLG89XyxzPWIobixlLl9fd2JpbmRnZW5fbWFsbG9jLGUuX193YmluZGdlbl9yZWFsbG9jKSxjPV8sbD1iKHIsZS5fX3diaW5kZ2VuX21hbGxvYyxlLl9fd2JpbmRnZW5fcmVhbGxvYyksdT1fLGQ9YihpLGUuX193YmluZGdlbl9tYWxsb2MsZS5fX3diaW5kZ2VuX3JlYWxsb2MpLGY9XztyZXR1cm4gcChlLmRlY3J5cHRfc2Vzc2lvbihhLG8scyxjLGwsdSxkLGYpKX1mdW5jdGlvbiB3KHQsbixyKXtyZXR1cm4gcChlLmRlY3J5cHRfeGooaSh0KSxuLHIpKX1mdW5jdGlvbiBUKHQpe2Uuc2h1ZmZsZShpKHQpKX1mdW5jdGlvbiBFKHQpe3JldHVybiBwKGUucmFuZ2VzKHQpKX1mdW5jdGlvbiBEKHQpe3JldHVybiBwKGUub3Blbl9wYXJhbShpKHQpKSl9ZnVuY3Rpb24gTygpe2xldCB0LG47dHJ5e2xldCBhPWUuX193YmluZGdlbl9hZGRfdG9fc3RhY2tfcG9pbnRlcigtMTYpO2UuZ2V0X3NwZWNpYWxfdXJsKGEpO3ZhciByPVMoKS5nZXRJbnQzMihhKzAsITApLGk9UygpLmdldEludDMyKGErNCwhMCk7cmV0dXJuIHQ9cixuPWksZChyLGkpfWZpbmFsbHl7ZS5fX3diaW5kZ2VuX2FkZF90b19zdGFja19wb2ludGVyKDE2KSxlLl9fd2JpbmRnZW5fZnJlZSh0LG4sMSl9fWZ1bmN0aW9uIGsodCxuKXtsZXQgcj1iKHQsZS5fX3diaW5kZ2VuX21hbGxvYyxlLl9fd2JpbmRnZW5fcmVhbGxvYyksaT1fO3JldHVybiBwKGUuZ2V0X3BhZ2VfbmFtZShyLGksbikpfWZ1bmN0aW9uIEEodCxuLHIpe2UuX2R5bl9jb3JlX19vcHNfX2Z1bmN0aW9uX19Gbk11dF9fQV9fX19PdXRwdXRfX19SX2FzX3dhc21fYmluZGdlbl9fY2xvc3VyZV9fV2FzbUNsb3N1cmVfX19kZXNjcmliZV9faW52b2tlX19oZDViNmRmMGFhNWE1YmYxNCh0LG4saShyKSl9ZnVuY3Rpb24gaih0LG4scixhLG8pe2Uud2FzbV9iaW5kZ2VuX19jb252ZXJ0X19jbG9zdXJlc19faW52b2tlM19tdXRfX2gyODQwZDQ1NmNmOTA1YTE3KHQsbixpKHIpLGEsaShvKSl9ZnVuY3Rpb24gTSh0LG4scixhKXtlLndhc21fYmluZGdlbl9fY29udmVydF9fY2xvc3VyZXNfX2ludm9rZTJfbXV0X19oMTZiZjg3NTEyODdjZTM2MSh0LG4saShyKSxpKGEpKX1hc3luYyBmdW5jdGlvbiBOKGUsdCl7aWYodHlwZW9mIFJlc3BvbnNlPT1gZnVuY3Rpb25gJiZlIGluc3RhbmNlb2YgUmVzcG9uc2Upe2lmKHR5cGVvZiBXZWJBc3NlbWJseS5pbnN0YW50aWF0ZVN0cmVhbWluZz09YGZ1bmN0aW9uYCl0cnl7cmV0dXJuIGF3YWl0IFdlYkFzc2VtYmx5Lmluc3RhbnRpYXRlU3RyZWFtaW5nKGUsdCl9Y2F0Y2godCl7aWYoZS5oZWFkZXJzLmdldChgQ29udGVudC1UeXBlYCkhPWBhcHBsaWNhdGlvbi93YXNtYCljb25zb2xlLndhcm4oImBXZWJBc3NlbWJseS5pbnN0YW50aWF0ZVN0cmVhbWluZ2AgZmFpbGVkIGJlY2F1c2UgeW91ciBzZXJ2ZXIgZG9lcyBub3Qgc2VydmUgV2FzbSB3aXRoIGBhcHBsaWNhdGlvbi93YXNtYCBNSU1FIHR5cGUuIEZhbGxpbmcgYmFjayB0byBgV2ViQXNzZW1ibHkuaW5zdGFudGlhdGVgIHdoaWNoIGlzIHNsb3dlci4gT3JpZ2luYWwgZXJyb3I6XG4iLHQpO2Vsc2UgdGhyb3cgdH1sZXQgbj1hd2FpdCBlLmFycmF5QnVmZmVyKCk7cmV0dXJuIGF3YWl0IFdlYkFzc2VtYmx5Lmluc3RhbnRpYXRlKG4sdCl9e2xldCBuPWF3YWl0IFdlYkFzc2VtYmx5Lmluc3RhbnRpYXRlKGUsdCk7cmV0dXJuIG4gaW5zdGFuY2VvZiBXZWJBc3NlbWJseS5JbnN0YW5jZT97aW5zdGFuY2U6bixtb2R1bGU6ZX06bn19ZnVuY3Rpb24gUCgpe2xldCB0PXt9O3JldHVybiB0LndiZz17fSx0LndiZy5fX3diZ19idWZmZXJfNjA5Y2MzZWVlNTFlZDE1OD1mdW5jdGlvbihlKXtsZXQgdD1uKGUpLmJ1ZmZlcjtyZXR1cm4gaSh0KX0sdC53YmcuX193YmdfY2FsbF82NzJhNGQyMTYzNGQ0YTI0PWZ1bmN0aW9uKCl7cmV0dXJuIGEoZnVuY3Rpb24oZSx0KXtyZXR1cm4gaShuKGUpLmNhbGwobih0KSkpfSxhcmd1bWVudHMpfSx0LndiZy5fX3diZ19jYWxsXzdjY2NkZDY5ZTA3OTFhZTI9ZnVuY3Rpb24oKXtyZXR1cm4gYShmdW5jdGlvbihlLHQscil7cmV0dXJuIGkobihlKS5jYWxsKG4odCksbihyKSkpfSxhcmd1bWVudHMpfSx0LndiZy5fX3diZ19jYW52YXNfOWJiY2RiOTRhOTc3ODA3YT1mdW5jdGlvbihlKXtsZXQgdD1uKGUpLmNhbnZhcztyZXR1cm4gbyh0KT8wOmkodCl9LHQud2JnLl9fd2JnX2NsZWFyUmVjdF84ZTRiYTdlYTBlMDY3MTFhPWZ1bmN0aW9uKGUsdCxyLGksYSl7bihlKS5jbGVhclJlY3QodCxyLGksYSl9LHQud2JnLl9fd2JnX2NyeXB0b18xMjU3NmNkNjYyNDY5OThiPWZ1bmN0aW9uKCl7cmV0dXJuIGEoZnVuY3Rpb24oZSl7bGV0IHQ9bihlKS5jcnlwdG87cmV0dXJuIGkodCl9LGFyZ3VtZW50cyl9LHQud2JnLl9fd2JnX2RlY3J5cHRfZDUyZjJkNzFhNWI4YmVkZj1mdW5jdGlvbigpe3JldHVybiBhKGZ1bmN0aW9uKGUsdCxyLGEsbyl7cmV0dXJuIGkobihlKS5kZWNyeXB0KG4odCksbihyKSxsKGEsbykpKX0sYXJndW1lbnRzKX0sdC53YmcuX193YmdfZGlnZXN0X2FjNTU0ZGVhMDE4MGM2NGQ9ZnVuY3Rpb24oKXtyZXR1cm4gYShmdW5jdGlvbihlLHQscixhLG8pe3JldHVybiBpKG4oZSkuZGlnZXN0KGQodCxyKSxsKGEsbykpKX0sYXJndW1lbnRzKX0sdC53YmcuX193YmdfZHJhd0ltYWdlXzAzZjdhZTJhOTVhOTYwNWY9ZnVuY3Rpb24oKXtyZXR1cm4gYShmdW5jdGlvbihlLHQscixpKXtuKGUpLmRyYXdJbWFnZShuKHQpLHIsaSl9LGFyZ3VtZW50cyl9LHQud2JnLl9fd2JnX2RyYXdJbWFnZV8wN2MzN2Y4NTYwZTU4YmJkPWZ1bmN0aW9uKCl7cmV0dXJuIGEoZnVuY3Rpb24oZSx0LHIsaSxhLG8scyxjLGwsdSl7bihlKS5kcmF3SW1hZ2Uobih0KSxyLGksYSxvLHMsYyxsLHUpfSxhcmd1bWVudHMpfSx0LndiZy5fX3diZ19lbmNyeXB0Xzc2NjIyMWQ2Njc5YTAwY2Q9ZnVuY3Rpb24oKXtyZXR1cm4gYShmdW5jdGlvbihlLHQscixhLG8pe3JldHVybiBpKG4oZSkuZW5jcnlwdChuKHQpLG4ociksbChhLG8pKSl9LGFyZ3VtZW50cyl9LHQud2JnLl9fd2JnX2ZvckVhY2hfZDZhMDVjYTk2NDIyZWZmOT1mdW5jdGlvbihlLHQscil7dHJ5e3ZhciBpPXthOnQsYjpyfTtuKGUpLmZvckVhY2goKGUsdCxuKT0+e2xldCByPWkuYTtpLmE9MDt0cnl7cmV0dXJuIGoocixpLmIsZSx0LG4pfWZpbmFsbHl7aS5hPXJ9fSl9ZmluYWxseXtpLmE9aS5iPTB9fSx0LndiZy5fX3diZ19mcm9tXzJhNWQzZTIxOGU2N2FhODU9ZnVuY3Rpb24oZSl7cmV0dXJuIGkoQXJyYXkuZnJvbShuKGUpKSl9LHQud2JnLl9fd2JnX2dldFByb3RvdHlwZU9mXzA4YWFhY2VhN2UzMDBhMzg9ZnVuY3Rpb24oKXtyZXR1cm4gYShmdW5jdGlvbihlKXtyZXR1cm4gaShSZWZsZWN0LmdldFByb3RvdHlwZU9mKG4oZSkpKX0sYXJndW1lbnRzKX0sdC53YmcuX193YmdfZ2V0XzY3YjJiYTYyZmMzMGRlMTI9ZnVuY3Rpb24oKXtyZXR1cm4gYShmdW5jdGlvbihlLHQpe3JldHVybiBpKFJlZmxlY3QuZ2V0KG4oZSksbih0KSkpfSxhcmd1bWVudHMpfSx0LndiZy5fX3diZ19oYXNfYTVlYTkxMTdmMjU4YTBlYz1mdW5jdGlvbigpe3JldHVybiBhKGZ1bmN0aW9uKGUsdCl7cmV0dXJuIFJlZmxlY3QuaGFzKG4oZSksbih0KSl9LGFyZ3VtZW50cyl9LHQud2JnLl9fd2JnX2hlaWdodF9kM2YzOWUxMmYwZjYyMTIxPWZ1bmN0aW9uKGUpe3JldHVybiBuKGUpLmhlaWdodH0sdC53YmcuX193YmdfaW1wb3J0S2V5Xzk1M2FiYWE4ZTY1NWFiMDQ9ZnVuY3Rpb24oKXtyZXR1cm4gYShmdW5jdGlvbihlLHQscixhLG8scyxjLGwpe3JldHVybiBpKG4oZSkuaW1wb3J0S2V5KGQodCxyKSxuKGEpLGQobyxzKSxjIT09MCxuKGwpKSl9LGFyZ3VtZW50cyl9LHQud2JnLl9fd2JnX2luc3RhbmNlb2ZfV2luZG93X2RlZjczZWEwOTU1ZmM1Njk9ZnVuY3Rpb24oZSl7dmFyIHQ7dHJ5e3ZhciBnPW4oZSk7dD1nIGluc3RhbmNlb2YgV2luZG93fHxnPT09Z2xvYmFsVGhpc3x8ISFnJiZnLndpbmRvdz09PWcmJiEhZy5kb2N1bWVudH1jYXRjaChnKXt0PSExfXJldHVybiB0fSx0LndiZy5fX3diZ19sZW5ndGhfYTQ0NjE5M2RjMjJjMTJmOD1mdW5jdGlvbihlKXtyZXR1cm4gbihlKS5sZW5ndGh9LHQud2JnLl9fd2JnX2xlbmd0aF9kNTY3Mzc5OTEwNzg1ODFiPWZ1bmN0aW9uKGUpe3JldHVybiBuKGUpLmxlbmd0aH0sdC53YmcuX193YmdfbGVuZ3RoX2UyZDJhNDkxMzJjMWIyNTY9ZnVuY3Rpb24oZSl7cmV0dXJuIG4oZSkubGVuZ3RofSx0LndiZy5fX3diZ19uZXdfMjNhMjY2NWZhYzgzYzYxMT1mdW5jdGlvbihlLHQpe3RyeXt2YXIgbj17YTplLGI6dH07cmV0dXJuIGkobmV3IFByb21pc2UoKGUsdCk9PntsZXQgcj1uLmE7bi5hPTA7dHJ5e3JldHVybiBNKHIsbi5iLGUsdCl9ZmluYWxseXtuLmE9cn19KSl9ZmluYWxseXtuLmE9bi5iPTB9fSx0LndiZy5fX3diZ19uZXdfNDA1ZTIyZjM5MDU3NmNlMj1mdW5jdGlvbigpe3JldHVybiBpKHt9KX0sdC53YmcuX193YmdfbmV3Xzc4ZmViMTA4YjY0NzI3MTM9ZnVuY3Rpb24oKXtyZXR1cm4gaShbXSl9LHQud2JnLl9fd2JnX25ld19hMTIwMDJhN2Y5MWM3NWJlPWZ1bmN0aW9uKGUpe3JldHVybiBpKG5ldyBVaW50OEFycmF5KG4oZSkpKX0sdC53YmcuX193YmdfbmV3bm9hcmdzXzEwNWVkNDcxNDc1YWFmNTA9ZnVuY3Rpb24oZSx0KXtyZXR1cm4gaShGdW5jdGlvbihkKGUsdCkpKX0sdC53YmcuX193YmdfbmV3d2l0aGJ5dGVvZmZzZXRhbmRsZW5ndGhfZDk3ZTYzN2ViZTE0NWE5YT1mdW5jdGlvbihlLHQscil7cmV0dXJuIGkobmV3IFVpbnQ4QXJyYXkobihlKSx0Pj4+MCxyPj4+MCkpfSx0LndiZy5fX3diZ19wYXJzZV9kZWYyZTI0ZWYxMjUyYWZmPWZ1bmN0aW9uKCl7cmV0dXJuIGEoZnVuY3Rpb24oZSx0KXtyZXR1cm4gaShKU09OLnBhcnNlKGQoZSx0KSkpfSxhcmd1bWVudHMpfSx0LndiZy5fX3diZ19wdXNoXzczN2NmYzhjMTQzMmMyYzY9ZnVuY3Rpb24oZSx0KXtyZXR1cm4gbihlKS5wdXNoKG4odCkpfSx0LndiZy5fX3diZ19xdWV1ZU1pY3JvdGFza185N2Q5MmI0ZmNjOGE2MWM1PWZ1bmN0aW9uKGUpe3F1ZXVlTWljcm90YXNrKG4oZSkpfSx0LndiZy5fX3diZ19xdWV1ZU1pY3JvdGFza19kMzIxOWRlZjgyNTUyNDg1PWZ1bmN0aW9uKGUpe2xldCB0PW4oZSkucXVldWVNaWNyb3Rhc2s7cmV0dXJuIGkodCl9LHQud2JnLl9fd2JnX3Jlc29sdmVfNDg1MTc4NWM5YzVmNTczZD1mdW5jdGlvbihlKXtyZXR1cm4gaShQcm9taXNlLnJlc29sdmUobihlKSkpfSx0LndiZy5fX3diZ19yb3RhdGVfOWEzYzc0NzdlN2ZiY2Q0MD1mdW5jdGlvbigpe3JldHVybiBhKGZ1bmN0aW9uKGUsdCl7bihlKS5yb3RhdGUodCl9LGFyZ3VtZW50cyl9LHQud2JnLl9fd2JnX3NldFRyYW5zZm9ybV84YzRkOTU0Y2FmYjM0Yjc1PWZ1bmN0aW9uKCl7cmV0dXJuIGEoZnVuY3Rpb24oZSx0LHIsaSxhLG8scyl7bihlKS5zZXRUcmFuc2Zvcm0odCxyLGksYSxvLHMpfSxhcmd1bWVudHMpfSx0LndiZy5fX3diZ19zZXRfNjU1OTViZGQ4NjhiMzAwOT1mdW5jdGlvbihlLHQscil7bihlKS5zZXQobih0KSxyPj4+MCl9LHQud2JnLl9fd2JnX3NldF9iYjhjZWNmNmE2MmI5ZjQ2PWZ1bmN0aW9uKCl7cmV0dXJuIGEoZnVuY3Rpb24oZSx0LHIpe3JldHVybiBSZWZsZWN0LnNldChuKGUpLG4odCksbihyKSl9LGFyZ3VtZW50cyl9LHQud2JnLl9fd2JnX3N0YXRpY19hY2Nlc3Nvcl9HTE9CQUxfODhhOTAyZDEzYTU1N2QwNz1mdW5jdGlvbigpe2xldCBlPXR5cGVvZiBnbG9iYWw+YHVgP251bGw6Z2xvYmFsO3JldHVybiBvKGUpPzA6aShlKX0sdC53YmcuX193Ymdfc3RhdGljX2FjY2Vzc29yX0dMT0JBTF9USElTXzU2NTc4YmU3ZTlmODMyYjA9ZnVuY3Rpb24oKXtsZXQgZT10eXBlb2YgZ2xvYmFsVGhpcz5gdWA/bnVsbDpnbG9iYWxUaGlzO3JldHVybiBvKGUpPzA6aShlKX0sdC53YmcuX193Ymdfc3RhdGljX2FjY2Vzc29yX1NFTEZfMzdjNWQ0MThlNGJmNTgxOT1mdW5jdGlvbigpe2xldCBlPXR5cGVvZiBzZWxmPmB1YD9udWxsOnNlbGY7cmV0dXJuIG8oZSk/MDppKGUpfSx0LndiZy5fX3diZ19zdGF0aWNfYWNjZXNzb3JfV0lORE9XXzVkZTM3MDQzYTkxYTljNDA9ZnVuY3Rpb24oKXtsZXQgZT10eXBlb2Ygd2luZG93PmB1YD9udWxsOndpbmRvdztyZXR1cm4gbyhlKT8wOmkoZSl9LHQud2JnLl9fd2JnX3N1YnN0cmluZ19jMjEyYzA0NGUzMzliYmIwPWZ1bmN0aW9uKGUsdCxyKXtyZXR1cm4gaShuKGUpLnN1YnN0cmluZyh0Pj4+MCxyPj4+MCkpfSx0LndiZy5fX3diZ19zdWJ0bGVfZDA2MTQxOTNhMGI3YTYyNj1mdW5jdGlvbihlKXtsZXQgdD1uKGUpLnN1YnRsZTtyZXR1cm4gaSh0KX0sdC53YmcuX193YmdfdGhlbl80NGI3Mzk0NmQyZmIzZTdkPWZ1bmN0aW9uKGUsdCl7cmV0dXJuIGkobihlKS50aGVuKG4odCkpKX0sdC53YmcuX193YmdfdGhlbl9jZDY0OWNjYmE3M2JkODlhPWZ1bmN0aW9uKGUsdCxyKXtyZXR1cm4gaShuKGUpLnRoZW4obih0KSxuKHIpKSl9LHQud2JnLl9fd2JnX3dpZHRoXzRmMzM0ZmM0N2VmMDNkZTE9ZnVuY3Rpb24oZSl7cmV0dXJuIG4oZSkud2lkdGh9LHQud2JnLl9fd2JpbmRnZW5fY2JfZHJvcD1mdW5jdGlvbihlKXtsZXQgdD1wKGUpLm9yaWdpbmFsO3JldHVybiB0LmNudC0tPT0xJiYodC5hPTAsITApfSx0LndiZy5fX3diaW5kZ2VuX2Nsb3N1cmVfd3JhcHBlcjIxOT1mdW5jdGlvbihlLHQsbil7cmV0dXJuIGkoaChlLHQsNzIsQSkpfSx0LndiZy5fX3diaW5kZ2VuX2RlYnVnX3N0cmluZz1mdW5jdGlvbih0LHIpe2xldCBpPWIoZyhuKHIpKSxlLl9fd2JpbmRnZW5fbWFsbG9jLGUuX193YmluZGdlbl9yZWFsbG9jKSxhPV87UygpLnNldEludDMyKHQrNCxhLCEwKSxTKCkuc2V0SW50MzIodCswLGksITApfSx0LndiZy5fX3diaW5kZ2VuX2lzX2Z1bmN0aW9uPWZ1bmN0aW9uKGUpe3JldHVybiB0eXBlb2YgbihlKT09YGZ1bmN0aW9uYH0sdC53YmcuX193YmluZGdlbl9pc19udWxsPWZ1bmN0aW9uKGUpe3JldHVybiBuKGUpPT09bnVsbH0sdC53YmcuX193YmluZGdlbl9pc191bmRlZmluZWQ9ZnVuY3Rpb24oZSl7cmV0dXJuIG4oZSk9PT12b2lkIDB9LHQud2JnLl9fd2JpbmRnZW5fbWVtb3J5PWZ1bmN0aW9uKCl7bGV0IHQ9ZS5tZW1vcnk7cmV0dXJuIGkodCl9LHQud2JnLl9fd2JpbmRnZW5fbnVtYmVyX2dldD1mdW5jdGlvbihlLHQpe2xldCByPW4odCksaT10eXBlb2Ygcj09YG51bWJlcmA/cjp2b2lkIDA7UygpLnNldEZsb2F0NjQoZSs4LG8oaSk/MDppLCEwKSxTKCkuc2V0SW50MzIoZSswLCFvKGkpLCEwKX0sdC53YmcuX193YmluZGdlbl9udW1iZXJfbmV3PWZ1bmN0aW9uKGUpe3JldHVybiBpKGUpfSx0LndiZy5fX3diaW5kZ2VuX29iamVjdF9jbG9uZV9yZWY9ZnVuY3Rpb24oZSl7cmV0dXJuIGkobihlKSl9LHQud2JnLl9fd2JpbmRnZW5fb2JqZWN0X2Ryb3BfcmVmPWZ1bmN0aW9uKGUpe3AoZSl9LHQud2JnLl9fd2JpbmRnZW5fc3RyaW5nX2dldD1mdW5jdGlvbih0LHIpe2xldCBpPW4ociksYT10eXBlb2YgaT09YHN0cmluZ2A/aTp2b2lkIDA7dmFyIHM9byhhKT8wOmIoYSxlLl9fd2JpbmRnZW5fbWFsbG9jLGUuX193YmluZGdlbl9yZWFsbG9jKSxjPV87UygpLnNldEludDMyKHQrNCxjLCEwKSxTKCkuc2V0SW50MzIodCswLHMsITApfSx0LndiZy5fX3diaW5kZ2VuX3N0cmluZ19uZXc9ZnVuY3Rpb24oZSx0KXtyZXR1cm4gaShkKGUsdCkpfSx0LndiZy5fX3diaW5kZ2VuX3Rocm93PWZ1bmN0aW9uKGUsdCl7dGhyb3cgRXJyb3IoZChlLHQpKX0sdH1mdW5jdGlvbiBGKHQsbil7cmV0dXJuIGU9dC5leHBvcnRzLEkuX193YmluZGdlbl93YXNtX21vZHVsZT1uLHg9bnVsbCxzPW51bGwsZX1hc3luYyBmdW5jdGlvbiBJKHQpe2lmKGUhPT12b2lkIDApcmV0dXJuIGU7dCE9PXZvaWQgMCYmKE9iamVjdC5nZXRQcm90b3R5cGVPZih0KT09PU9iamVjdC5wcm90b3R5cGU/e21vZHVsZV9vcl9wYXRoOnR9PXQ6Y29uc29sZS53YXJuKGB1c2luZyBkZXByZWNhdGVkIHBhcmFtZXRlcnMgZm9yIHRoZSBpbml0aWFsaXphdGlvbiBmdW5jdGlvbjsgcGFzcyBhIHNpbmdsZSBvYmplY3QgaW5zdGVhZGApKSx0PT09dm9pZCAwJiYodD0odHlwZW9mIGdsb2JhbFRoaXMuX19FQkpEX0dMVUVfV0FTTV9fPT1gZnVuY3Rpb25gP2dsb2JhbFRoaXMuX19FQkpEX0dMVUVfV0FTTV9fKCk6bnVsbCl8fGBicl9jb3JlX2JnLkJZNDlrclVvLndhc21gKTtsZXQgbj1QKCk7KHR5cGVvZiB0PT1gc3RyaW5nYHx8dHlwZW9mIFJlcXVlc3Q9PWBmdW5jdGlvbmAmJnQgaW5zdGFuY2VvZiBSZXF1ZXN0fHx0eXBlb2YgVVJMPT1gZnVuY3Rpb25gJiZ0IGluc3RhbmNlb2YgVVJMKSYmKHQ9ZmV0Y2godCkpO2xldHtpbnN0YW5jZTpyLG1vZHVsZTppfT1hd2FpdCBOKGF3YWl0IHQsbik7cmV0dXJuIEYocixpKX1yZXR1cm4geyJkZWNyeXB0X3Nlc3Npb24iOkMsImRlY3J5cHRfeGoiOncsImRlZmF1bHQiOkksImdldF9wYWdlX25hbWUiOmssImdldF9zcGVjaWFsX3VybCI6Tywib3Blbl9wYXJhbSI6RCwicmFuZ2VzIjpFLCJzaHVmZmxlIjpUfTs=';
     const EBJ_WASM_B64 = 'AGFzbQEAAAABhAIhYAJ/fwF/YAF/AGACf38AYAF/AX9gA39/fwF/YAN/f38AYAR/f39/AGAAAX9gBX9/f39/AGAFf39/f38Bf2AGf39/f39/AGAHf39/f39/fwBgBH9/f38Bf2AIf39/f39/f38Bf2AGf39/f39/AX9gAABgAXwBf2AEf398fABgCn9/fHx8fHx8fHwAYAV/fHx8fABgAn98AGAHf3x8fHx8fABgB39/f39/f38Bf2ADfn9/AX9gC39/f39/f39/f39/AX9gC39/f3x8fHx8fHx8AGADf398AGAFf39+f38AYAR/fn9/AGAFf398f38AYAR/fH9/AGAFf399f38AYAR/fX9/AAL6EDwDd2JnGl9fd2JpbmRnZW5fb2JqZWN0X2Ryb3BfcmVmAAEDd2JnFV9fd2JpbmRnZW5fc3RyaW5nX25ldwAAA3diZxVfX3diaW5kZ2VuX251bWJlcl9uZXcAEAN3YmcbX193YmluZGdlbl9vYmplY3RfY2xvbmVfcmVmAAMDd2JnFV9fd2JpbmRnZW5fbnVtYmVyX2dldAACA3diZxdfX3diaW5kZ2VuX2lzX3VuZGVmaW5lZAADA3diZxVfX3diaW5kZ2VuX3N0cmluZ19nZXQAAgN3YmcSX193YmluZGdlbl9jYl9kcm9wAAMDd2JnEl9fd2JpbmRnZW5faXNfbnVsbAADA3diZyVfX3diZ19xdWV1ZU1pY3JvdGFza185N2Q5MmI0ZmNjOGE2MWM1AAEDd2JnJV9fd2JnX3F1ZXVlTWljcm90YXNrX2QzMjE5ZGVmODI1NTI0ODUAAwN3YmcWX193YmluZGdlbl9pc19mdW5jdGlvbgADA3diZyhfX3diZ19pbnN0YW5jZW9mX1dpbmRvd19kZWY3M2VhMDk1NWZjNTY5AAMDd2JnHV9fd2JnX2NyeXB0b18xMjU3NmNkNjYyNDY5OThiAAMDd2JnHl9fd2JnX2RlY3J5cHRfZDUyZjJkNzFhNWI4YmVkZgAJA3diZx1fX3diZ19kaWdlc3RfYWM1NTRkZWEwMTgwYzY0ZAAJA3diZx5fX3diZ19lbmNyeXB0Xzc2NjIyMWQ2Njc5YTAwY2QACQN3YmcgX193YmdfaW1wb3J0S2V5Xzk1M2FiYWE4ZTY1NWFiMDQADQN3YmcdX193YmdfY2FudmFzXzliYmNkYjk0YTk3NzgwN2EAAwN3YmcgX193YmdfZHJhd0ltYWdlXzAzZjdhZTJhOTVhOTYwNWYAEQN3YmcgX193YmdfZHJhd0ltYWdlXzA3YzM3Zjg1NjBlNThiYmQAEgN3YmcgX193YmdfY2xlYXJSZWN0XzhlNGJhN2VhMGUwNjcxMWEAEwN3YmcdX193Ymdfcm90YXRlXzlhM2M3NDc3ZTdmYmNkNDAAFAN3YmcjX193Ymdfc2V0VHJhbnNmb3JtXzhjNGQ5NTRjYWZiMzRiNzUAFQN3YmcdX193Ymdfc3VidGxlX2QwNjE0MTkzYTBiN2E2MjYAAwN3YmccX193Ymdfd2lkdGhfNGYzMzRmYzQ3ZWYwM2RlMQADA3diZx1fX3diZ19oZWlnaHRfZDNmMzllMTJmMGY2MjEyMQADA3diZx1fX3diZ19sZW5ndGhfZTJkMmE0OTEzMmMxYjI1NgADA3diZxpfX3diZ19uZXdfNzhmZWIxMDhiNjQ3MjcxMwAHA3diZyBfX3diZ19uZXdub2FyZ3NfMTA1ZWQ0NzE0NzVhYWY1MAAAA3diZxpfX3diZ19nZXRfNjdiMmJhNjJmYzMwZGUxMgAAA3diZxtfX3diZ19jYWxsXzY3MmE0ZDIxNjM0ZDRhMjQAAAN3YmcaX193YmdfbmV3XzQwNWUyMmYzOTA1NzZjZTIABwN3YmcdX193YmdfbGVuZ3RoX2Q1NjczNzk5MTA3ODU4MWIAAwN3YmcbX193YmdfZnJvbV8yYTVkM2UyMThlNjdhYTg1AAMDd2JnHl9fd2JnX2ZvckVhY2hfZDZhMDVjYTk2NDIyZWZmOQAFA3diZxtfX3diZ19wdXNoXzczN2NmYzhjMTQzMmMyYzYAAAN3YmcbX193YmdfY2FsbF83Y2NjZGQ2OWUwNzkxYWUyAAQDd2JnIF9fd2JnX3N1YnN0cmluZ19jMjEyYzA0NGUzMzliYmIwAAQDd2JnGl9fd2JnX25ld18yM2EyNjY1ZmFjODNjNjExAAADd2JnHl9fd2JnX3Jlc29sdmVfNDg1MTc4NWM5YzVmNTczZAADA3diZxtfX3diZ190aGVuXzQ0YjczOTQ2ZDJmYjNlN2QAAAN3YmcbX193YmdfdGhlbl9jZDY0OWNjYmE3M2JkODlhAAQDd2JnMl9fd2JnX3N0YXRpY19hY2Nlc3Nvcl9HTE9CQUxfVEhJU181NjU3OGJlN2U5ZjgzMmIwAAcDd2JnK19fd2JnX3N0YXRpY19hY2Nlc3Nvcl9TRUxGXzM3YzVkNDE4ZTRiZjU4MTkABwN3YmctX193Ymdfc3RhdGljX2FjY2Vzc29yX1dJTkRPV181ZGUzNzA0M2E5MWE5YzQwAAcDd2JnLV9fd2JnX3N0YXRpY19hY2Nlc3Nvcl9HTE9CQUxfODhhOTAyZDEzYTU1N2QwNwAHA3diZx1fX3diZ19idWZmZXJfNjA5Y2MzZWVlNTFlZDE1OAADA3diZzFfX3diZ19uZXd3aXRoYnl0ZW9mZnNldGFuZGxlbmd0aF9kOTdlNjM3ZWJlMTQ1YTlhAAQDd2JnGl9fd2JnX25ld19hMTIwMDJhN2Y5MWM3NWJlAAMDd2JnGl9fd2JnX3NldF82NTU5NWJkZDg2OGIzMDA5AAUDd2JnHV9fd2JnX2xlbmd0aF9hNDQ2MTkzZGMyMmMxMmY4AAMDd2JnJV9fd2JnX2dldFByb3RvdHlwZU9mXzA4YWFhY2VhN2UzMDBhMzgAAwN3YmcaX193YmdfaGFzX2E1ZWE5MTE3ZjI1OGEwZWMAAAN3YmcaX193Ymdfc2V0X2JiOGNlY2Y2YTYyYjlmNDYABAN3YmccX193YmdfcGFyc2VfZGVmMmUyNGVmMTI1MmFmZgAAA3diZxdfX3diaW5kZ2VuX2RlYnVnX3N0cmluZwACA3diZxBfX3diaW5kZ2VuX3Rocm93AAIDd2JnEV9fd2JpbmRnZW5fbWVtb3J5AAcDd2JnHV9fd2JpbmRnZW5fY2xvc3VyZV93cmFwcGVyMjE5AAQDlgKUAgMABAAGCAUGAQoGCwsEAAQLAQUOBQgCAgQDBQICBAIPAgUGAQIAAwIWAwMJAAIXAAIGAQEFAgAGAgYHAQoCBgIBAAEABwECBQECAgIGAwUIBQIFBgUFBwUFGAEKAQAAAgAHAgIBAQEBDQEIAwIIAAECAwMDAgUGBQUFBQIEAgICGQYCBgEFBQQEAQIAAgICBQIFAAAGGgkBDwICAAwAAAAAAAYGBgIABgUAAAICAQEHAAUOCBsdCR8AAgICBgIFBQQDAQEAAwMCAAAAAQIBAQEBAAAMBQMCAQMACAACAAIEAAUBAgIAAAIDAAMDBgUCAwMCAwAAAAAABAMAAAIDAwMDAgQCBAUEAgMAAwAAAAMDAwMBBQQHAXABmQGZAQUDAQARBgkBfwFBgIDAAAsHhwQRBm1lbW9yeQIAD2RlY3J5cHRfc2Vzc2lvbgCkAQpkZWNyeXB0X3hqAJsCB3NodWZmbGUA0wEGcmFuZ2VzAMwCCm9wZW5fcGFyYW0AzQIPZ2V0X3NwZWNpYWxfdXJsAJYBDWdldF9wYWdlX25hbWUAuAEUX193YmluZGdlbl9leG5fc3RvcmUAngITX193YmluZGdlbl9leHBvcnRfMQEAEV9fd2JpbmRnZW5fbWFsbG9jAM8BEl9fd2JpbmRnZW5fcmVhbGxvYwDYAR9fX3diaW5kZ2VuX2FkZF90b19zdGFja19wb2ludGVyALUCD19fd2JpbmRnZW5fZnJlZQCQAnxfZHluX2NvcmVfX29wc19fZnVuY3Rpb25fX0ZuTXV0X19BX19fX091dHB1dF9fX1JfYXNfd2FzbV9iaW5kZ2VuX19jbG9zdXJlX19XYXNtQ2xvc3VyZV9fX2Rlc2NyaWJlX19pbnZva2VfX2hkNWI2ZGYwYWE1YTViZjE0APsBP3dhc21fYmluZGdlbl9fY29udmVydF9fY2xvc3VyZXNfX2ludm9rZTNfbXV0X19oMjg0MGQ0NTZjZjkwNWExNwDvAT93YXNtX2JpbmRnZW5fX2NvbnZlcnRfX2Nsb3N1cmVzX19pbnZva2UyX211dF9faDE2YmY4NzUxMjg3Y2UzNjEA+AEJrQICAEEBC0WOArEClwKZAsABxwLOAuABQ/0BrQGuAd8BRocCnAGJAd4BbagCdZcCtgLOApMBkAGUAZEBoAE/oQE9sgKaAf4BlwKiAsMCmgKSAs8CswL+Ac4C1gH3AewBwQHOAogC9gHHAbEBzgLaAYUChAKXAs4CtwH5AZgCrwH+Ac4C4QGYAcUBpQEAQccAC1L7AegB+gGrAZ8BY5MCyQG7AcgBugHOAn7OAf4BwwKaAs8CzgLlAc4C2QHyAZcB7wHyAe4B/AH4Ae8B7wHzAfEB8AGAAYkCigKLAowClwL/AbkBzgLDAWjbAeYBzgL0Af4BogKhAp8CmALMAaMC6gGCAZ4BzgKgAoACzgLEAa8C3AHOAoYCsAKVAqUCqgFyzgKgAs4CWX/iAbQCfd0BCqWJB5QC+yECD38BfiMAQRBrIgskAAJA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NgIADAELQazlwQAoAgANAUG05cEAKAIAIQVBsOXBACgCACEGQbDlwQAgASkCADcCAEG45cEAIAFBCGooAgA2AgBBrOXBAEEANgIAIAZFIAVFcg0AIAYQRAsgA0EQaiQADAELQdynwABBECADQQ9qQeynwABB+KrAABCpAQALQQALIQMgAEGwAWooAgAEQCAAQawBaigCABBECyAAQZwBaigCAARAIABBmAFqKAIAEEQLIABBkAFqKAIABEAgAEGMAWooAgAQRAsgAEGEAWooAgAEQCAAQYABaigCABBECyAAQbwBaigCAARAIABBuAFqKAIAEEQLIABBqAFqKAIAIgFBhAFJDQEgARAADAELIABBhAFqKAIARQRAQQEhAwwBC0EBIQMgAEGAAWooAgAQRAsgAEH4AGooAgAEQCAAQfQAaigCABBECyAAQewAaigCAARAIABB6ABqKAIAEEQLIABB4ABqKAIABEAgAEHcAGooAgAQRAsgAEHUAGooAgAEQCAAQdAAaigCABBECyAJQQE6AAALAkACQCADQQJGBEBBAyEEIABBAzoA/AEMAQsgCxBNIABBAToA/AEgBEGAASADGyEBAkAgAwRAIAIgATYCUCACQYABNgIwIAJBCGogAEGEAmogAkEwaiACQdAAahC/ASACKAIIRQRAIAIoAgwiAUGEAU8EQCABEAALIAIoAjAiAUGEAU8EQCABEAALIAIoAlAiAUGEAUkNAiABEAAMAgtBsJ/AAEExELgCAAsgAiABNgJQIAJBgAE2AjAgAiAAQYACaiACQTBqIAJB0ABqEL8BIAIoAgANAiACKAIEIgFBhAFPBEAgARAACyACKAIwIgFBhAFPBEAgARAACyACKAJQIgFBhAFJDQAgARAACyAAKAKAAiIBQYQBTwRAIAEQAAtBASEEIAAoAoQCIgFBhAFJDQAgARAACyAAIAQ6AIgEIAJB4ABqJAAgA0ECRg8LQbCfwABBMRC4AgALrxMBCn8jAEHQAWsiAyQAIAMCf0Gg5cEALQAARQRAQaTlwQBBAjYCAEGg5cEAQQE6AABBAgwBC0Gk5cEAKAIACzYCkAEgA0EgaiADQZABahBXAkACQAJAAkACQAJAIANBxQBqLQAARQRAAkAgAUUEQEEBIQcMAQsgAUEASA0FQb3lwQAtAAAaIAFBARCcAiIHRQ0CCyAHIAAgARDAAhogASEJDAMLIANBkAFqIgVBtYvAACAAIAEQeiADKAKQASIARQ0BIAMoApQBIANB6ABqIAAgAygCmAEQXSADKAJsIQkgBSADKAJoIgcgAygCcCIBEFACQCADKAKQAUUNACADQZgBajEAAEIghkKAgICAIFENAEEAIQEgCUUEQEEBIQdBACEJDAELIAcQREEAIQlBASEHC0UNAiAAEEQMAgtBASABEL0CAAtBmI7AAEETQayOwAAQ5AEACwJAIANBxABqLQAARQ0AIANBEGogA0HoAGogA0GEAWoCfwJAIAIgA0FAaygCACIASQRAIAMoAjggA0EANgJwIANCATcCaCADIAE2ApgBIAMgCTYClAEgAyAHNgKQASADQZABaiIAKAIAIgEgACgCCBABIQQgACgCBARAIAEQRAsgAyAENgKEASACQRRsaiIEKAIQIgkNAUEAIQBBACEFQQAMAgsgAiAAQfiNwAAQtAEACyAEQRBqIARBDGohCEEAIQJBACEFQQAhAEEAIQECQANAIAQoAggiBiABSwRAIANBGGogA0HoAGogA0GEAWogCCgCACIGIAQoAgAgAmooAgBsIAYgBSAAQQFxEEwgAkEEaiECIAMtABlBAXEhACADLQAYIQUgAUEBaiIBIAlHDQEMAgsLIAEgBkGIjsAAELQBAAsoAgALIAQoAgxsQQAgBSAAEEwgAygCbCEJIANBkAFqIAMoAmgiByADKAJwIgEQUAJAIAMoApABRQ0AIANBmAFqMQAAQiCGQoCAgIAgUQ0AQQAhASAJBEAgBxBEC0EBIQdBACEJCyADKAKEASIAQYQBSQ0AIAAQAAsgA0GQAWoiACAHIAFBmIvAABBAIANB6ABqIAAQUwJAIAMoAmgEQAJAIAMoAmwiAEUNACAAIAFPBEAgACABRg0BDAYLIAAgB2osAABBv39MDQULIAMgBzYCYCADIAA2AmRBACEIIANBADYCjAEgA0IBNwKEASADQZABaiICIAAgB2oiBiABIABrIgpBrIvAABBAIANB6ABqIAIQUwJAIAMoAmhFBEBBASECQQAhAUEAIQUMAQtBACEBQQEhAkEAIQADQCADKAJwIQUgAygCbCAAayIEIAMoAogBIAFrSwRAIANBhAFqIAEgBBCKASADKAKEASECIAMoAowBIQELIAEgAmogACAGaiAEEMACGiADIAEgBGoiATYCjAEgAygCiAEgAWtBAU0EQCADQYQBaiABQQIQigEgAygCjAEhAQsgAygChAEiAiABakGsxAA7AAAgAyABQQJqIgE2AowBIANB6ABqIANBkAFqEFMgBSEAIAMoAmgNAAsgAygCiAEhCAsgCiAFayIEIAggAWtLBEAgA0GEAWogASAEEIoBIAMoAoQBIQIgAygCjAEhAQsgASACaiAFIAZqIAQQwAIaIAMoAogBQQAhACADQQA2AowBIANCATcChAEgA0GQAWoiBSACIAEgBGoiBkGvi8AAEEAgA0HoAGogBRBTAkAgAygCaEUEQEEBIQhBACEBQQAhBAwBC0EAIQFBASEIQQAhBQNAIAMoAnAhBCADKAJsIAVrIgAgAygCiAEgAWtLBEAgA0GEAWogASAAEIoBIAMoAoQBIQggAygCjAEhAQsgASAIaiACIAVqIAAQwAIaIAMgACABaiIBNgKMASADKAKIASABa0EBTQRAIANBhAFqIAFBAhCKASADKAKMASEBCyADKAKEASIIIAFqQfvEADsAACADIAFBAmoiATYCjAEgA0HoAGogA0GQAWoQUyAEIQUgAygCaA0ACyADKAKIASEACyAGIARrIgYgACABa0sEQCADQYQBaiABIAYQigEgAygChAEhCCADKAKMASEBCyABIAhqIAIgBGogBhDAAhogAygCiAFBACEFIANBADYCjAEgA0IBNwKEASADQZABaiIAIAggASAGaiIMQbKLwAAQQCADQegAaiAAEFMCQCADKAJoRQRAQQEhBEEAIQFBACEADAELQQAhAUEBIQQDQCADKAJwIQAgAygCbCAFayIGIAMoAogBIAFrSwRAIANBhAFqIAEgBhCKASADKAKEASEEIAMoAowBIQELIAEgBGogBSAIaiAGEMACGiADIAEgBmoiATYCjAEgAygCiAEgAWtBAU0EQCADQYQBaiABQQIQigEgAygCjAEhAQsgAygChAEiBCABakGi9AA7AAAgAyABQQJqIgE2AowBIANB6ABqIANBkAFqEFMgACEFIAMoAmgNAAsgAygCiAEhBQsgDCAAayIGIAUgAWtLBEAgA0GEAWogASAGEIoBIAMoAoQBIQQgAygCjAEhAQsgASAEaiAAIAhqIAYQwAIaIANBgAFqIAEgBmo2AgAgA0H0AGpBAzYCACADQZwBakICNwIAIAMgAykChAE3A3ggA0EENgJsIANBAjYClAEgA0Gci8AANgKQASADIANB+ABqNgJwIAMgA0HgAGo2AmggAyADQegAajYCmAEgA0GEAWogA0GQAWoQYCADKAJ8BEAgAygCeBBECwRAIAgQRAsEQCACEEQLIAMoAowBIQEgAygChAEhAAwBCwJAIAFFBEBBASEADAELIAFBAEgNAkG95cEALQAAGiABQQEQnAIiAEUNAwsgACAHIAEQwAIhAiADIAE2AowBIAMgATYCiAEgAyACNgKEAQsgA0EIaiAAIAEQywEgAygCDCEBAkAgAygCCEUEQCABIQQMAQtBgQEhBCABQYQBSQ0AIAEQAAsgCQRAIAcQRAsgAygCJARAIAMoAiAQRAsgA0EwaigCAARAIAMoAiwQRAsgAygCOCEFIANBQGsoAgAiAgRAIAUhAQNAIAFBBGooAgAEQCABKAIAEEQLIAFBFGohASACQQFrIgINAAsLIANBPGooAgAEQCAFEEQLIAMoAkghBSADQdAAaigCACICBEAgBSEBA0AgAUEEaigCAARAIAEoAgAQRAsgAUEUaiEBIAJBAWsiAg0ACwsgA0HMAGooAgAEQCAFEEQLIAMoAogBBEAgABBECyADQdABaiQAIAQPCxDUAQALQQEgARC9AgALIAcgAUEAIABBzIDAABCWAgALiRIBDH8jAEGwAWsiAiQAAkACQAJAAkACQAJAAkACfwJAAkACQAJAAkACQAJAAkACQAJAAkACQCAALQDAAUEBaw4DBQIBAAsgAEEIaiAAQeQAakHcABDAAhoLAkACQAJAAkAgAEHgAGotAABBAWsOAwYEAAELIABBFGohByAAQdwAaiIKLQAAQQFrDgMHAwIBCyAAQdwAaiIKQQA6AAAgAEEUaiIHIAAoAgg2AgAgAEEgaiAAQRBqKAIANgIAIABBHGogAEEMaigCACIENgIAIABBGGogBDYCAAsgAEEkaiIEIAcpAgA3AgAgAEEsaiAHQQhqKAIANgIAIABBMGoiAyAAQSBqKAIANgIAIAJB/ABqQgI3AgAgAkGgAWpBAjYCACACQQM2AnQgAkGwl8AANgJwIAIgAzYCnAEgAkEWNgKYASACIAQ2ApQBIAIgAkGUAWo2AnggAkE4aiACQfAAahBgIABBPGoiBCACQUBrKAIANgIAIABBNGoiAyACKQI4NwIAIABB2ABqIghBADoAACAAQcQAaiAEKAIANgIAIABBQGsgAygCADYCAAwGCyAAQdgAaiIILQAAQQFrDgMBAAYFCwALQYCSwABBI0GclMAAEM0BAAtBgJLAAEEjQZSYwAAQzQEAC0GAksAAQSNB8JHAABDNAQALQYCSwABBI0HIl8AAEM0BAAsgAEFAaygCACEDAkAgAEHEAGooAgAiBEUEQEEBIQUMAQsgBEEASA0IQb3lwQAtAAAaIARBARCcAiIFRQ0JCyAFIAMgBBDAAiEDIABB0ABqIgUgBDYCACAAQcwAaiAENgIAIAAgAzYCSCACEJ0BNgJwIAJBIGogAkHwAGogACgCSCAFKAIAEL0BIAIoAnAhAyACKAIkIQQgAigCIA0BIANBhAFPBEAgAxAACyAAQdQAaiAEEFU2AgALIAJBGGogAEHUAGoiAyABEI4BIAIoAhgiBUECRg0FIAIoAhwhBCADEHwgBQ0BIAIgBDYCXCACIAJB3ABqEMYCNgJsIAJB4ABqIAJB7ABqEJsBIAIoAmAhCUEAIQQgAigCaCIDDQJBACEFQQEMAwsgA0GEAUkNACADEAALQQAhAwwCCyACIAk2AlQgAkGoAWpBATYCACACQaABakEBNgIAIAJBFzYCMCACQQE2ApgBIAJByKDAADYClAEgAiACQdQAajYCLCACQQM6AIwBIAJBCDYCiAEgAkIgNwKAASACQoCAgIAgNwJ4IAJBAjYCcCACIAJB8ABqIgY2AqQBIAIgAkEsajYCnAEgAkE4aiACQZQBahBgQQAhBUEBIAIoAjhFDQAaIAJB+ABqIg0gAkFAaygCADYCACACIAIpAjg3A3AjAEHgAGsiASQAIAlBAWoiBSADIAlqIgRHBEAgBCAFayELIAYoAgghAwNAIAEgBTYCDCABQRc2AiwgAUEBNgIkIAFBATYCFCABQcigwAA2AhAgAUEBNgIcIAEgAUEMajYCKCABQQM6AEwgAUEINgJIIAFCIDcCQCABQoCAgIAgNwI4IAFBAjYCMCABIAFBMGo2AiAgASABQShqNgIYIAFB0ABqIAFBEGoQYCABKAJQIQwgASgCWCIEIAYoAgQgA2tLBEAgBiADIAQQigEgBigCCCEDCyAGKAIAIANqIAwgBBDAAhogBiADIARqIgM2AgggASgCVARAIAwQRAsgBUEBaiEFIAtBAWsiCw0ACwsgAUHgAGokACANKAIAIQUgAigCdCEEIAIoAnALIQMgAigCZARAIAkQRAsgAigCbCIBQYQBTwRAIAEQAAsgAigCXCIBQYQBSQ0AIAEQAAsgAEHMAGooAgAEQCAAKAJIEEQLIAhBAToAACADRQRAQQAhAwwFCyACIAU2AjQgAiAENgIwIAIgAzYCLCAAQSRqIgMoAgAhAQJAIABBLGooAgAiBEECTQRAIARBAkYNAQwFCyABLAACQb9/TA0ECyACQQI2AlggAiABNgJUIAIgAzYCbCACQZQBahB3IAJB6ABqIAJBqAFqKAIANgIAIAIgAikCoAE3A2AgAigClAEhASACKAKcASIDBEAgASEEA0AgBEEEaigCAARAIAQoAgAQRAsgBEEMaiEEIANBAWsiAw0ACwsgAigCmAEEQCABEEQLIAJBjAFqQRY2AgAgAkGEAWpBFjYCACACQfwAakEBNgIAIAJBxABqQgQ3AgAgAkEENgJ0IAJBBTYCPCACQdyXwAA2AjggAiACQSxqNgKIASACIAJB4ABqNgKAASACIAJB7ABqNgJ4IAIgAkHUAGo2AnAgAiACQfAAajYCQCACQZQBaiACQThqEGAgAigCZARAIAIoAmAQRAsgAkFAayACQZwBaigCADYCACACIAIpApQBNwM4IAJB8ABqIAJBOGoQrAEgAigCeCEIIAIoAnQhBCACKAJwIQMgAigCPARAIAIoAjgQRAsgAigCMEUNBCACKAIsEEQMBAtBAyEEIABBAzoAYCAAQQM6AFwgAEEDOgBYQQEhAwwECxDUAQALQQEgBBC9AgALIAEgBEEAQQJBhJjAABCWAgALIABBOGooAgAEQCAAQTRqKAIAEEQLIABBKGooAgAEQCAAQSRqKAIAEEQLIApBAToAACAHEKIBAkACQAJAIAMEQCADIAgQASEBIAQEQCADEEQLIABBAToAYCACIAE2ApQBIAJBgAE2AnAgAkEQaiAAIAJB8ABqIAJBlAFqEL8BIAIoAhANAiACKAIUIgFBhAFPBEAgARAACyACKAJwIgFBhAFPBEAgARAACyACKAKUASIBQYQBSQ0BIAEQAAwBCyAAQQE6AGAgAiAENgKUASACQYABNgJwIAJBCGogAEEEaiACQfAAaiACQZQBahC/ASACKAIIDQIgAigCDCIBQYQBTwRAIAEQAAsgAigCcCIBQYQBTwRAIAEQAAsgAigClAEiAUGEAUkNACABEAALIAAoAgAiAUGEAU8EQCABEAALQQEhBEEAIQMgACgCBCIBQYQBSQ0CIAEQAAwCC0Gwn8AAQTEQuAIAC0Gwn8AAQTEQuAIACyAAIAQ6AMABIAJBsAFqJAAgAwvlCQIKfwF+QQEhC0EBIQVBASEGA0AgBiEHAkACQCAEIAhqIgpBA0kEQCADIAVqLQAAIgwgAyAKai0AACIFSQ0BIAUgDEcEQEEBIQsgBkEBaiEGQQAhBCAHIQgMAwtBACAEQQFqIgYgBiALRiIFGyEEIAZBACAFGyAHaiEGDAILIApBA0HQ6sAAELQBAAsgBCAHakEBaiIGIAhrIQtBACEECyAEIAZqIgVBA0kNAAtBASEFQQEhBkEAIQRBASEKA0AgBiEHAkACQCAEIAlqIg1BA0kEQCADIAVqLQAAIgwgAyANai0AACIFSw0BIAUgDEcEQEEBIQogBkEBaiEGQQAhBCAHIQkMAwtBACAEQQFqIgYgBiAKRiIFGyEEIAZBACAFGyAHaiEGDAILIA1BA0HQ6sAAELQBAAsgBCAHakEBaiIGIAlrIQpBACEECyAEIAZqIgVBA0kNAAsCQAJAAkACQAJAAkACQCAIIAkgCCAJSyIHGyIMQQNNBEAgCyAKIAcbIgYgDGoiByAGSQ0BIAdBA0sNAgJ/IAMgAyAGaiAMEMICBEAgDEEDIAxrIgtLIQdBAyEJIAMhBANAQgEgBDEAAIYgDoQhDiAEQQFqIQQgCUEBayIJDQALIAwgCyAHG0EBaiEGQX8hCCAMIQtBfwwBC0EBIQlBACEEQQEhBUEAIQsDQCAFIgcgBGoiDUEDSQRAQQMgBGsgB0F/c2oiCkEDTw0GIARBf3NBA2ogC2siCEEDTw0HAkACQCADIApqLQAAIgogAyAIai0AACIITwRAIAggCkYNASAHQQFqIQVBACEEQQEhCSAHIQsMAgsgDUEBaiIFIAtrIQlBACEEDAELQQAgBEEBaiIIIAggCUYiBRshBCAIQQAgBRsgB2ohBQsgBiAJRw0BCwtBASEJQQAhBEEBIQVBACEKA0AgBSIHIARqIgVBA0kEQEEDIARrIAdBf3NqIg1BA08NCCAEQX9zQQNqIAprIghBA08NCQJAAkAgAyANai0AACINIAMgCGotAAAiCE0EQCAIIA1GDQEgB0EBaiEFQQAhBEEBIQkgByEKDAILIAVBAWoiBSAKayEJQQAhBAwBC0EAIARBAWoiCCAIIAlGIgUbIQQgCEEAIAUbIAdqIQULIAYgCUcNAQsLQQMgCyAKIAogC0kbayELAkAgBkUEQEEAIQZBACEIDAELIAZBA3EhBUEAIQgCQCAGQQRJBEBBACEJDAELIAZBfHEhB0EAIQkDQEIBIAMgCWoiCkEDajEAAIZCASAKMQAAhiAOhEIBIApBAWoxAACGhEIBIApBAmoxAACGhIQhDiAHIAlBBGoiCUcNAAsLIAVFDQAgAyAJaiEEA0BCASAEMQAAhiAOhCEOIARBAWohBCAFQQFrIgUNAAsLQQMLIQcgACADNgI4IAAgATYCMCAAIAc2AiggACAINgIkIAAgAjYCICAAQQA2AhwgACAGNgIYIAAgCzYCFCAAIAw2AhAgACAONwMIIABBATYCACAAQTxqQQM2AgAMBwsgDEEDQbDqwAAQtQEACyAGIAdBwOrAABC2AQALIAdBA0HA6sAAELUBAAsgCkEDQeDqwAAQtAEACyAIQQNB8OrAABC0AQALIA1BA0Hg6sAAELQBAAsgCEEDQfDqwAAQtAEACyAAQTRqIAI2AgALqwwBB38jAEEQayIJJAACQCAAAn8CQAJAAkACQAJAAn8CQAJAAkACQAJAAkACQAJAAkAgAkH//wNxIgZBEE8EQCAGQRBrDgMCAwQBC0G95cEALQAAGkECQQEQnAIiAUUNBCABIAI6AAEgAUEBOgAAQeikwAAhAgwOC0GwpMAAQShB2KTAABDNAQALIAEtABQiBkEfayECIAEoAhAhByABLQAAQQRHDQMgAkH/AXFB3gFLDQogASgCDCIFQQFrIQIgBiAFQQN0a0EIayABKAIIIQUCQANAIAdBCHYhByACQX9GDQEgASACNgIMIAEgBUEBaiIKNgIIIAJBAWshAiAFLQAAQRh0IAdyIQcgBkEnayAGQQhrIQYgCiEFQf8BcUHfAUkNAAsgASAHNgIQDAsLIAFBiKTAADYCBCABQQI2AgAgASAHNgIQQQAhBSEGDAsLIAEtABQiBkEeayECIAEoAhAhByABLQAAQQRHDQMgAkH/AXFB3gFLDQcgASgCDCIDQQFrIQIgBiADQQN0a0EIayABKAIIIQUCQANAIAdBCHYhCCACQX9GDQEgASACNgIMIAEgBUEBaiIENgIIIAJBAWshAiAFLQAAQRh0IAhyIQcgBkEmayAGQQhrIQYgBCEFQf8BcUHfAUkNAAsgASAHNgIQDAgLIAFBiKTAADYCBCABQQI2AgAgASAINgIQQQAhBSEGDAgLIAEtABQiBkEaayECIAEoAhAhByABLQAAQQRHDQMgAkH/AXFB3gFLDQQgASgCDCIDQQFrIQIgBiADQQN0a0EIayABKAIIIQUCQANAIAdBCHYhCCACQX9GDQEgASACNgIMIAEgBUEBaiIENgIIIAJBAWshAiAFLQAAQRh0IAhyIQcgBkEiayAGQQhrIQYgBCEFQf8BcUHfAUkNAAsgASAHNgIQDAULIAFBiKTAADYCBCABQQI2AgAgASAINgIQIQZBAAwFC0EBQQIQvQIACyACQf8BcUHfAU8NBgwHCyACQf8BcUHfAU8NAwwEC0EAIAJB/wFxQd8BSQ0BGgsgByAGdkH/AHELIQUgASAGQQdqOgAUIAEoAgAhAiABQQQ6AAACQCACQf8BcUEERiIDDQAgAkEQdiEFIAMNACABKAIEIQEgACACOgAEIABBCGogATYCACAAQQZqIAU7AQAgAEEFaiACQQh2OgAAQQEMBgtBveXBAC0AABpBCEEEEJwCIgEEQCABQQA6AAQgASAFQQtqQf//A3E2AgBBlKTAACECDAULDAYLIAcgBnZBB3EhBQsgASAGQQNqOgAUIAEoAgAhAiABQQQ6AAACQCACQf8BcUEERiIDDQAgAkEQdiEFIAMNACABKAIEIQEgACACOgAEIABBCGogATYCACAAQQZqIAU7AQAgAEEFaiACQQh2OgAAQQEMBAtBveXBAC0AABpBCEEEEJwCIgEEQCABQQA6AAQgASAFQQNqQf//A3E2AgBBlKTAACECDAMLDAQLIAcgBnZBA3EhBQsgASAGQQJqOgAUIAEoAgAhAiABQQQ6AAACQAJAAkACQCACQf8BcUEERiIGRQRAIAJBEHYhBSAGRQ0BCyADRQRAQb3lwQAtAAAaQRJBARCcAiIBRQ0CQb3lwQAtAAAaIAFBEGpBlKXAAC8AADsAACABQQhqQYylwAApAAA3AAAgAUGEpcAAKQAANwAAQQxBBBCcAiICRQ0DIAJCkoCAgKACNwIEIAIgATYCACAJQQhqQRUgAkGIosAAENABIAlBBGogCUEOai8BADsBACAJIAkoAQo2AgAgCS0ACSEEIAktAAgiAUEERw0EC0G95cEALQAAGkEIQQQQnAIiAUUNBiABIAQ6AAQgASAFQQNqQf//A3E2AgBBlKTAACECDAQLIAEoAgQhASAAIAI6AAQgAEEIaiABNgIAIABBBmogBTsBACAAQQVqIAJBCHY6AABBAQwEC0EBQRIQvQIAC0EEQQwQvQIACyAAQQZqIAkoAgA2AQAgAEEKaiAJQQRqLwEAOwEAIABBBWogBDoAACAAIAE6AARBAQwBCyAAIAE2AgQgAEEIaiACNgIAQQALNgIAIAlBEGokAA8LQQRBCBC9AgALrA0BCX8jAEFAaiIDJAACfwJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkACQAJAAkAgAS0ANEEBaw4DDQEAAgsgAUEIaiEGIAFBHWoiCi0AAEEBaw4EBgADCwILAAsgAUEdaiIKQYACOwAAIAFBFGogASkCADcCACABQQhqIQYLIAEgAUEUaigCADYCCCABQQxqIAFBGGooAgAiBDYCACABQRxqIAFBHmotAAA6AAAgBEEIaigCAEEfTQ0LIAQoAgAhBCABQRBqIgUQHDYCACADQdOTwABBzJPAACABLQAcG0EHEAE2AjAgBSADQTBqEKoCIAMoAjAiCEGEAU8EQCAIEAALIAMQnQE2AiwgAyAEQSAQ1wE2AjAgA0EwahDGAiEEIAMoAjAiCEGEAU8EQCAIEAALIAMgBDYCPCMAQRBrIgQkACADQSxqKAIAQdqTwABBAyADQTxqKAIAQd2TwABBB0EAIAUoAgAQESEFIARBCGoQ6QEgBCgCDCEIIANBIGoiByAEKAIIIgk2AgAgByAIIAUgCRs2AgQgBEEQaiQAIAMoAjwhBSADKAIkIQQgAygCIA0BIAVBhAFPBEAgBRAACyADKAIsIgVBhAFPBEAgBRAACyABQSBqIAQQVTYCAAsgA0EYaiABQSBqIgggAhCOAUEDIQQgAygCGCIFQQJGDQkgAygCHCEEIAgQfCAFDQEgAUEMaigCACIFQQhqKAIAIgdBH00NCyAFKAIAIQkgASAENgIgIAFBJGoiBRAgNgIAIANBhJTAAEEEEAE2AiwgA0Hdk8AAQQcQATYCPCADQTBqIAUgA0EsaiADQTxqELIBIAMtADANDCADKAI8IgRBhAFPBEAgBBAACyADKAIsIgRBhAFPBEAgBBAACyADQYiUwABBAhABNgIsIAMgCUEgaiAHQSBrENcBNgIwIANBMGoQxgIhBCADKAIwIgdBhAFPBEAgBxAACyADIAQ2AjwgA0EwaiAFIANBLGogA0E8ahCyASADLQAwDQ0gAygCPCIEQYQBTwRAIAQQAAsgAygCLCIEQYQBTwRAIAQQAAsgAUEcai0AAA0FIAMQnQE2AjAgBigCACIGKAIAIQcgBigCCCIGDQNBASEEDAQLIAVBhAFPBEAgBRAACyADKAIsIgJBhAFJDQAgAhAAC0EAIQIgAUEQaigCACIFQYMBTQ0SDBELQYCSwABBI0Hkk8AAEM0BAAsgBkEASA0KQb3lwQAtAAAaIAZBARCcAiIERQ0LCyAEIAcgBhDAAiEHIwBBEGsiBCQAIANBMGooAgAgBSgCACAIKAIAIAcgBhAQIQUgBEEIahDpASAEKAIMIQggA0EIaiIJIAQoAggiCzYCACAJIAggBSALGzYCBCAEQRBqJAAgASADKQMINwIsIAYEQCAHEEQLIAMoAjAiBEGEAUkNASAEEAAMAQsgAxCdATYCMCAGKAIAIgYoAgAhBwJAIAYoAggiBkUEQEEBIQQMAQsgBkEASA0JQb3lwQAtAAAaIAZBARCcAiIERQ0LCyAEIAcgBhDAAiEHIwBBEGsiBCQAIANBMGooAgAgBSgCACAIKAIAIAcgBhAOIQUgBEEIahDpASAEKAIMIQggA0EQaiIJIAQoAggiCzYCACAJIAggBSALGzYCBCAEQRBqJAAgASADKQMQNwIsIAYEQCAHEEQLIAMoAjAiBEGEAUkNACAEEAALIAEoAjAhBCABKAIsDQogAUEoaiAEEFU2AgALIAMgAUEoaiIFIAIQjgFBBCEEIAMoAgAiAkECRg0BIAMoAgQhBCAFEHwgAg0JIAMgBDYCLCADIANBLGoQxgI2AjwgA0EwaiADQTxqEJsBIAMoAjghBiADKAI0IQQgAygCMCECIAMoAjwiBUGEAU8EQCAFEAALIAMoAiwiBUGEAUkNCiAFEAAMCgtBgJLAAEEjQYyUwAAQzQEACyAKIAQ6AABBAyEFQQEMCwtBpJLAAEEjQbyTwAAQzQEAC0GkksAAQSNB9JPAABDNAQALIAMoAjQQowEACyADKAI0EKMBAAsQ1AEAC0EBIAYQvQIAC0EBIAYQvQIAC0EAIQILIAFBJGooAgAiBUGEAU8EQCAFEAALIAFBIGooAgAiBUGEAU8EQCAFEAALIAFBEGooAgAiBUGEAUkNAQsgBRAAC0EBIQUgCkEBOgAAIABBDGogBjYCACAAQQhqIAQ2AgAgACACNgIEQQALIQIgASAFOgA0IAAgAjYCACADQUBrJAALlQkCBH8CfCMAQeAAayIEJAAgBCABNgJEIARBgIXAAEEFEAE2AkggBEE4aiAEQcQAaiAEQcgAahDCASAEKAI8IQICQCAEKAI4RQRAIAIhAQwBC0GBASEBIAJBhAFJDQAgAhAACyAEQShqIAEQBAJ/IAQrAzBEAAAAAAAAAAAgBCgCKBsiCEQAAAAAAADwQWMgCEQAAAAAAAAAAGYiBnEEQCAIqwwBC0EACyEFIAFBhAFPBEAgARAACyAEKAJIIgFBhAFPBEAgARAACyAEQYWFwABBBhABNgJIIARBIGogBEHEAGogBEHIAGoQwgEgBCgCJCECAkAgBCgCIEUEQCACIQEMAQtBgQEhASACQYQBSQ0AIAIQAAsgBEEQaiABEAQCfyAEKwMYRAAAAAAAAAAAIAQoAhAbIglEAAAAAAAA8EFjIAlEAAAAAAAAAABmIgdxBEAgCasMAQtBAAshAiABQYQBTwRAIAEQAAtB//8DIAJBACAHGyAJRAAAAADg/+9AZBshASAEKAJIIgJBhAFPBEAgAhAACwJAAkACQEH//wMgBUEAIAYbIAhEAAAAAOD/70BkGyICQf//A3EiBiABQf//A3EiByIFTQRAIAVFDQEgACgCACIALwEAIQUgBEGAhcAAQQUQATYCWCAEIAUgAkH//wNxbCAHbkH//wNxuBACNgJcIARByABqIARBxABqIARB2ABqIARB3ABqELIBIAQtAEgNAyAEKAJcIgJBhAFPBEAgAhAACyAEKAJYIgJBhAFPBEAgAhAACyAEQYWFwABBBhABNgJYIAQgAC8BALgQAjYCXCAEQcgAaiAEQcQAaiAEQdgAaiAEQdwAahCyASAELQBIDQMgBCgCXCICQYQBTwRAIAIQAAsgBCgCWCICQYQBSQ0CIAIQAAwCCyAAKAIAIgAvAQAgBEGAhcAAQQUQATYCWCAEIAAvAQC4EAI2AlwgBWwgBm4hASAEQcgAaiAEQcQAaiAEQdgAaiAEQdwAahCyASAELQBIDQIgBCgCXCIFQYQBTwRAIAUQAAsgBCgCWCIFQYQBTwRAIAUQAAsgBEGFhcAAQQYQATYCWCAEIAFB//8DcbgQAjYCXCAEQcgAaiAEQcQAaiAEQdgAaiAEQdwAahCyASAELQBIDQIgBCgCXCIBQYQBTwRAIAEQAAsgBCgCWCIBQYQBTwRAIAEQAAsgAiEBDAELQcCEwABBGUGshcAAEM0BAAsgBCAALwEAuCABQf//A3G4ozkDSCAEQZOFwABBBRABNgJYIARBCGogBEHEAGogBEHYAGoQwgEgBCgCDCEAAkAgBCgCCEUEQCAEIAA2AlQMAQsgBEGBATYCVCAAQYQBSQ0AIAAQAAsgBCAEQdQAahDEAjYCUCAEIARByABqNgJcIARB0ABqIARB3ABqQbyFwAAQqQIgBCgCUCIAQYQBTwRAIAAQAAsgBCgCVCIAQYQBTwRAIAAQAAsgBCgCWCIAQYQBTwRAIAAQAAsgA0GEAU8EQCADEAALIAQoAkQiAEGEAU8EQCAAEAALIARB4ABqJAAPCyAEKAJMEKMBAAumBwEFfyAAEMsCIgAgABC5AiIBEMgCIQICQAJAIAAQugINACAAKAIAIQMgABCsAkUEQCABIANqIQEgACADEMkCIgBBkOnBACgCAEYEQCACKAIEQQNxQQNHDQJBiOnBACABNgIAIAAgASACEO0BDwsgA0GAAk8EQCAAEG8MAgsgAEEMaigCACIEIABBCGooAgAiBUcEQCAFIAQ2AgwgBCAFNgIIDAILQYDpwQBBgOnBACgCAEF+IANBA3Z3cTYCAAwBCyABIANqQRBqIQAMAQsCQCACEKQCBEAgACABIAIQ7QEMAQsCQAJAAkBBlOnBACgCACACRwRAIAJBkOnBACgCAEYNASACELkCIgMgAWohAQJAIANBgAJPBEAgAhBvDAELIAJBDGooAgAiBCACQQhqKAIAIgJHBEAgAiAENgIMIAQgAjYCCAwBC0GA6cEAQYDpwQAoAgBBfiADQQN2d3E2AgALIAAgARCDAiAAQZDpwQAoAgBHDQRBiOnBACABNgIADwtBlOnBACAANgIAQYzpwQBBjOnBACgCACABaiICNgIAIAAgAkEBcjYCBCAAQZDpwQAoAgBGDQEMAgtBkOnBACAANgIAQYjpwQBBiOnBACgCACABaiICNgIAIAAgAhCDAg8LQYjpwQBBADYCAEGQ6cEAQQA2AgALIAJBoOnBACgCAE0NAUEIQQgQjQIhAEEUQQgQjQIhAkEQQQgQjQIhA0EAQRBBCBCNAkECdGsiAUGAgHwgAyAAIAJqamtBd3FBA2siACAAIAFLG0UNAUGU6cEAKAIARQ0BQQhBCBCNAiEAQRRBCBCNAiECQRBBCBCNAiEBQQAhAwJAQYzpwQAoAgAiBCABIAIgAEEIa2pqIgBNDQAgBCAAa0H//wNqQYCAfHEiBEGAgARrIQJBlOnBACgCACEBQejmwQAhAAJAA0AgASAAKAIATwRAIAAQrgIgAUsNAgsgACgCCCIADQALQQAhAAsgABC7Ag0AIAAoAgwaDAALEHZBACADa0cNAUGM6cEAKAIAQaDpwQAoAgBNDQFBoOnBAEF/NgIADwsgAUGAAk8EQCAAIAEQcUGo6cEAQajpwQAoAgBBAWsiADYCACAADQEQdhoPCyABQXhxQfjmwQBqIQICf0GA6cEAKAIAIgNBASABQQN2dCIBcQRAIAIoAggMAQtBgOnBACABIANyNgIAIAILIQMgAiAANgIIIAMgADYCDCAAIAI2AgwgACADNgIICwuvCQEKfyMAQTBrIgYkACAGQQA2AhAgBkIENwIIIANB/wFxIgdFIAJFckUEQCABIAJBDGxqIQ8gB0EERiEOA0AgBkEANgIcIAZCBDcCFAJAAkACQAJAAkACQAJAAkACQCABKAIIIgcEQCABKAIAIggoAgAhCSAGQRRqIgpBABCGASAGKAIUIAYoAhxBAnRqIAk2AgAgBiAGKAIcQQFqIgI2AhwCQCAHQQFGDQAgCCgCBCELIAYoAhggAkYEQCAKIAIQhgEgBigCHCECCyAGKAIUIAJBAnRqIAs2AgAgBiAGKAIcQQFqIgI2AhwgB0ECRg0AIAhBCGohCCAHQQJ0QQhrIQoDQCAIKAIAIAsiByAJa2ohCyAGKAIYIAJGBEAgBkEUaiACEIYBIAYoAhwhAgsgCEEEaiEIIAYoAhQgAkECdGogCzYCACAGIAYoAhxBAWoiAjYCHCAHIQkgCkEEayIKDQALC0EAIQsgBUUEQCACRQ0FIAJBAmshByACQQFGDQYgAkEBayELIAYoAhQiCSAHQQJ0aigCACECIAkgC0ECdGooAgAhCwsgDkUNAQwICyAFRQ0DQQAhAkEAIQsgDg0HIAZCBDcCIAwBCyAGQQA2AiggBkIENwIgIAINAQtBACECIAZBADYCKAwECyMAQSBrIgckAEEEIAZBIGoiCCgCBCIJQQF0IgogAiACIApJGyIKIApBBE0bIgpBAnQhDCAKQYCAgIACSUECdCENAkAgCQRAIAdBBDYCGCAHIAlBAnQ2AhwgByAIKAIANgIUDAELIAdBADYCGAsgB0EIaiANIAwgB0EUahCPASAHKAIMIQkCQCAHKAIIRQRAIAggCjYCBCAIIAk2AgAMAQsgCUGBgICAeEYNACAJBEAgCSAHQRBqKAIAEL0CAAsQ1AEACyAHQSBqJAAgBigCICINIAYoAigiB0ECdGogAkECdBC/AiAGIAIgB2oiBzYCKCACQQBMDQNBASEKQQAhCUEAIQgDQCAIIAYoAhwiDE8NAyAHIAYoAhQgCWooAgBBAWsiDEsEQCANIAxBAnRqIApBACACIApKGyIKNgIAIAlBBGohCSAKQQJqIQogAiAIQQFqIghGDQUMAQsLIAwgB0HYisAAELQBAAtBf0EAQaiKwAAQtAEACyAHQQFBuIrAABC0AQALIAggDEHIisAAELQBAAsgBigCECIIIAYoAgxGBEAgBkEIaiAIEIcBIAYoAhAhCAsgBigCCCAIQRRsaiIHIAYpAiA3AgAgByACNgIQIAcgCzYCDCAHQQhqIAZBKGooAgA2AgAgBiAGKAIQQQFqNgIQIAYoAhhFDQEgBigCFBBEDAELIAZBKGoiCSAGQRxqKAIANgIAIAYgBikCFDcDICAGKAIQIgggBigCDEYEQCAGQQhqIAgQhwEgBigCECEICyAGKAIIIAhBFGxqIgcgBikDIDcCACAHIAI2AhAgByALNgIMIAdBCGogCSgCADYCACAGIAYoAhBBAWo2AhALIAFBDGoiASAPRw0ACwsgACAGKQIINwIAIAAgAzoADCAAQQhqIAZBEGooAgA2AgAgACAEQf8BcUEARzoADSAGQTBqJAALmQgCBH8EfCMAQYABayIEJAAgBCABNgJsIARBmIXAAEEEEAE2AnAgBEHgAGogBEHsAGogBEHwAGoQwgEgBCgCZCECAkAgBCgCYEUEQCACIQEMAQtBgQEhASACQYQBSQ0AIAIQAAsgBEHQAGogARAEIAQoAlAhBSAEKwNYIQggAUGEAU8EQCABEAALIAQoAnAiAUGEAU8EQCABEAALIARBnIXAAEEFEAE2AnAgBEHIAGogBEHsAGogBEHwAGoQwgEgBCgCTCECAkAgBCgCSEUEQCACIQEMAQtBgQEhASACQYQBSQ0AIAIQAAsgBEE4aiABEAQgBCgCOCEGIAQrA0AhCSABQYQBTwRAIAEQAAsgBCgCcCIBQYQBTwRAIAEQAAsgBEGhhcAAQQMQATYCcCAEQTBqIARB7ABqIARB8ABqEMIBIAQoAjQhAgJAIAQoAjBFBEAgAiEBDAELQYEBIQEgAkGEAUkNACACEAALIARBIGogARAEIAQoAiAhByAEKwMoIQogAUGEAU8EQCABEAALIAQoAnAiAUGEAU8EQCABEAALIARBpIXAAEEGEAE2AnAgBEEYaiAEQewAaiAEQfAAahDCASAEKAIcIQICQCAEKAIYRQRAIAIhAQwBC0GBASEBIAJBhAFJDQAgAhAACyAEQQhqIAEQBCAEKAIIIQIgBCsDECELIAFBhAFPBEAgARAACyAEKAJwIgFBhAFPBEAgARAACyAEQZiFwABBBBABNgJ4IAQgCEQAAAAAAAAAACAFGyAAKAIAIgArAwCiEAI2AnwgBEHwAGogBEHsAGogBEH4AGogBEH8AGoQsgEgBC0AcEUEQAJAIAQoAnwiAUGEAU8EQCABEAALIAQoAngiAUGEAU8EQCABEAALIARBnIXAAEEFEAE2AnggBCAJRAAAAAAAAAAAIAYbIAArAwCiEAI2AnwgBEHwAGogBEHsAGogBEH4AGogBEH8AGoQsgEgBC0AcA0AIAQoAnwiAUGEAU8EQCABEAALIAQoAngiAUGEAU8EQCABEAALIARBoYXAAEEDEAE2AnggBCAKRAAAAAAAAAAAIAcbIAArAwCiEAI2AnwgBEHwAGogBEHsAGogBEH4AGogBEH8AGoQsgEgBC0AcA0AIAQoAnwiAUGEAU8EQCABEAALIAQoAngiAUGEAU8EQCABEAALIARBpIXAAEEGEAE2AnggBCALRAAAAAAAAAAAIAIbIAArAwCiEAI2AnwgBEHwAGogBEHsAGogBEH4AGogBEH8AGoQsgEgBC0AcA0AIAQoAnwiAEGEAU8EQCAAEAALIAQoAngiAEGEAU8EQCAAEAALIANBhAFPBEAgAxAACyAEKAJsIgBBhAFPBEAgABAACyAEQYABaiQADwsLIAQoAnQQowEAC78XAhl/AX4jAEHgAGsiCyQAAkACQAJ/IAJFBEBBAiEOQQEMAQsgAS0AACETAkAgAkEBRg0AIAJBAWsiB0EDcSEIIAJBAmtBA08EQCAHQXxxIQkDQCATQf8BcSIKIAEgDmoiB0EBai0AACIMIAogDEsbIgogB0ECai0AACIMIAogDEsbIgogB0EDai0AACIMIAogDEsbIgogB0EEai0AACIHIAcgCkkbIRMgCSAOQQRqIg5HDQALCyAIRQ0AIAEgDmpBAWohBwNAIBNB/wFxIgkgBy0AACIOIAkgDksbIRMgB0EBaiEHIAhBAWsiCA0ACwsgE0EfcSIHQR1LDQFBAiAHdCIOQQBIDQFBASAHdAshCkG95cEALQAAGiAOQQIQnAIiCUUNASABIAJqIQICfyAHRQRAIAkhB0EBDAELIApBAWsiCEEHcSEOIAkhByAKQQJrQQdPBEAgCEF4cSEIA0AgB0KQgMCAgIKACDcBACAHQQhqQpCAwICAgoAINwEAIAdBEGohByAIQQhrIggNAAsLIAogDkUNABoDQCAHQRA7AQAgB0ECaiEHIA5BAWsiDg0ACyAKCyEOIAdBEDsBACALIBM6AB4gCyAEOgAdIAsgAzoAHCALIA42AhggCyAKNgIUIAsgCTYCECALIAY7AQ4gCyAFOwEMQQAhDiALQQA2AjQgCyACNgIwIAsgATYCLCALQSBqIQojAEEQayIJJAAgC0EsaiIGKAIIIQUgBigCACEBIAYoAgQhDAJAAkADQCABIAxGDQEgBiABQQFqIgI2AgAgBiAFQQFqIgU2AgggAS0AACEIIAIhASAIRQ0AC0G95cEALQAAGkEQQQIQnAIiBwRAIAcgCDoAAiAHIAVBAWs7AQAgCUKEgICAEDcCCCAJIAc2AgQCQCABIAxGDQBBASEIA0AgBSEBA0AgAi0AACIQRQRAIAFBAWohASAMIAJBAWoiAkcNAQwDCwsgAUEBaiEFIAkoAgggCEYEQCAJQQRqIQcjAEEgayIGJAACQAJAIAggCEEBaiINSw0AQQQgBygCBCIRQQF0Ig8gDSANIA9JGyINIA1BBE0bIg9BAnQhDSAPQYCAgIACSUEBdCESAkAgEQRAIAYgBygCADYCFCAGQQI2AhggBiARQQJ0NgIcDAELIAZBADYCGAsgBkEIaiASIA0gBkEUahCPASAGKAIMIQ0gBigCCEUEQCAHIA82AgQgByANNgIADAILIA1BgYCAgHhGDQEgDUUNACANIAZBEGooAgAQvQIACxDUAQALIAZBIGokACAJKAIEIQcLIAcgCEECdGoiBiAQOgACIAYgATsBACAJIAhBAWoiCDYCDCACQQFqIgIgDEcNAAsLIAogCSkCBDcCACAKQQhqIAlBDGooAgA2AgAMAgtBAkEQEL0CAAsgCkEANgIIIApCAjcCAAsgCUEQaiQAIAsoAighCCALKAIgIQUgCyALQd8AajYCSEEAIQlBACECIwBBIGsiDyQAAkACQAJAAkAgCEEVTwRAQb3lwQAtAAAaIAhBAXRB/P///wdxQQIQnAIiFwRAQb3lwQAtAAAaQYABQQQQnAIiDUUNBCAFQQRrIRsgBUEKaiEcQRAhHQJAA0AgBSACIgxBAnRqIRECQAJAAkAgCCACayICQQJJDQAgEUEGai0AACIHIBFBAmotAABPBEBBAiEBIAJBAkYNAiAcIAxBAnRqIQYDQCAHQf8BcSAGLQAAIgdLDQMgBkEEaiEGIAFBAWoiASACRw0ACwwBC0ECIQECQCACQQJGDQAgHCAMQQJ0aiEGA0AgB0H/AXEgBi0AACIHTQ0BIAZBBGohBiACIAFBAWoiAUcNAAsgAiEBCwJAIAEgASAMaiICTQRAIAIgCEsNASABQQJJDQQgAUEBdiEKIBsgAkECdGohByARIQYDQCAGLwEAIRAgBiAHLwEAOwEAIAcgEDsBACAGQQJqIhAtAAAhEiAQIAdBAmoiEC0AADoAACAQIBI6AAAgB0EEayEHIAZBBGohBiAKQQFrIgoNAAsMBAsgDCACQdTCwAAQtgEACyACIAhB1MLAABC1AQALIAIhAQsgASAMaiECCwJAAkAgAiAMSSACIAhLckUEQCABQQpJIAIgCElxDQEgAiAMayEHDAILQYDEwABBLEGsxMAAEM0BAAsgDEEKaiICIAggAiAISRsiAiAMSQ0CIBEgAiAMayIHQQEgASABQQFNGxCDAQsCQCAJIB1GBEBBveXBAC0AABogCUEEdEEEEJwCIgFFDQEgCUEBdCEdIAEgDSAJQQN0EMACIA0QRCENCyANIAlBA3RqIgEgDDYCBCABIAc2AgAgCUEBaiIMIQkCQCAMQQJJDQADQAJAAkACQAJAIA0gDCIJQQFrIgxBA3RqIgYoAgAiASAGKAIEaiAIRg0AIAlBA3QgDWoiCkEQaygCACIHIAFNDQAgCUEDSQRAQQIhCQwGCyANIAlBA2siEEEDdGooAgAiBiABIAdqTQ0BIAlBBEkEQEEDIQkMBgsgCkEgaygCACAGIAdqTQ0BDAULIAlBA0kNASANIAlBA2siEEEDdGooAgAhBgsgASAGSw0BCyAJQQJrIRALAkACQAJAAkACQCAJIBBLBEAgCSAQQQFqIgFNDQEgDSABQQN0aiIYKAIEIBgoAgAiHmoiBiANIBBBA3RqIhkoAgQiFkkNAiAGIAhLDQMgGEEEaiEfIAUgFkECdGoiASAZKAIAIhJBAnQiCmohByAGQQJ0IRQgEiAGIBZrIhEgEmsiFUsEQCAXIAcgFUECdCIGEMACIhEgBmohBiASQQBMIBVBAExyDQUgFCAbaiEKA0AgCiAHQXxBACAGQQJrLQAAIhQgB0ECay0AACIVSSIaG2oiByAGQXxBACAUIBVPG2oiBiAaGygBADYBACABIAdPDQYgCkEEayEKIAYgEUsNAAsMBQsgCiAXIAEgChDAAiIKaiEGIBJBAEwgESASTHINBSAFIBRqIREDQCABIAcgCiAHQQJqLQAAIhQgCkECai0AACIVSSIaGygBADYBACABQQRqIQEgCiAUIBVPQQJ0aiIKIAZPDQYgByAaQQJ0aiIHIBFJDQALDAULIA9BFGpCADcCACAPQQE2AgwgD0H8wcAANgIIIA9BhMLAADYCECAPQQhqQeTCwAAQ1QEACyAPQRRqQgA3AgAgD0EBNgIMIA9B/MHAADYCCCAPQYTCwAA2AhAgD0EIakH0wsAAENUBAAsgFiAGQYTDwAAQtgEACyAGIAhBhMPAABC1AQALIAchASARIQoLIAEgCiAGIAprEMACGiAfIBY2AgAgGCASIB5qNgIAIBkgGUEIaiAJIBBBf3NqQQN0EMECQQEhCSAMQQFLDQALCyACIAhPDQUMAQsLQZTDwABBK0Hgw8AAEM0BAAsgDCACQfDDwAAQtgEAC0GUw8AAQStBwMPAABDNAQALIAhBAU0NASAFIAhBARCDAQwBCyANEEQgFxBECyAPQSBqJAAMAQtBlMPAAEErQdDDwAAQzQEACyALKAIkIQICQAJAIAgEQCAFIAhBAnRqIQMgBSEHQQAhCANAIAtByABqIAtBDGogBy8BACAIIAdBAmotAAAiASAOa0EPcXQiBCABEFEgCy0ASCIGQQRHDQIgBEEBaiEIIAEhDiAHQQRqIgcgA0cNAAsgCy0AHiETIAstAB0hBCALLQAcIQMLIAIEQCAFEEQLIAtB0ABqIAtBFGopAgA3AwAgC0FAayALQdQAaigCACIBNgIAIAsgCykCDDcDSCALIAspAkwiIDcDOCAAQQhqIAE2AgAgACAgNwIAIAAgEzoADSAAIBNB/wFxIgAgBEEBIANB/wFxG0H/AXEiASAAIAFJGzoADAwBCyAAQQVqIAsoAEk2AAAgAEEIaiALQcwAaigAADYAACAAQQA2AgAgACAGOgAEIAIEQCAFEEQLIAsoAhRFDQAgCygCEBBECyALQeAAaiQADwsQ1AEAC0ECIA4QvQIAC/sGAgx/AX4CQAJAAkACQAJAAkAgASgCFCIIIAVBAWsiDWoiByADTw0AIAEoAhAhDiABKQMAIRMgASgCCCEKIAZFBEAgBSAOayEPQQEgCmshECACIAVBAXRBAWsiEWohEiABKAIcIQsDQCABAn8gEyACIAdqMQAAiKdBAXFFBEAgAUEANgIcIAUgCGogDWogA08NBANAIBMgCCASajEAAIhCAYNQBEAgAUEANgIcIAMgESAFIAhqIghqSw0BDAYLCyAFIAhqIQhBACELCwJAIAUgCiALIAogC0sbIgxLBEAgAiAIaiEJIAwhBwNAIAcgCGogA08NCyAEIAdqLQAAIAcgCWotAABHDQIgBSAHQQFqIgdHDQALCyAKIQcDQCAHIAtNDQYgB0EBayIHIAVPDQcgByAIaiIJIANPDQggBCAHai0AACACIAlqLQAARg0ACyAIIA5qIQggDwwBCyAIIBBqIAdqIQhBAAsiCzYCHCAIIA1qIgcgA0kNAAsMAQsgCkEBayEMIAUgCksEQCACIApqIREgBCAKaiEPIAUgCmshEANAIBMgAiAHajEAAIhCAYNQRQRAIA8hCSAQIQsgCCEHIA0CfwNAIAMgByAKak0EQCAKIQwMCwsgB0EBaiAJLQAAIAcgEWotAABHDQEaIAlBAWohCSAHQQFqIQcgC0EBayILDQALIAIgCGohCyAMIQcDQCAHQX9GDQYgBSAMTQ0HIAcgCGoiCSADTw0IIAcgC2ohCSAEIAdqIAdBAWshBy0AACAJLQAARg0ACyAIIA5qCyIIaiIHIANJDQEMAwsgASAFIAhqIgg2AhQgCCANaiIHIANJDQALDAELA0AgEyACIAdqMQAAiEIBg1AEQCABIAUgCGoiCDYCFCAIIA1qIgcgA08NAgwBCyACIAhqIQogDCEHA0AgB0F/Rg0DIAUgDE0NBCAHIAhqIgkgA08NBSAHIApqIQsgBCAHaiAHQQFrIQctAAAgCy0AAEYNAAsgCCAOaiIIIA1qIgcgA0kNAAsLIAEgAzYCFCAAQQA2AgAPCyABIAUgCGoiAjYCFCAGDQIgAUEANgIcDAILIAcgBUGsgcAAELQBAAsgCSADQbyBwAAQtAEACyAAIAg2AgQgAEEIaiACNgIAIABBATYCAA8LIAMgCCAMaiIAIAAgA0kbIANBzIHAABC0AQAL9AYBCH8CQCAAKAIAIgogACgCCCIDcgRAAkAgA0UNACABIAJqIQggAEEMaigCAEEBaiEHIAEhBQNAAkAgBSEDIAdBAWsiB0UNACADIAhGDQICfyADLAAAIgZBAE4EQCAGQf8BcSEGIANBAWoMAQsgAy0AAUE/cSEJIAZBH3EhBSAGQV9NBEAgBUEGdCAJciEGIANBAmoMAQsgAy0AAkE/cSAJQQZ0ciEJIAZBcEkEQCAJIAVBDHRyIQYgA0EDagwBCyAFQRJ0QYCA8ABxIAMtAANBP3EgCUEGdHJyIgZBgIDEAEYNAyADQQRqCyIFIAQgA2tqIQQgBkGAgMQARw0BDAILCyADIAhGDQAgAywAACIFQQBOIAVBYElyIAVBcElyRQRAIAVB/wFxQRJ0QYCA8ABxIAMtAANBP3EgAy0AAkE/cUEGdCADLQABQT9xQQx0cnJyQYCAxABGDQELAkACQCAERQ0AIAIgBE0EQEEAIQMgAiAERg0BDAILQQAhAyABIARqLAAAQUBIDQELIAEhAwsgBCACIAMbIQIgAyABIAMbIQELIApFDQEgACgCBCEIAkAgAkEQTwRAIAEgAhBKIQMMAQsgAkUEQEEAIQMMAQsgAkEDcSEHAkAgAkEESQRAQQAhA0EAIQYMAQsgAkF8cSEFQQAhA0EAIQYDQCADIAEgBmoiBCwAAEG/f0pqIARBAWosAABBv39KaiAEQQJqLAAAQb9/SmogBEEDaiwAAEG/f0pqIQMgBSAGQQRqIgZHDQALCyAHRQ0AIAEgBmohBQNAIAMgBSwAAEG/f0pqIQMgBUEBaiEFIAdBAWsiBw0ACwsCQCADIAhJBEAgCCADayEEQQAhAwJAAkACQCAALQAgQQFrDgIAAQILIAQhA0EAIQQMAQsgBEEBdiEDIARBAWpBAXYhBAsgA0EBaiEDIABBGGooAgAhBSAAKAIQIQYgACgCFCEAA0AgA0EBayIDRQ0CIAAgBiAFKAIQEQAARQ0AC0EBDwsMAgtBASEDIAAgASACIAUoAgwRBAAEfyADBUEAIQMCfwNAIAQgAyAERg0BGiADQQFqIQMgACAGIAUoAhARAABFDQALIANBAWsLIARJCw8LIAAoAhQgASACIABBGGooAgAoAgwRBAAPCyAAKAIUIAEgAiAAQRhqKAIAKAIMEQQAC+IGAQh/AkACQCABIABBA2pBfHEiAiAAayIISQ0AIAEgCGsiBkEESQ0AIAZBA3EhB0EAIQECQCAAIAJGIgkNAAJAIAIgAEF/c2pBA0kEQAwBCwNAIAEgACAEaiIDLAAAQb9/SmogA0EBaiwAAEG/f0pqIANBAmosAABBv39KaiADQQNqLAAAQb9/SmohASAEQQRqIgQNAAsLIAkNACAAIAJrIQMgACAEaiECA0AgASACLAAAQb9/SmohASACQQFqIQIgA0EBaiIDDQALCyAAIAhqIQQCQCAHRQ0AIAQgBkF8cWoiACwAAEG/f0ohBSAHQQFGDQAgBSAALAABQb9/SmohBSAHQQJGDQAgBSAALAACQb9/SmohBQsgBkECdiEGIAEgBWohAwNAIAQhACAGRQ0CQcABIAYgBkHAAU8bIgRBA3EhBSAEQQJ0IQgCQCAEQfwBcSIHRQRAQQAhAgwBCyAAIAdBAnRqIQlBACECIAAhAQNAIAIgASgCACICQX9zQQd2IAJBBnZyQYGChAhxaiABQQRqKAIAIgJBf3NBB3YgAkEGdnJBgYKECHFqIAFBCGooAgAiAkF/c0EHdiACQQZ2ckGBgoQIcWogAUEMaigCACICQX9zQQd2IAJBBnZyQYGChAhxaiECIAFBEGoiASAJRw0ACwsgBiAEayEGIAAgCGohBCACQQh2Qf+B/AdxIAJB/4H8B3FqQYGABGxBEHYgA2ohAyAFRQ0ACwJ/IAAgB0ECdGoiACgCACIBQX9zQQd2IAFBBnZyQYGChAhxIgEgBUEBRg0AGiABIAAoAgQiAUF/c0EHdiABQQZ2ckGBgoQIcWoiASAFQQJGDQAaIAAoAggiAEF/c0EHdiAAQQZ2ckGBgoQIcSABagsiAUEIdkH/gRxxIAFB/4H8B3FqQYGABGxBEHYgA2ohAwwBCyABRQRAQQAPCyABQQNxIQQCQCABQQRJBEBBACECDAELIAFBfHEhBUEAIQIDQCADIAAgAmoiASwAAEG/f0pqIAFBAWosAABBv39KaiABQQJqLAAAQb9/SmogAUEDaiwAAEG/f0pqIQMgBSACQQRqIgJHDQALCyAERQ0AIAAgAmohAQNAIAMgASwAAEG/f0pqIQMgAUEBaiEBIARBAWsiBA0ACwsgAwvlBgIOfwF+IwBBIGsiAyQAQQEhDQJAAkAgAigCFCIMQSIgAkEYaigCACIPKAIQIg4RAAANAAJAIAFFBEBBACECQQAhAQwBCyAAIAFqIRBBACECIAAhBAJAAkADQAJAIAQiCCwAACIKQQBOBEAgCEEBaiEEIApB/wFxIQkMAQsgCC0AAUE/cSEEIApBH3EhBiAKQV9NBEAgBkEGdCAEciEJIAhBAmohBAwBCyAILQACQT9xIARBBnRyIQcgCEEDaiEEIApBcEkEQCAHIAZBDHRyIQkMAQsgBkESdEGAgPAAcSAELQAAQT9xIAdBBnRyciIJQYCAxABGDQMgCEEEaiEECyADQQRqIAlBgYAEEE4CQAJAIAMtAARBgAFGDQAgAy0ADyADLQAOa0H/AXFBAUYNACACIAVLDQMCQCACRQ0AIAEgAk0EQCABIAJGDQEMBQsgACACaiwAAEFASA0ECwJAIAVFDQAgASAFTQRAIAEgBUYNAQwFCyAAIAVqLAAAQb9/TA0ECwJAAkAgDCAAIAJqIAUgAmsgDygCDBEEAA0AIANBGGoiByADQQxqKAIANgIAIAMgAykCBCIRNwMQIBGnQf8BcUGAAUYEQEGAASEGA0ACQCAGQYABRwRAIAMtABoiCyADLQAbTw0FIAMgC0EBajoAGiALQQpPDQcgA0EQaiALai0AACECDAELQQAhBiAHQQA2AgAgAygCFCECIANCADcDEAsgDCACIA4RAABFDQALDAELQQogAy0AGiICIAJBCk0bIQsgAy0AGyIHIAIgAiAHSRshCgNAIAIgCkYNAiADIAJBAWoiBzoAGiACIAtGDQQgA0EQaiACaiEGIAchAiAMIAYtAAAgDhEAAEUNAAsLDAcLAn9BASAJQYABSQ0AGkECIAlBgBBJDQAaQQNBBCAJQYCABEkbCyAFaiECCyAFIAhrIARqIQUgBCAQRw0BDAMLCyALQQpB3PnAABC0AQALIAAgASACIAVB6ObAABCWAgALIAJFBEBBACECDAELAkAgASACTQRAIAEgAkYNAQwECyAAIAJqLAAAQb9/TA0DCyABIAJrIQELIAwgACACaiABIA8oAgwRBAANACAMQSIgDhEAACENCyADQSBqJAAgDQ8LIAAgASACIAFB2ObAABCWAgALxAYBA38jAEEQayIHJAACfyAERQRAIAIoAgAQIQwBCyADIARqCyEEIAdBCGogAigCACADIAQQJiICEAYCQAJAAkAgBygCCCIJBEAgBygCDCEIIAJBgwFLBEAgAhAACyAIRQ0DQQAhBANAIAQgCWotAAAhAgJAAkACQCAGQQFxRQRAAkACQAJAIAJB3ABHBEAgAkEJRgRAIAEoAggiAiABKAIERgR/IAEgAhCNASABKAIIBSACCyABKAIAakH9ADoAACABIAEoAghBAWoiAjYCCCABKAIEIAJGBH8gASACEI0BIAEoAggFIAILIAEoAgBqQSw6AAAgASABKAIIQQFqNgIIQfsAIQILIAVB/wFxDgIBAgMLIAEoAggiAyABKAIERw0GDAULIAEoAggiAyABKAIERgR/IAEgAxCNASABKAIIBSADCyABKAIAaiACOgAAIAEgASgCCEEBaiIDNgIIIAJBLEYgAkH7AEZyRQRAIAJBIkZBAXQhBQwECyABKAIEIANGBH8gASADEI0BIAEoAggFIAMLIAEoAgBqQSI6AABBASEFIAEgASgCCEEBajYCCAwDCyABKAIEIQUgASgCCCEDIAJBOkcEQCADIAVGBH8gASADEI0BIAEoAggFIAMLIAEoAgBqIAI6AABBASEFIAEgASgCCEEBajYCCAwDCyADIAVGBH8gASADEI0BIAEoAggFIAMLIAEoAgBqQSI6AAAgASABKAIIQQFqIgI2AgggASgCBCACRgR/IAEgAhCNASABKAIIBSACCyABKAIAakE6OgAAIAEgASgCCEEBajYCCEEAIQUMAgsg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JGooAgAQB0UNACADIAAoAiAiBCgCABEBACAEKAIERQ0AIAQoAggaIAMQRAsCQCAAQTBqKAIAEAdFDQAgAEEoaigCACIEIABBLGooAgAiAygCABEBACADKAIERQ0AIAMoAggaIAQQRAsgACgCCEEBagVBAAshAyACIAEpAyg3AgAgAkEQaiABQThqKQMANwIAIAJBCGogAUEwaikDADcCACAAIAM2AgggASgCDCICQYQBTwRAIAIQAAsgAUHgAGokACAADwtB6L3AAEEQIAFB3wBqQfi9wABBoMDAABCpAQALQQRBNBC9AgALQQRBBBC9AgALAAtBBEEEEL0CAAuKBQEFfyMAQdAAayIDJAACQAJAIAItAABFBEAgAi0AASEFIAEoAggiAiABKAIERgR/IAEgAhCNASABKAIIBSACCyABKAIAaiAFOgAAIAEgASgCCEEBajYCCAwBCyACLwECIQUgAyACLwEEIgI7AQ4CQAJAAkACQAJAAkAgAiABKAIIIgRNBEAgAkUNASAFIAEoAgQgBGtLBEAgASAEIAUQigELIAQgAmshBiACIAVNBEADQCACIAZqIgcgAkkNBSAHIAEoAggiBEsNBiACIAEoAgQgBGtLBEAgASAEIAIQigEgASgCCCEECyABKAIAIgcgBGogBiAHaiACEMACGiABIAIgBGo2AgggBSACayIFIAJBAXQiAk8NAAsLIAUgBmoiBCAFSQ0CIAQgASgCCCICSw0GIAUgASgCBCACa0sEQCABIAIgBRCKASABKAIIIQILIAEoAgAiBCACaiAEIAZqIAUQwAIaIAEgAiAFajYCCAwHCyADQRxqQgI3AgAgA0E4akEqNgIAIANBAjYCFCADQbytwAA2AhAgA0ECNgIwIAMgBDYCPCADIANBLGo2AhggAyADQQ5qNgI0IAMgA0E8ajYCLCADQUBrIANBEGoiAhBgQb3lwQAtAAAaQQxBBBCcAiIBRQ0EIAEgAykDQDcCACABQQhqIANByABqKAIANgIAIAJBFSABQdytwAAQ0AEgACADKQMQNwIADAcLQcTJwABBJEHMysAAEM0BAAtBkK/AAEEbQayvwAAQzQEAC0GQr8AAQRtBrK/AABDNAQALQeyuwABBFEGAr8AAEM0BAAtBBEEMEL0CAAtB7K7AAEEUQYCvwAAQzQEACyAAQQQ6AAALIANB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QAJAIAFBEGohAiABQW9LDQAgAiADSw0CIAkgCCABIAVqIgEtAABqIghqIAggAS0AAWoiCWogCSABQQJqLQAAaiIJaiAJIAFBA2otAABqIglqIAkgAUEEai0AAGoiCWogCSABQQVqLQAAaiIJaiAJIAFBBmotAABqIglqIAkgAUEHai0AAGoiCWogCSABQQhqLQAAaiIJaiAJIAFBCWotAABqIglqIAkgAUEKai0AAGoiCWogCSABQQtqLQAAaiIJaiAJIAFBDGotAABqIglqIAkgAUENai0AAGoiCWogCSABQQ5qLQAAaiIJaiAJIAFBD2otAABqIghqIQkgAiEBIAMgBEEQayIEakEPSw0BDAULCyABIAJBoMjAABC2AQALIAIgA0GgyMAAELUBAAsgBygCACEJIAMEQCAHKAIEIQgCQCADQQNxIhhFBEAgBSEBIAMhBAwBCyADIQQDQCAEQQFrIQQgCSACLQAAaiIJIAhqIQggAkEBaiIBIQIgGEEBayIYDQALCwJAIANBBEkNACADIAVqIQMgBEEEayECA0AgCSABLQAAaiIEIAEtAAFqIgUgAS0AAmoiGCABQQNqLQAAaiIJIBggBSAEIAhqampqIQggAkUNASACQQRrIQIgAUEEaiIBIANHDQALCyAHIAg2AgQgByAJNgIACyAJQfD/A0sEQCAHIAlB8f8DazYCAAsgBygCBCEJIAdBBGoMAgsgByAHKAIAIAUtAABqQfH/A3AiATYCACAHKAIEIAFqIQkgB0EEagwBCwJAIAIgA0YNACACQX9zIANqIAMgAmtBA3EiBARAIAIhAQNAIAggASAFai0AAGoiCCAJaiEJIAFBAWoiAiEBIARBAWsiBA0ACwtBA0kNACACIAVqIQEgAyACayECA0AgCCABLQAAaiIDIAFBAWotAABqIgQgAUECai0AAGoiBSABQQNqLQAAaiIIIAUgBCADIAlqampqIQkgAUEEaiEBIAJBBGsiAg0ACwsgByAIQfH/A3A2AgAgB0EEagsgCUHx/wNwNgIACyAAQQQ6AAAgACAONgIEDAULIAFBAToANiABQRRqKAIAIgJBBEkNAyABIAJBBGs2AhQgAUEQaiICIAIoAgAiAkEEajYCACATIAIoAAAiAkEYdCACQYD+A3FBCHRyIAJBCHZBgP4DcSACQRh2cnIiAjYCDCABEJQCIAJGBEAgAEEEOgAAIABBADYCBAwFCyABEJQCIQEgE0E4akECNgIAIBNBHGpCAjcCACATQQI2AjAgEyABNgI8IBNBAjYCFCATQYiawAA2AhAgEyATQQxqNgI0IBMgE0E8ajYCLCATIBNBLGo2AhggE0FAayECIBNBEGoiBSIBQQxqKAIAIQMCQAJAAkACQAJAAkACQAJAIAEoAgQOAgABAgsgAw0BQQEhA0EAIQFB/JjAACEEDAMLIANFDQELIAIgARBgDAQLIAEoAgAiASgCACEEIAEoAgQiAUUEQEEBIQNBACEBDAELIAFBAEgNAUG95cEALQAAGiABQQEQnAIiA0UNAgsgAyAEIAEQwAIhAyACIAE2AgggAiABNgIEIAIgAzYCAAwCCxDUAQALQQEgARC9AgALEOsBIgFBCGogE0HIAGooAgA2AgAgASATKQNANwIAIAVBFSABQaiawAAQ0AEgACATKQMQNwIADAQLIABBBDoAACAAQQA2AgQMAwsgACATLwAROwABIABBA2ogEy0AEzoAACAAIBMoAhQ2AgQgACAEOgAADAILIA4gA0G0m8AAELUBAAsgAEHcmMAANgIEIABBAjoAAAsgE0HQAGokAAuUAwEHfwJAIAAoAgwiAUUNACAAKAIAIQUgACgCBCICIAAoAggiACACQQAgACACTxtrIgAgAWogASACIABrIgRLGyICIABHBEAgAiAAayEGIAUgAEECdGohAgNAIAIoAgAiACAAKAIAQQFrIgM2AgACQCADDQAgAEEMaigCACIDBEAgAyAAQRBqKAIAIgcoAgARAQAgBygCBARAIAcoAggaIAMQRAsgAEEYaigCACAAQRRqKAIAKAIMEQEACyAAQQRqIgMgAygCAEEBayIDNgIAIAMNACAAEEQLIAJBBGohAiAGQQFrIgYNAAsLIAEgBE0NACABIARrIgBBACAAIAFNGyECA0AgBSgCACIAIAAoAgBBAWsiATYCAAJAIAENACAAQQxqKAIAIgEEQCABIABBEGooAgAiBCgCABEBACAEKAIEBEAgBCgCCBogARBECyAAQRhqKAIAIABBFGooAgAoAgwRAQALIABBBGoiASABKAIAQQFrIgE2AgAgAQ0AIAAQRAsgBUEEaiEFIAJBAWsiAg0ACwsLjAMBB38jAEEgayIEJAACQAJAAkACQAJAAkAgASgCBCICRQ0AIAEoAgAhBiACQQNxIQcCQCACQQRJBEBBACECDAELIAZBHGohAyACQXxxIQhBACECA0AgAygCACADQQhrKAIAIANBEGsoAgAgA0EYaygCACACampqaiECIANBIGohAyAIIAVBBGoiBUcNAAsLIAcEQCAFQQN0IAZqQQRqIQMDQCADKAIAIAJqIQIgA0EIaiEDIAdBAWsiBw0ACwsgAUEMaigCAARAIAJBAEgNASAGKAIERSACQRBJcQ0BIAJBAXQhAgsgAg0BC0EBIQNBACECDAELIAJBAEgNAUG95cEALQAAGiACQQEQnAIiA0UNAgsgBEEANgIUIAQgAjYCECAEIAM2AgwgBCAEQQxqNgIYIARBGGpB9N3AACABEFRFDQJBxN/AAEEzIARBH2pB+N/AAEGg4MAAEKkBAAsQ1AEAC0EBIAIQvQIACyAAIAQpAgw3AgAgAEEIaiAEQRRqKAIANgIAIARBIGokAAv3AgEFf0EQQQgQjQIgAEsEQEEQQQgQjQIhAAtBCEEIEI0CIQNBFEEIEI0CIQJBEEEIEI0CIQQCQEEAQRBBCBCNAkECdGsiBUGAgHwgBCACIANqamtBd3FBA2siAyADIAVLGyAAayABTQ0AIABBECABQQRqQRBBCBCNAkEFayABSxtBCBCNAiIDakEQQQgQjQJqQQRrEDwiAkUNACACEMsCIQECQCAAQQFrIgQgAnFFBEAgASEADAELIAIgBGpBACAAa3EQywIhAkEQQQgQjQIhBCABELkCIAIgAEEAIAIgAWsgBE0baiIAIAFrIgJrIQQgARCsAkUEQCAAIAQQ5wEgASACEOcBIAEgAhBaDAELIAEoAgAhASAAIAQ2AgQgACABIAJqNgIACwJAIAAQrAINACAAELkCIgJBEEEIEI0CIANqTQ0AIAAgAxDIAiEBIAAgAxDnASABIAIgA2siAxDnASABIAMQWgsgABDKAiEGIAAQrAIaCyAGC4IDAQl/IwBBIGsiASQAQQIhAkHs5MEAAn9BACAARQ0AGiAAKAIAIQMgAEEANgIAQQAgA0UNABogAUEIaiAAQRBqKQIANwMAIAFBEGogAEEYaikCADcDACABQRhqIABBIGovAQA7AQAgASAAKQIINwMAIAAtACMhBCAALQAiIQIgACgCBAs2AgBB6OTBACgCACEFQejkwQBBATYCAEH05MEAKAIAIQZB8OTBACgCACEDQfDkwQAgASkDADcCAEH45MEAKAIAIQBB/OTBACgCACEHQfjkwQAgAUEIaikDADcCAEGA5cEAKAIAIQhBgOXBACABQRBqKQMANwIAQYjlwQAgAUEYai8BADsBAEGK5cEALQAAIQlBiuXBACACOgAAQYvlwQAgBDoAAAJAIAVFIAlBAkZyDQAgAARAIAMhAgNAIAJBBGooAgAEQCACKAIAEEQLIAJBDGohAiAAQQFrIgANAAsLIAYEQCADEEQLIAhFDQAgBxBECyABQSBqJABB7OTBAAvKBAEHfyMAQRBrIgYkACAAKAIAIgBBHGpBADoAAAJAAkACQCAAKAIIIgJB/v///wdNBEAgAEEYaigCACIHRQ0CIAINAwwBC0HQvcAAQRggBkEPakGEv8AAQZS/wAAQqQEACwNAIABBfzYCCCAAKAIYIgJFBEAgAEEANgIIDAILIAAgAkEBazYCGCAAKAIMIAAoAhQiAkECdGooAgAhAyAAQQA2AgggACACQQFqIgIgACgCECIEQQAgAiAETxtrNgIUIwBBEGsiBCQAAkAgA0EIaiICKAIARQRAIAJBfzYCAAJAIAIoAgQiBUUNACACQQA6ABQgBCACQQxqNgIIIAUgBEEIaiACQQhqKAIAKAIMEQAADQAgAigCBCIFBEAgBSACKAIIIggoAgARAQAgCCgCBARAIAgoAggaIAUQRAsgAkEQaigCACACKAIMKAIMEQEACyACQQA2AgQLIAIgAigCAEEBajYCACAEQRBqJAAMAQtBjLvAAEEQIARBD2pBnLvAAEG0vMAAEKkBAAsgAyADKAIAQQFrIgI2AgACQCACDQAgA0EMaigCACICBEAgAiADQRBqKAIAIgQoAgARAQAgBCgCBARAIAQoAggaIAIQRAsgA0EYaigCACADQRRqKAIAKAIMEQEACyADQQRqIgIgAigCAEEBayICNgIAIAINACADEEQLIAdBAWsiB0UNASAAKAIIRQ0ACwwBCyABQYQBTwRAIAEQAAsgBkEQaiQADwtB6L3AAEEQIAZBD2pB+L3AAEH0vsAAEKkBAAvcAgEHf0EBIQkCQAJAIAJFDQAgASACQQF0aiEKIABBgP4DcUEIdiELIABB/wFxIQ0DQCABQQJqIQwgByABLQABIgJqIQggCyABLQAAIgFHBEAgASALSw0CIAghByAMIgEgCkYNAgwBCwJAAkAgByAITQRAIAQgCEkNASADIAdqIQEDQCACRQ0DIAJBAWshAiABLQAAIAFBAWohASANRw0AC0EAIQkMBQsgByAIQcjtwAAQtgEACyAIIARByO3AABC1AQALIAghByAMIgEgCkcNAAsLIAZFDQAgBSAGaiEDIABB//8DcSEBA0AgBUEBaiEAAkAgBS0AACICwCIEQQBOBEAgACEFDAELIAAgA0cEQCAFLQABIARB/wBxQQh0ciECIAVBAmohBQwBC0Gs4cAAQStBuO3AABDNAQALIAEgAmsiAUEASA0BIAlBAXMhCSADIAVHDQALCyAJQQFxC+UCAQV/IABBC3QhBEEjIQNBIyECAkADQAJAAkBBfyADQQF2IAFqIgNBAnRB9PnAAGooAgBBC3QiBSAERyAEIAVLGyIFQQFGBEAgAyECDAELIAVB/wFxQf8BRw0BIANBAWohAQsgAiABayEDIAEgAkkNAQwCCwsgA0EBaiEBCwJ/An8CQCABQSJNBEAgAUECdCIDQfT5wABqKAIAQRV2IQIgAUEiRw0BQesGIQNBIQwCCyABQSNB/PjAABC0AQALIANB+PnAAGooAgBBFXYhA0EAIAFFDQEaIAFBAWsLQQJ0QfT5wABqKAIAQf///wBxCyEBAkACQCADIAJBf3NqRQ0AIAAgAWshBUHrBiACIAJB6wZNGyEEIANBAWshAEEAIQEDQCACIARGDQIgASACQYD7wABqLQAAaiIBIAVLDQEgACACQQFqIgJHDQALIAAhAgsgAkEBcQ8LIARB6wZBjPnAABC0AQAL5QIBBX8gAEELdCEEQRYhA0EWIQICQANAAkACQEF/IANBAXYgAWoiA0ECdEHsgcEAaigCAEELdCIFIARHIAQgBUsbIgVBAUYEQCADIQIMAQsgBUH/AXFB/wFHDQEgA0EBaiEBCyACIAFrIQMgASACSQ0BDAILCyADQQFqIQELAn8CfwJAIAFBFU0EQCABQQJ0IgNB7IHBAGooAgBBFXYhAiABQRVHDQFBuwIhA0EUDAILIAFBFkH8+MAAELQBAAsgA0HwgcEAaigCAEEVdiEDQQAgAUUNARogAUEBawtBAnRB7IHBAGooAgBB////AHELIQECQAJAIAMgAkF/c2pFDQAgACABayEFQbsCIAIgAkG7Ak0bIQQgA0EBayEAQQAhAQNAIAIgBEYNAiABIAJBxILBAGotAABqIgEgBUsNASAAIAJBAWoiAkcNAAsgACECCyACQQFxDwsgBEG7AkGM+cAAELQBAAuHAwIFfwF+IwBBQGoiBSQAQQEhBwJAIAAtAAQNACAALQAFIQkgACgCACIGKAIcIghBBHFFBEAgBigCFEGr5MAAQajkwAAgCRtBAkEDIAkbIAZBGGooAgAoAgwRBAANASAGKAIUIAEgAiAGKAIYKAIMEQQADQEgBigCFEH448AAQQIgBigCGCgCDBEEAA0BIAMgBiAEKAIMEQAAIQcMAQsgCUUEQCAGKAIUQa3kwABBAyAGQRhqKAIAKAIMEQQADQEgBigCHCEICyAFQQE6ABsgBUE0akGM5MAANgIAIAUgBikCFDcCDCAFIAVBG2o2AhQgBSAGKQIINwIkIAYpAgAhCiAFIAg2AjggBSAGKAIQNgIsIAUgBi0AIDoAPCAFIAo3AhwgBSAFQQxqIgg2AjAgCCABIAIQWQ0AIAhB+OPAAEECEFkNACADIAVBHGogBCgCDBEAAA0AIAUoAjBBsOTAAEECIAUoAjQoAgwRBAAhBwsgAEEBOgAFIAAgBzoABCAFQUBrJAAgAAvVAgECfyMAQRBrIgIkACAAKAIAIQACQAJ/AkAgAUGAAU8EQCACQQA2AgwgAUGAEEkNASABQYCABEkEQCACIAFBP3FBgAFyOgAOIAIgAUEMdkHgAXI6AAwgAiABQQZ2QT9xQYABcjoADUEDDAMLIAIgAUE/cUGAAXI6AA8gAiABQQZ2QT9xQYABcjoADiACIAFBDHZBP3FBgAFyOgANIAIgAUESdkEHcUHwAXI6AAxBBAwCCyAAKAIIIgMgACgCBEYEQCAAIAMQjQEgACgCCCEDCyAAIANBAWo2AgggACgCACADaiABOgAADAILIAIgAUE/cUGAAXI6AA0gAiABQQZ2QcABcjoADEECCyEBIAEgACgCBCAAKAIIIgNrSwRAIAAgAyABEIoBIAAoAgghAwsgACgCACADaiACQQxqIAEQwAIaIAAgASADajYCCAsgAkEQaiQAQQALiQQBBX8jAEEQayIDJAACQAJ/AkAgAUGAAU8EQCADQQA2AgwgAUGAEEkNASABQYCABEkEQCADIAFBP3FBgAFyOgAOIAMgAUEMdkHgAXI6AAwgAyABQQZ2QT9xQYABcjoADUEDDAMLIAMgAUE/cUGAAXI6AA8gAyABQQZ2QT9xQYABcjoADiADIAFBDHZBP3FBgAFyOgANIAMgAUESdkEHcUHwAXI6AAxBBAwCCyAAKAIIIgIgACgCBEYEQCMAQSBrIgQkAAJAAkAgAkEBaiICRQ0AQQggACgCBCIGQQF0IgUgAiACIAVJGyICIAJBCE0bIgVBf3NBH3YhAgJAIAYEQCAEIAY2AhwgBEEBNgIYIAQgACgCADYCFAwBCyAEQQA2AhgLIARBCGogAiAFIARBFGoQiAEgBCgCDCECIAQoAghFBEAgACAFNgIEIAAgAjYCAAwCCyACQYGAgIB4Rg0BIAJFDQAgAiAEQRBqKAIAEL0CAAsQ1AEACyAEQSBqJAAgACgCCCECCyAAIAJBAWo2AgggACgCACACaiABOgAADAILIAMgAUE/cUGAAXI6AA0gAyABQQZ2QcABcjoADEECCyEBIAEgACgCBCAAKAIIIgJrSwRAIAAgAiABEIwBIAAoAgghAgsgACgCACACaiADQQxqIAEQwAIaIAAgASACajYCCAsgA0EQaiQAC8ACAgV/AX4jAEEwayIFJABBJyEDAkAgAEKQzgBUBEAgACEIDAELA0AgBUEJaiADaiIEQQRrIAAgAEKQzgCAIghCkM4Afn2nIgZB//8DcUHkAG4iB0EBdEHo5MAAai8AADsAACAEQQJrIAYgB0HkAGxrQf//A3FBAXRB6OTAAGovAAA7AAAgA0EEayEDIABC/8HXL1YgCCEADQALCyAIpyIEQeMASwRAIANBAmsiAyAFQQlqaiAIpyIEIARB//8DcUHkAG4iBEHkAGxrQf//A3FBAXRB6OTAAGovAAA7AAALAkAgBEEKTwRAIANBAmsiAyAFQQlqaiAEQQF0QejkwABqLwAAOwAADAELIANBAWsiAyAFQQlqaiAEQTBqOgAACyACIAFBrOHAAEEAIAVBCWogA2pBJyADaxBPIAVBMGokAAu6AgEDfyMAQYABayIEJAACQAJAAn8CQCABKAIcIgJBEHFFBEAgAkEgcQ0BIAA1AgBBASABEGoMAgsgACgCACEAQQAhAgNAIAIgBGpB/wBqQTBB1wAgAEEPcSIDQQpJGyADajoAACACQQFrIQIgAEEQSSAAQQR2IQBFDQALIAJBgAFqIgBBgAFLDQIgAUEBQbnkwABBAiACIARqQYABakEAIAJrEE8MAQsgACgCACEAQQAhAgNAIAIgBGpB/wBqQTBBNyAAQQ9xIgNBCkkbIANqOgAAIAJBAWshAiAAQRBJIABBBHYhAEUNAAsgAkGAAWoiAEGAAUsNAiABQQFBueTAAEECIAIgBGpBgAFqQQAgAmsQTwsgBEGAAWokAA8LIABBgAFB2OTAABCzAQALIABBgAFB2OTAABCzAQALzAIBDH8CQAJAAkACQCABKAIIIgNFBEBBBCEEDAELIANB5syZM0sNAiADQRRsIgJBAEgNAiABKAIAIQFBBCEEIAIEQEG95cEALQAAGiACQQQQnAIiBEUNAgsgA0EUbCEKIAMhBwNAIAUgCkYNASABKAIAIQsgASgCECEMIAEoAgwhDUEEIQhBACEJAkAgASgCCCIGRQ0AIAZB/////wFLDQQgBkECdCICQQBIDQQgAkUNAEG95cEALQAAGiACQQQQnAIiCEUNBSACIQkLIAFBFGohASAEIAVqIgIgCCALIAkQwAI2AgAgAkEQaiAMNgIAIAJBDGogDTYCACACQQhqIAY2AgAgAkEEaiAGNgIAIAVBFGohBSAHQQFrIgcNAAsLIAAgAzYCCCAAIAM2AgQgACAENgIADwtBBCACEL0CAAsQ1AEAC0EEIAIQvQIAC7YCAQJ/IwBB4ABrIgIkACAAKAIAIQQgAiAAKAIENgJIIAJBCGogARAGIAJBxABqQQE2AgAgAkEsakICNwIAIAJBATYCPCACQQI2AiQgAkGci8AANgIgIAIgAigCDEEAIAIoAggiABsiBTYCWCACIAU2AlQgAiAAQQEgABs2AlAgAiACQdAAajYCTCACIAJBzABqNgJAIAIgAkHIAGo2AjggAiACQThqNgIoIAJBEGogAkEgahBgIAIoAlQEQCACKAJQEEQLIAQoAggiACAEKAIERgRAIAQgABCFASAEKAIIIQALIAQoAgAgAEEMbGoiACACKQMQNwIAIABBCGogAkEYaigCADYCACAEIAQoAghBAWo2AgggA0GEAU8EQCADEAALIAFBhAFPBEAgARAACyACQeAAaiQAC+oBAQV/IAAoAggiBARAIAAoAgAhBQNAIAUgA0EGdGoiASgCBARAIAEoAgAQRAsgAUEQaigCAARAIAFBDGooAgAQRAsgAUEgaigCACICBEAgASgCGCEAA0AgAEEEaigCAARAIAAoAgAQRAsgAEEUaiEAIAJBAWsiAg0ACwsgAUEYaiIAKAIEBEAgACgCABBECyABQTBqKAIAIgIEQCABKAIoIQADQCAAQQRqKAIABEAgACgCABBECyAAQRRqIQAgAkEBayICDQALCyABQShqIgAoAgQEQCAAKAIAEEQLIANBAWoiAyAERw0ACwsLuwIBBX8gACgCGCEDAkACQCAAIAAoAgxGBEAgAEEUQRAgAEEUaiIBKAIAIgQbaigCACICDQFBACEBDAILIAAoAggiAiAAKAIMIgE2AgwgASACNgIIDAELIAEgAEEQaiAEGyEEA0AgBCEFIAIiAUEUaiICIAFBEGogAigCACICGyEEIAFBFEEQIAIbaigCACICDQALIAVBADYCAAsCQCADRQ0AAkAgACAAKAIcQQJ0QejlwQBqIgIoAgBHBEAgA0EQQRQgAygCECAARhtqIAE2AgAgAQ0BDAILIAIgATYCACABDQBBhOnBAEGE6cEAKAIAQX4gACgCHHdxNgIADwsgASADNgIYIAAoAhAiAgRAIAEgAjYCECACIAE2AhgLIABBFGooAgAiAEUNACABQRRqIAA2AgAgACABNgIYCwu4AgEGfyMAQRBrIgYkACAAKAIARQRAIABBfzYCACAAQRRqIgMoAgAhBCADQQA2AgACQCAERQ0AIABBKGooAgAgAEEkaigCACEDIABBIGooAgAhByAAQRhqKAIAIQUCQCAAQRxqKAIAEAdFDQAgBCAFKAIAEQEAIAUoAgRFDQAgBSgCCBogBBBECxAHRQ0AIAcgAygCABEBACADKAIERQ0AIAMoAggaIAcQRAsgAEEIaiEEAkAgAEEEaigCAEECRg0AIAQoAgAiA0GEAUkNACADEAALIAAgATYCBCAEIAI2AgAgAEEMaiICKAIAIQEgAkEANgIAIAAgACgCAEEBajYCACABBEAgAEEQaigCACABKAIEEQEACyAGQRBqJAAPC0HovcAAQRAgBkEPakH4vcAAQbDAwAAQqQEAC6MCAQR/IABCADcCECAAAn9BACABQYACSQ0AGkEfIAFB////B0sNABogAUEGIAFBCHZnIgJrdkEBcSACQQF0a0E+agsiAzYCHCADQQJ0QejlwQBqIQICQAJAAkACQEGE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AgQiBEEBdCIDIAEgASADSRsiASABQQhNGyIDQX9zQR92IQECQCAEBEAgAiAENgIcIAJBATYCGCACIAAoAgA2AhQMAQsgAkEANgIYCyACQQhqIAEgAyACQRRqEI8BIAIoAgwhASACKAIIRQRAIAAgAzYCBCAAIAE2AgAMAgsgAUGBgICAeEYNASABRQ0AIAEgAkEQaigCABC9AgALENQBAAsgAkEgaiQAC9UBAQV/IwBBEGsiAyQAIAEoAgAiASgCCEUEQCABQQxqKAIAIQUgAUL/////LzcCCCABQRBqKAIAIQYgASAFQQJGBH8gAyACKAIAIgIoAgQgAigCACgCABECACADKAIEIQIgAygCACEEIAFBFGooAgAiBwRAIAFBGGooAgAgBygCDBEBAAsgASAENgIUIAFBGGogAjYCACABKAIIQQFqBSAECzYCCCAAIAY2AgQgACAFNgIAIANBEGokAA8LQei9wABBECADQQ9qQfi9wABBwMDAABCpAQALrgEBAX8CQAJAIAEEQCACQQBIDQECfyADKAIEBEACQCADQQhqKAIAIgRFBEAMAQsgAygCACAEIAEgAhCPAgwCCwsgASACRQ0AGkG95cEALQAAGiACIAEQnAILIgMEQCAAIAM2AgQgAEEIaiACNgIAIABBADYCAA8LIAAgATYCBCAAQQhqIAI2AgAMAgsgAEEANgIEIABBCGogAjYCAAwBCyAAQQA2AgQLIABBATYCAAvdAQEDfyMAQcABayIDJAAgACgCACIALQBYIQQgAEEEOgBYAkAgBEEERwRAIANBBmoiBSAAQdsAai0AADoAACADIAAvAFk7AQQgA0HkAGogAEHYABDAAhpBveXBAC0AABpBxAFBBBCcAiIARQ0BIAAgAjYCBCAAIAE2AgAgAEEIaiADQQhqQbQBEMACGiAAIAQ6ALwBIABBADoAwAEgACADLwEEOwC9ASAAQb8BaiAFLQAAOgAAIABBsJDAABCwASADQcABaiQADwtBwJDAAEExELgCAAtBBEHEARC9AgAL4QEBBH8jAEGQAmsiAyQAIAAoAgAiAC0A/AEhBCAAQQQ6APwBAkAgBEEERwRAIANBEGoiBSAAQfwBEMACGiADQQ5qIgYgAEH/AWotAAA6AABBveXBAC0AABogAyAALwD9ATsBDEGMBEEEEJwCIgBFDQEgACAC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//8DcbggBEH//wNxuCAWIBYgGJogFqEgFyAWIBYQvAEgASgCqAENBiABQaABaiAJEMYBIAEoAqABRQ0BIAEgASgCpAE2AqADQbSCwABBKyABQaADakGchsAAQfyHwAAQqQEACyABQegAaiABQegCaiABQeQCaiADQf//A3G4IARB//8DcbggFiAWIBcgGCAWIBYQvAEgASgCaA0KCyAQIAAgE2ogAEH//wNxIBRGGyEAIAUgCGoiA0EAIANB//8DcSALSSIDGyEIIAJBAWohAkEAIAUgAxsgB2ohByAGQQFrIgYNAAsgASgCjANFDQwgASgCiAMQRAwMC0HAhMAAQRlBvIjAABDNAQALIAEgASgCfDYCoANBtILAAEErIAFBoANqQZyGwABBrIfAABCpAQALIAEgASgClAE2AqADQbSCwABBKyABQaADakGchsAAQdyHwAAQqQEACyABIAEoAqwBNgKgA0G0gsAAQSsgAUGgA2pBnIbAAEGMiMAAEKkBAAtB4IbAAEE5QcyIwAAQzQEACyABIAEoAoQBNgKgA0G0gsAAQSsgAUGgA2pBnIbAAEG8h8AAEKkBAAsgASABKAKcATYCoANBtILAAEErIAFBoANqQZyGwABB7IfAABCpAQALIAEgASgCtAE2AqADQbSCwABBKyABQaADakGchsAAQZyIwAAQqQEACyABIAEoAmw2AqADQbSCwABBKyABQaADakGchsAAQayIwAAQqQEACyADDQELQeCGwABBOUHciMAAEM0BAAsCQCABQYgDaiIAKAIIIgIgDiADcCIDSwRAIAAoAgAgA0ECdGoiBSgCABogBSAFQQRqIAIgA0F/c2pBAnQQwQIgACACQQFrNgIIDAELIwBBMGsiACQAIAAgAjYCBCAAIAM2AgAgAEEsakECNgIAIABBAjYCJCAAIABBBGo2AiggACAANgIgIwBBIGsiAyQAIABBCGoiAkEANgIQIAJBAzYCBCACQZThwAA2AgAgAiAAQSBqNgIIIAJBDGpBAjYCACADQSBqJAAgAkHsiMAAENUBAAtB4IbAAEE5QfyIwAAQzQEACyABKAL0AiIABEAgASgC7AIhAwNAIANBBGooAgAEQCADKAIAEEQLIANBDGohAyAAQQFrIgANAAsLIAEoAvACBEAgASgC7AIQRAsgAUH8AmooAgBFDQEgASgC+AIQRAwBCwJAICAgHKIiGCAWY0UNACABQThqIAFB6AJqIAFB5AJqRAAAAAAAAAAAIBggFyAWIBihIhYgGiAZIBigIBcgFhC8ASABKAI4RQ0AIAFBMGogASgCPBAGQQAhAwJ/QQEgASgCMCICRQ0AGiABKAI0IQAgASACNgLsAiABIAA2AvQCIAEgADYC8AIgAUEoaiABQewCahCoAUEBIAEoAigiAEUNABogASgCLCEDIAALIQAgAUH4AmpCATcCACABIAM2AqgDIAEgAzYCpAMgASAANgKgAyABQQM2ApwDIAFBATYC8AIgAUHwicAANgLsAiABIAFBoANqNgKYAyABIAFBmANqNgL0AiABQewCakGIisAAENUBAAsgASgCjANFDQAgAxBECyABQdiJwABBCxABNgLsAiABQSBqIBEgAUHsAmoQwgEgASgCJCECAkAgASgCIARAIAJBhAFPBEAgAhAAC0GAARAFIQAMAQsgAhAFIQAgAkGEAUkNACACEAALIAEoAuwCIgJBhAFPBEAgAhAACwJAIABBAUYNACABQdiJwABBCxABNgLsAiABQRhqIBEgAUHsAmoQwgEgASgCHCEAAkAgASgCGEUEQCAAIQIMAQtBgQEhAiAAQYQBSQ0AIAAQAAsgASACNgKYAyABKALsAiIAQYQBTwRAIAAQAAsjAEEQayIAJAAgAUHoAmooAgAgAUGYA2ooAgAgGiAZEBMgAEEIahDpASAAKAIMIQIgAUEQaiIDIAAoAgg2AgAgAyACNgIEIABBEGokACABKAIQRQRAIAEoApgDIgBBhAFJDQEgABAADAELIAFBCGogASgCFBAGQQAhAwJ/QQEgASgCCCICRQ0AGiABKAIMIQAgASACNgLsAiABIAA2AvQCIAEgADYC8AIgASABQewCahCoAUEBIAEoAgAiAEUNABogASgCBCEDIAALIQAgAUH4AmpCATcCACABIAM2ApADIAEgAzYCjAMgASAANgKIAyABQQM2AqQDIAFBATYC8AIgAUHwicAANgLsAiABIAFBiANqNgKgAyABIAFBoANqNgL0AiABQewCakGYisAAENUBAAsgASgC6AIiAEGEAU8EQCAAEAALIAEoAuQCIgBBhAFPBEAgABAACyABKALgAiIAQYQBTwRAIAAQAAsgASgC0AJFDQAgASgCzAIQRAsgAUGwA2okACASKAIMIgBBhAFPBEAgABAACyASQRBqJAALQAEBfyMAQSBrIgAkACAAQRRqQgA3AgAgAEEBNgIMIABBrN/AADYCCCAAQezewAA2AhAgAEEIakG038AAENUBAAvDAgECfyMAQSBrIgIkACACIAA2AhggAkGk48AANgIQIAJBrOHAADYCDCACQQE6ABwgAiABNgIUIwBBEGsiASQAAkAgAkEMaiIAKAIIIgIEQCAAKAIMIgNFDQEgASACNgIMIAEgADYCCCABIAM2AgQjAEEQayIAJAAgAUEEaiIBKAIAIgJBDGooAgAhAwJAAn8CQAJAIAIoAgQOAgABAwsgAw0CQQAhAkH80sAADAELIAMNASACKAIAIgMoAgQhAiADKAIACyEDIAAgAjYCBCAAIAM2AgAgAEGk1sAAIAEoAgQiACgCDCABKAIIIAAtABAQiwEACyAAQQA2AgQgACACNgIAIABBuNbAACABKAIEIgAoAgwgASgCCCAALQAQEIsBAAtB2NPAAEErQeTVwAAQzQEAC0HY08AAQStB9NXAABDNAQALLwEBfyAAIAEoAgAiAgR/IAEgAkEBazYCACABLQAEBSABCzoAASAAIAJBAEc6AAALLAECfxA6IgIQLyIDIAAgARAwIAJBhAFPBEAgAhAACyADQYQBTwRAIAMQAAsLLgACQCADaUEBR0GAgICAeCADayABSXJFBEAgACABIAMgAhCPAiIADQELAAsgAAu5AgEDfyAAKAIAIQAgARCmAkUEQCABEKcCRQRAIAAgARCzAg8LIwBBgAFrIgMkACAALwEAIQADQCACIANqQf8AakEwQTcgAEEPcSIEQQpJGyAEajoAACACQQFrIQIgACIEQQR2IQAgBEEQTw0ACyACQYABaiIAQYABSwRAIABBgAFB2OTAABCzAQALIAFBAUG55MAAQQIgAiADakGAAWpBACACaxBPIANBgAFqJAAPCyMAQYABayIDJAAgAC8BACEAA0AgAiADakH/AGpBMEHXACAAQQ9xIgRBCkkbIARqOgAAIAJBAWshAiAAIgRBBHYhACAEQRBPDQALIAJBgAFqIgBBgAFLBEAgAEGAAUHY5MAAELMBAAsgAUEBQbnkwABBAiACIANqQYABakEAIAJrEE8gA0GAAWokAAssAQF/IwBBEGsiACQAIABBCGoiAiABQYPUwABBCxDjASACEKcBIABBEGokAAssAQF/IwBBEGsiAiQAIAIgACgCADYCDCACQQxqQdDSwAAgARBUIAJBEGokAAssAQF/IwBBEGsiAiQAIAIgACgCADYCDCACQQxqQfTdwAAgARBUIAJBEGokAAssAQF/IwBBEGsiAiQAIAIgACgCADYCDCACQQxqQbDmwAAgARBUIAJBEGokAAspACMAQRBrIgIkACACIAApAgA3AgggAkEIaiABIAIgAxBtIAJBEGokAAspACMAQRBrIgIkACACIAAoAgA2AgwgAkEMaiABIAIgAxBGIAJBEGokAAspACMAQRBrIgIkACACIAAoAgA2AgwgAkEMaiABIAIgAxBDIAJBEGokAAswAQF/IAFBCGsiAiACKAIAQQFqIgI2AgAgAkUEQAALIAAgATYCBCAAQaS8wAA2AgALKQEBfyMAQRBrIgIkACACIAA2AgwgAkEMakGw5sAAIAEQVCACQRBqJAALMAAgASgCFCACIAMgAUEYaigCACgCDBEEACECIABBADoABSAAIAI6AAQgACABNgIAC1EBAX8jAEEQayIDJAAgAyACNgIMIAMgATYCCCADIAA2AgQjAEEQayIAJAAgACADQQRqIgEpAgA3AgggAEEIakGoq8AAQQAgASgCCEEBEIsBAAuvAQEDfyABEKYCRQRAIAEQpwJFBEAgACABELICDwsjAEGAAWsiAyQAIAAtAAAhAANAIAIgA2pB/wBqQTBBNyAAQQ9xIgRBCkkbIARqOgAAIAJBAWshAiAAIgRBBHYhACAEQRBPDQALIAJBgAFqIgBBgAFLBEAgAEGAAUHY5MAAELMBAAsgAUEBQbnkwABBAiACIANqQYABakEAIAJrEE8gA0GAAWokAA8LIAAgARCZAQvEAQEDfyABEKYCRQRAIAEQpwJFBEAgACgCACIArUIAIACsfSAAQQBOIgAbIAAgARBqDwsgACABEJoBDwsjAEGAAWsiAyQAIAAoAgAhAANAIAIgA2pB/wBqQTBB1wAgAEEPcSIEQQpJGyAEajoAACACQQFrIQIgAEEQSSAAQQR2IQBFDQALIAJBgAFqIgBBgAFLBEAgAEGAAUHY5MAAELMBAAsgAUEBQbnkwABBAiACIANqQYABakEAIAJrEE8gA0GAAWokAAsnACAAIAAoAgRBAXEgAXJBAnI2AgQgACABaiIAIAAoAgRBAXI2AgQLJgACQCAARQ0AIAAgASgCABEBACABKAIERQ0AIAEoAggaIAAQRAsLMwECf0HI5cEAKAIAIQFBzOXBACgCACECQcjlwQBCADcDACAAIAI2AgQgACABQQFGNgIACyABAX8CQCAAKAIEIgFFDQAgAEEIaigCAEUNACABEEQLCyQBAX9BveXBAC0AABpBDEEEEJwCIgAEQCAADwtBBEEMEL0CAAsgACAAIAAoAgAiACAAIAEgACABSRsiAGs2AgAgASAAawsjACACIAIoAgRBfnE2AgQgACABQQFyNgIEIAAgAWogATYCAAslACAARQRAQfjKwABBMhC4AgALIAAgAiADIAQgBSABKAIQEQkACyMAIABFBEBB+MrAAEEyELgCAAsgACACIAMgBCABKAIQEQYACyMAIABFBEBB+MrAAEEyELgCAAsgACACIAMgBCABKAIQERwACyMAIABFBEBB+MrAAEEyELgCAAsgACACIAMgBCABKAIQER4ACyMAIABFBEBB+MrAAEEyELgCAAsgACACIAMgBCABKAIQEQwACyMAIABFBEBB+MrAAEEyELgCAAsgACACIAMgBCABKAIQESAACzMAIAEoAhQgAC0AAEECdCIAQdDcwABqKAIAIABBrNvAAGooAgAgAUEYaigCACgCDBEEAAseACAAIAFBA3I2AgQgACABaiIAIAAoAgRBAXI2AgQLHwAgAEEBNgIEIABBCGogAS0AACIBNgIAIAAgATYCAAsfACAAQQE2AgQgAEEIaiABKAIAIgE2AgAgACABNgIACyEAIABFBEBB+MrAAEEyELgCAAsgACACIAMgASgCEBEFAAsdACABKAIARQRAAAsgAEG8q8AANgIEIAAgATYCAAsfACAARQRAQYy5wABBMhC4AgALIAAgAiABKAIQEQIACx8AIABFBEBBxLzAAEEyELgCAAsgACACIAEoAhARAgALHwAgAEUEQEH4ysAAQTIQuAIACyAAIAIgASgCEBEAAAsdAQF/QezkwQAhAUHo5MEAKAIABH8gAQUgABBiCwsRACAAKAIEBEAgACgCABBECwsaACAAQgA3AgQgAEEENgIAIABBDGpCADcCAAscACAAKAIAIgAoAgAgASAAQQRqKAIAKAIMEQAACxkBAX8gACgCECIBBH8gAQUgAEEUaigC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QSBqIAAQBiADKAIgIgRFDQMgAygCJCICRQ0DIAJBAEgNBkG95cEALQAAGiACQQEQnAIiAEUNAiAAIAQgAhDAAhogBBBEIAIhAQwECyAAIAhBvI7AABC0AQALIAMgABADNgJsDAMLQQEgAhC9AgALQQEhAEEBIQYLIANBkAFqIAAgARBdIANBoAFqIAMoApABIgQgAygCmAEiARBQAn8gAygCoAFFBEAgAygClAEMAQsgAygClAEiAiADQagBajEAAEIghkKAgICAIFENABpBACEBIAJFBEBBASEEQQAMAQsgBBBEQQEhBEEACyADQRhqIAQgARDLASADKAIcIQECQCADKAIYRQRAIAMgATYCbAwBCyADQYEBNgJsIAFBhAFJDQAgARAACyAGRQRAIAAQRAtFDQAgBBBECyADQcyOwABBARABNgKQASMAQRBrIgAkACADQewAaigCACADQZABaigCABA1IQIgAEEIahDpASADQaABaiIBAn8gACgCCEUEQCABIAJBAEc6AAFBAAwBCyABIAAoAgw2AgRBAQs6AAAgAEEQaiQAAkACQAJAAkAgAy0AoAFFBEAgAy0AoQEgAygCkAEiAUGEAU8EQCABEAALRQ0BIANBzI7AAEEBEAE2AqABIANBEGogA0HsAGogA0GgAWoQwgEgAygCFCEBIAMoAhANAiABIQAMAwsgAygCpAEiAEGEAU8EQCAAEAALIAMoApABIgBBhAFJDQAgABAACyADQQA2AnggA0IBNwNwDAILQYEBIQAgAUGEAUkNACABEAALIANBCGogABAGIAMgAygCDEEAIAMoAggiARsiAjYCeCADIAI2AnQgAyABQQEgARs2AnAgAEGEAU8EQCAAEAALIAMoAqABIgBBhAFJDQAgABAACyADQQA2AogBIANCBDcCgAEgA0HNjsAAQQEQATYCoAEgAyADQewAaiADQaABahDCASADKAIEIQACQCADKAIARQRAIAMgADYCkAEMAQsgA0GBATYCkAEgAEGEAUkNACAAEAALIAMgA0GQAWoQxAI2AowBIAMoApABIgBBhAFPBEAgABAACyADKAKgASIAQYQBTwRAIAAQAAsgAyADQfAAajYCpAEgAyADQYABajYCoAEgA0GMAWogA0GgAWpB0I7AABCpAgJ/IAlBBEYEQAJAIAMoAogBIgRFBEAgA0EANgKYASADIAQ2ApQBIANBBDYCkAEMAQsgBEGq1arVAEsNAyAEQQxsIgBBAEgNAwJAIABFBEAgA0EANgKYASADIAQ2ApQBIANBBDYCkAEMAQtBveXBAC0AABogAEEEEJwCIgFFDQUgA0EANgKYASADIAQ2ApQBIAMgATYCkAEgAygCiAEiBEUNAQtBACEAA0AgAygClAEgAEYEQCADQZABaiAAEIUBIAMoApgBIQALIAMoApABIABBDGxqIgBBADYCCCAAQgE3AgAgAyADKAKYAUEBaiIANgKYASAEQQFrIgQNAAsLIAMgA0GMAWoiACgCABAbQQF2NgKcASADIANBgAFqNgKsASADIANB6ABqNgKoASADIANBkAFqNgKkASADIANBnAFqNgKgASAAIANBoAFqQeSOwAAQqQIgAygCkAEhASADKAKUASEGIAMoApgBDAELIAMoAoQBIQYgAygCgAEhASADKAKIAQshBCADEBwiADYCkAEgBAR/IAEgBEEMbGohAiABIQADQCADIAAoAgAgAEEIaigCABABNgKgASADQZABaiADQaABahCqAiADKAKgASIKQYQBTwRAIAoQAAsgAEEMaiIAIAJHDQALIAMoApABBSAACxADIQIgAygCkAEiAEGEAU8EQCAAEAALIAQEQCABIQADQCAAQQRqKAIABEAgACgCABBECyAAQQxqIQAgBEEBayIEDQALCyAGBEAgARBECyADKAKMASIAQYQBTwRAIAAQAAsgCUEERw0CIAMoAogBIgQEQCADKAKAASEAA0AgAEEEaigCAARAIAAoAgAQRAsgAEEMaiEAIARBAWsiBA0ACwsgAygChAFFDQIgAygCgAEQRAwCCxDUAQALQQQgABC9AgALIAMoAnQEQCADKAJwEEQLIAMoAmwiAEGEAU8EQCAAEAALIAMoAiwEQCADKAIoEEQLIANBOGooAgAEQCADKAI0EEQLIAMoAkAhASADQcgAaigCACIEBEAgASEAA0AgAEEEaigCAARAIAAoAgAQRAsgAEEUaiEAIARBAWsiBA0ACwsgA0HEAGooAgAEQCABEEQLIAchAANAIABBBGooAgAEQCAAKAIAEEQLIABBFGohACAIQQFrIggNAAsgA0HUAGooAgAEQCAHEEQLIANBsAFqJAAgAiEBIAUoAgwhAAwBC0EBQQAgARA+IQEL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QCABECA2AlQgAUGYhcAAQQQQATYClAECQAJAAkACQAJAAkACQAJAAkACQAJAAkACQCABKAIYIgMgAEsEQCAAQQFqIANPDS4gASABKAIQIABqLwAAIgNBCHQgA0EIdnJB//8DcbgQAjYCOCABQfgAaiABQdQAaiABQZQBaiABQThqELIBIAEtAHgEQCABIABBAmo2AhwMLQsgASgCOCIDQYQBTwRAIAMQAAsgASgClAEiA0GEAU8EQCADEAALIAFBnIXAAEEFEAE2ApQBIAEoAhgiAyAAQQJqTQ0BIABBA2ogA08NAiABIAEoAhAgAGpBAmovAAAiA0EIdCADQQh2ckH//wNxuBACNgI4IAFB+ABqIAFB1ABqIAFBlAFqIAFBOGoQsgEgAS0AeA0DIAEoAjgiA0GEAU8EQCADEAALIAEoApQBIgNBhAFPBEAgAxAACyABQaGFwABBAxABNgKUASABKAIYIgMgAEEEak0NBCAAQQVqIANPDQUgASABKAIQIABqQQRqLwAAIgNBCHQgA0EIdnJB//8DcbgQAjYCOCABQfgAaiABQdQAaiABQZQBaiABQThqELIBIAEtAHgNBiABKAI4IgNBhAFPBEAgAxAACyABKAKUASIDQYQBTwRAIAMQAAsgAUGkhcAAQQYQATYClAEgASgCGCIDIABBBmpNDQcgAEEHaiADTw0IIAEgASgCECAAakEGai8AACIDQQh0IANBCHZyQf//A3G4EAI2AjggAUH4AGogAUHUAGogAUGUAWogAUE4ahCyASABLQB4DQkgASgCOCIDQYQBTwRAIAMQAAsgASgClAEiA0GEAU8EQCADEAALIAEoAhgiAyAAQQhqTQ0KIABBCWogA08NCyABKAIQIABqQQhqLwAAIQMgAUH4hMAAQQQQATYClAEgASADQQh0IANBCHZyQf//A3EiBLgQAjYCOCABQfgAaiABQdQAaiABQZQBaiABQThqELIBIAEtAHgNDCABKAI4IgNBhAFPBEAgAxAACyABKAKUASIDQYQBTwRAIAMQAAtBASEDIAFBNGogAUHUAGoQqgIgAkEBcQ0NIARBuBdGIARBiJ4DRnIhAwwNCwwsCyABIABBAmoiADYCHAwtCyABIABBAmo2AhwMLQsgASAAQQRqNgIcDCgLIAEgAEEEaiIANgIcDCoLIAEgAEEEajYCHAwrCyABIABBBmo2AhwMJQsgASAAQQZqIgA2AhwMJwsgASAAQQZqNgIcDCkLIAEgAEEIajYCHAwiCyABIABBCGoiADYCHAwkCyABIABBCGo2AhwgAEEJaiADQYCDwAAQtAEACyABIABBCmo2AhwMHwsgASgCVCICQYQBTwRAIAIQAAsgAEEKaiEAIAMhAiAFQQFrIgVB//8DcQ0ACwwVCwwfCyABIAA2AhwMIQsgASAANgIcIABBBmogA0GAg8AAELQBAAsgASAANgIcDB4LIAEgADYCHCAAQQRqIANBgIPAABC0AQALIAEgADYCHAwbCyABIAA2AhwgAEECaiADQYCDwAAQtAEACwwWCyAEIABBgIPAABC0AQALDBsLDB4LDBELDBALDBYLDBELDA0LIAQgAEGAg8AAELQBAAsMEwsMCgsMEQsMFAsgASAANgIcCyABQYABaiICIAFB4ABqKAIANgIAIAEgASkCWDcDeCABKAIsIgAgASgCKEYEQCABQSRqIAAQhwEgASgCLCEACyABKAIkIABBFGxqIgAgASkDeDcCACAAIAM6ABEgACAUOgAQIAAgDDsBDiAAIA87AQwgAEEIaiACKAIANgIAIAEgASgCLEEBajYCLCABQZOFwABBBRABNgI4IAFB+ABqIAFBMGogAUE4aiABQTRqELIBIAEtAHgNBiABKAI4IgBBhAFPBEAgABAACyABQSBqIAFBMGoQqgIgASgCNCIAQYQBTwRAIAAQAAsgDCAKQf//A3EiAEshAiABKAIwIgNBhAFPBEAgAxAACyAMIAAgAhshCiAQIAdBAWoiB0H//wNxSw0ACwwECwwEC0ECQQJBgIPAABC0AQALQQFBAUGAg8AAELQBAAtBAEEAQYCDwAAQtAEACyABQYWEwABBBRABNgJYIAFB+ABqIAFBDGogAUHYAGogAUEgahCyASABLQB4DQAgASgCWCIAQYQBTwRAIAAQAAsCQAJAIAEoAhwiACABKAIYIgNJBEAgAEEBaiICIANPDQogASgCECIFIABqLQAAIQYgASAAQQJqIgQ2AhwgAiAFai0AACABEBw2AjQgBkEIdHIiAgRAA0AgARAgNgKUASABQfSEwABBBBABNgI4IAFB+ABqIAFBEGoQdCABKAJ4IgAgASgCgAEQASEDIAEoAnwEQCAAEEQLIAEgAzYCWCABQfgA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BRABNgJYIAEgAUEMaiABQdgAahDCASABKAIEIQAgASgCAA0BIAEgADYClAEMAgtBwITAAEEZQbCEwAAQzQEACyABQYEBNgKUASAAQYQBSQ0AIAAQAAsgASABQZQBahDEAjYCVCABIAFBCmo2AnggAUHUAGogAUH4AGpBnITAABCpAiABKAJUIgBBhAFPBEAgABAACyABKAKUASIAQYQBTwRAIAAQAAsgASgCWCIAQYQBSQ0BIAAQAAwBCyADQeUBcSEDCwJAIAJBAWoiACAHTw0AIAAgCWotAABBAUcNACABQdmEwABBAxABNgKUASABRAAAAAAAAPA/EAI2AlggAUH4AGogAUEMaiABQZQBaiABQdgAahCyASABLQB4RQRAIAEoAlgiAEGEAU8EQCAAEAALIAEoApQBIgBBhAFJDQEgABAADAELDAMLIAFB3ITAAEELEAE2ApQBIAEgA7gQAjYCWCABQfgAaiABQQxqIAFBlAFqIAFB2ABqELIBIAEtAHgNAiABKAJYIgBBhAFPBEAgABAACyABKAKUASIAQYQBSQ0AIAAQAAsgAUGIAWogAUHIAGopAwA3AwAgESAOKQMANwMAIAEgASkDODcDeCABIA1BBXY6AJIBIAEgDDoAkQEgASAQOgCQASABQdgAaiEEIAFB+ABqIQAjAEEgayIDJAACQAJAAkBBAEHohMAAKAIAEQMAIgIEQCACKAIARQ0BQdynwABBECADQR9qQeynwABBiKjAABCpAQALIAAoAggiDQRAIAAoAgAhBANAIARBBGooAgAEQCAEKAIAEEQLIARBDGohBCANQQFrIg0NAAsLIAAoAgQEQCAAKAIAEEQLIABBEGooAgBFDQEgACgCDBBEDAELIAIpAgQhHSACIAApAgA3AgQgA0EYaiIGIAJBHGoiBy8BADsBACADQRBqIgkgAkEUaiIMKQIANwMAIANBCGoiCiACQQxqIg0pAgA3AwAgAkEfai0AACELIAJBHmotAAAhBSAHIABBGGooAgA2AgAgDSAAQQhqKQIANwIAIAwgAEEQaikCADcCACADIB03AwAgAkEANgIAIAVBA0YNACAEIAMpAwA3AgAgBCALOgAbIAQgBToAGiAEQRhqIAYvAQA7AQAgBEEQaiAJKQMANwIAIARBCGogCikDADcCACADQSBqJAAMAQtBpKbAAEHG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AAAAFwEQAAsAAADNAgAADgAAABcBEAALAAAAzgIAABUAAABkYXRhaW1hZ2VjdHh4eWRyYXcgZmFpbGVkAAAAFwEQAAsAAABsAwAADgAAABcBEAALAAAALQMAACIAAAAXARAACwAAACIDAAAiAAAAYXV0b2dyYXBoZWRmYXRhbCBlcnJvciAA4wQQAAwAAAAXARAACwAAAFgDAAARAAAAFwEQAAsAAAB8AwAAEQAAABcBEAALAAAAjgMAABEAAAAXARAACwAAAM0DAAAcAAAAFwEQAAsAAADSAwAAHAAAABcBEAALAAAA5AMAACwAAAAXARAACwAAAOUDAAAjAAAAFwEQAAsAAAAXBAAARAAAABEAAABsYXlvdXRwYXRoAAAXARAACwAAAGQEAABGAAAAXFwiAAAAEAAAAAAAAAAQAAAAAAAsIiJ7IiIiIjoBAAFBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWmFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3eHl6MDEyMzQ1Njc4OSsv/////////////////////////////////////////////////////////z7///8/NDU2Nzg5Ojs8Pf////////8AAQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGf///////xobHB0eHyAhIiMkJSYnKCkqKywtLi8wMTIz/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////xcBEAALAAAAsAQAABsAAAAXARAACwAAALoEAAAaAAAAYmFzZTY0IGRlY29kZSBlcnJvcgAXARAACwAAAKgEAAAXAAAAFwEQAAsAAADRBAAAIwAAAGhkAAAHAAAACAAAAAQAAAASAAAAEwAAAAcAAAAQAAAABAAAABQAAAAVAAAAFwEQAAsAAAD+BAAARQAAABcBEAALAAAA/gQAAB0AAAAXARAACwAAAP4EAAAUAAAAL3J1c3RjL2NjNjZhZDQ2ODk1NTcxN2FiOTI2MDBjNzcwZGE4YzE2MDFhNGZmMzMvbGlicmFyeS9jb3JlL3NyYy9zdHIvcGF0dGVybi5ycwCoBxAATwAAALgBAAA3AAAAGAAAAAQAAAAEAAAAGQAAABoAAAAYAAAABAAAAAQAAAAbAAAAHAAAAB0AAADEAAAABAAAAB4AAABjYWxsZWQgYE9wdGlvbjo6dW53cmFwX3Rocm93KClgIG9uIGEgYE5vbmVgIHZhbHVlAAAAHwAAAAwCAAAEAAAAIAAAAC9Vc2Vycy9oa2FuZWRhLy5jYXJnby9yZWdpc3RyeS9zcmMvaW5kZXguY3JhdGVzLmlvLTZmMTdkMjJiYmExNTAwMWYvd2FzbS1iaW5kZ2VuLWZ1dHVyZXMtMC40LjUwL3NyYy9saWIucnMAAIQIEABqAAAA5gAAABUAAABgYXN5bmMgZm5gIHJlc3VtZWQgYWZ0ZXIgY29tcGxldGlvbgBhc3NlcnRpb24gZmFpbGVkOiBtaWQgPD0gc2VsZi5sZW4oKVNIQS0yNTZzcmMvY3J5cHRvLnJzAE4JEAANAAAADwAAAFcAAABOCRAADQAAADYAAAAbAAAAAAAAAGF0dGVtcHQgdG8gY2FsY3VsYXRlIHRoZSByZW1haW5kZXIgd2l0aCBhIGRpdmlzb3Igb2YgemVybwAAAE4JEAANAAAAQAAAACEAAABlbmNyeXB0ZGVjcnlwdHJhd0FFUy1HQ01OCRAADQAAAD8AAAAfAAAATgkQAA0AAABRAAAAHAAAAG5hbWVpdgAATgkQAA0AAABuAAAAYAAAAE4JEAANAAAAcgAAAEQAAABzcmMvbGliLnJzAAAsChAACgAAAC0AAAAaAAAAAQABQUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVphYmNkZWZnaGlqa2xtbm9wcXJzdHV2d3h5ejAxMjM0NTY3ODkrL/////////////////////////////////////////////////////////8+////PzQ1Njc4OTo7PD3/////////AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBn///////8aGxwdHh8gISIjJCUmJygpKissLS4vMDEyM/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////9kZWNvZGUgZXJyb3IALAoQAAoAAAAnAAAAAQAAAG5mOi9fZWJqqAsQAAMAAACrCxAAAQAAAKwLEAAEAAAALAoQAAoAAACCAAAAVQAAAC5qcGckCRAAAAAAAKsLEAABAAAAqwsQAAEAAACrCxAAAQAAANgLEAAEAAAALAoQAAoAAACGAAAAFQAAACwKEAAKAAAAgQAAAAEAAADTAAAAHQAAAMUAAAArAAAAswAAAFkAAABPAAAAZmFpbGVkIHRvIGZpbGwgd2hvbGUgYnVmZmVyAEAMEAAbAAAAJQAAAGludmFsaWQgYXJnc2gMEAAMAAAAL3J1c3RjL2NjNjZhZDQ2ODk1NTcxN2FiOTI2MDBjNzcwZGE4YzE2MDFhNGZmMzMvbGlicmFyeS9jb3JlL3NyYy9mbXQvbW9kLnJzAHwMEABLAAAANQEAAA0AAABBZGxlcjMyIGNoZWNrc3VtIG1pc21hdGNoZWQ6IHZhbHVlPSwgZXhwZWN0ZWQ9AADYDBAAIwAAAPsMEAALAAAAIwAAAAwAAAAEAAAAJAAAACMAAAAMAAAABAAAACUAAAAkAAAAGA0QACYAAAAnAAAAKAAAACYAAAApAAAAL1VzZXJzL2hrYW5lZGEvLmNhcmdvL3JlZ2lzdHJ5L3NyYy9pbmRleC5jcmF0ZXMuaW8tNmYxN2QyMmJiYTE1MDAxZi9saWJmbGF0ZS0xLjQuMC9zcmMvemxpYi5ycwAAVA0QAF4AAAChAQAAKQAAAFZlYyBpcyBzaXplZCBjb25zZXJ2YXRpdmVseQDEDRAAGwAAAGludGVybmFsIGVycm9yOiBlbnRlcmVkIHVucmVhY2hhYmxlIGNvZGU6IAAA6A0QACoAAAAvVXNlcnMvaGthbmVkYS8uY2FyZ28vcmVnaXN0cnkvc3JjL2luZGV4LmNyYXRlcy5pby02ZjE3ZDIyYmJhMTUwMDFmL2Jhc2U2NC0wLjIyLjEvc3JjL2VuZ2luZS9tb2QucnMAHA4QAGMAAAABAQAAGQAAAFByZXNldCBkaWN0aW9uYXJpZXMgYXJlIG5vdCBzdXBwb3J0ZWQ6IGRpY3Rpb25hcnlfaWQ9MHgAkA4QADcAAABDb21wcmVzc2lvbiBtZXRob2RzIG90aGVyIHRoYW4gREVGTEFU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AAAAbW9kZWRwcmxpbWl0c2l6ZWZsYWcvVXNlcnMvaGthbmVkYS8uY2FyZ28vcmVnaXN0cnkvc3JjL2luZGV4LmNyYXRlcy5pby02ZjE3ZDIyYmJhMTUwMDFmL2xpYmZsYXRlX2x6NzctMS4yLjAvc3JjL2xpYi5ycwAAFBYQAGIAAADfAAAAFQAAAFRvbyBsb25nIGJhY2t3b3JkIHJlZmVyZW5jZTogYnVmZmVyLmxlbj0sIGRpc3RhbmNlPQCIFhAAKAAAALAWEAALAAAAQAAAAAwAAAAEAAAAJAAAAEAAAAAMAAAABAAAACUAAAAkAAAAzBYQACYAAAAnAAAAKAAAACYAAAApAAAAL1VzZXJzL2hrYW5lZGEvLmNhcmdvL3JlZ2lzdHJ5L3NyYy9pbmRleC5jcmF0ZXMuaW8tNmYxN2QyMmJiYTE1MDAxZi9ybGUtZGVjb2RlLWZhc3QtMS4wLjMvc3JjL2xpYi5yc3NyYyBpcyBvdXQgb2YgYm91bmRzCBcQAGQAAABOAAAABQAAAHNyYyBlbmQgaXMgYmVmb3JlIHNyYyBzdGFydAAIFxAAZAAAAE0AAAAFAAAAZmFpbGVkIHRvIGZpbGwgd2hvbGUgYnVmZmVyALwXEAAbAAAAJQAAAGJ0eXBlIDB4MTEgb2YgREVGTEFURSBpcyByZXNlcnZlZChlcnJvcikgdmFsdWVpbnRlcm5hbCBlcnJvcjogZW50ZXJlZCB1bnJlYWNoYWJsZSBjb2RlL1VzZXJzL2hrYW5lZGEvLmNhcmdvL3JlZ2lzdHJ5L3NyYy9pbmRleC5jcmF0ZXMuaW8tNmYxN2QyMmJiYTE1MDAxZi9saWJmbGF0ZS0xLjQuMC9zcmMvZGVmbGF0ZS9kZWNvZGUucnMAADoYEABoAAAAqAAAABYAAABMRU49IGlzIG5vdCB0aGUgb25lJ3MgY29tcGxlbWVudCBvZiBOTEVOPQAAALQYEAAEAAAAuBgQACUAAABUaGUgcmVhZGVyIGhhcyBpbmNvcnJlY3QgbGVuZ3RoOiBleHBlY3RlZCAsIHJlYWQgAAAA8BgQACoAAAAaGRAABwAAAAEAAAACAAAAAwAAAAQAAAAFAAEABwABAAkAAgANAAIAEQADABkAAwAhAAQAMQAEAEEABQBhAAUAgQAGAMEABgABAQcAgQEHAAECCAABAwgAAQQJAAEGCQABCAoAAQwKAAEQCwABGAsAASAMAAEwDAABQA0AAWANAC9Vc2Vycy9oa2FuZWRhLy5jYXJnby9yZWdpc3RyeS9zcmMvaW5kZXguY3JhdGVzLmlvLTZmMTdkMjJiYmExNTAwMWYvbGliZmxhdGUtMS40LjAvc3JjL2RlZmxhdGUvc3ltYm9sLnJzrBkQAGgAAADzAAAAIgAAAFRoZSB2YWx1ZSAgbXVzdCBub3Qgb2NjdXIgaW4gY29tcHJlc3NlZCBkYXRhJBoQAAoAAAAuGhAAIgAAAAMAAAAEAAAABQAAAAYAAAAHAAAACAAAAAkAAAAKAAAACwABAA0AAQAPAAEAEQABABMAAgAXAAIAGwACAB8AAgAjAAMAKwADADMAAwA7AAMAQwAEAFMABABjAAQAcwAEAIMABQCjAAUAwwAFAOMABQACAQAArBkQAGgAAADkAAAAKgAAAC9Vc2Vycy9oa2FuZWRhLy5jYXJnby9yZWdpc3RyeS9zcmMvaW5kZXguY3JhdGVzLmlvLTZmMTdkMjJiYmExNTAwMWYvbGliZmxhdGUtMS40LjAvc3JjL2h1ZmZtYW4ucnMAAADkGhAAYQAAAKsAAAAfAAAASW52YWxpZCBodWZmbWFuIGNvZGVkIHN0cmVhbS9ydXN0Yy9jYzY2YWQ0Njg5NTU3MTdhYjkyNjAwYzc3MGRhOGMxNjAxYTRmZjMzL2xpYnJhcnkvc3RkL3NyYy9pby9yZWFkYnVmLnJzAAAAdBsQAE0AAADjAAAAGgAAAC9ydXN0Yy9jYzY2YWQ0Njg5NTU3MTdhYjkyNjAwYzc3MGRhOGMxNjAxYTRmZjMzL2xpYnJhcnkvc3RkL3NyYy9pby9tb2QucnMAAAB0GxAATQAAANIAAABCAAAA1BsQAEkAAAClAQAANQAAAG51bWJlciBvZiByZWFkIGJ5dGVzIGV4Y2VlZHMgbGltaXQAAEAcEAAiAAAA1BsQAEkAAABCCgAACQAAANQbEABJAAAAVAoAADIAAABjbG9zdXJlIGludm9rZWQgcmVjdXJzaXZlbHkgb3IgYWZ0ZXIgYmVpbmcgZHJvcHBlZAAATGF6eSBpbnN0YW5jZSBoYXMgcHJldmlvdXNseSBiZWVuIHBvaXNvbmVkAADAHBAAKgAAAC9Vc2Vycy9oa2FuZWRhLy5jYXJnby9yZWdpc3RyeS9zcmMvaW5kZXguY3JhdGVzLmlvLTZmMTdkMjJiYmExNTAwMWYvb25jZV9jZWxsLTEuMjEuMy9zcmMvbGliLnJzAPQcEABfAAAACAMAABkAAAByZWVudHJhbnQgaW5pdAAAZB0QAA4AAAD0HBAAXwAAAHoCAAANAAAAYWxyZWFkeSBib3Jyb3dlZEEAAAAAAAAAAQAAADgAAAAvVXNlcnMvaGthbmVkYS8uY2FyZ28vcmVnaXN0cnkvc3JjL2luZGV4LmNyYXRlcy5pby02ZjE3ZDIyYmJhMTUwMDFmL3dhc20tYmluZGdlbi1mdXR1cmVzLTAuNC41MC9zcmMvdGFzay9zaW5nbGV0aHJlYWQucnNCAAAAQwAAAEQAAABFAAAArB0QAHgAAABnAAAAJQAAAGNsb3N1cmUgaW52b2tlZCByZWN1cnNpdmVseSBvciBhZnRlciBiZWluZyBkcm9wcGVkAABKAAAABAAAAAQAAABLAAAATAAAAE0AAAAEAAAABAAAAE4AAABPAAAATQAAAAQAAAAEAAAAUAAAAFEAAABGbk9uY2UgY2FsbGVkIG1vcmUgdGhhbiBvbmNlYWxyZWFkeSBtdXRhYmx5IGJvcnJvd2VkYWxyZWFkeSBib3Jyb3dlZFIAAAAAAAAAAQAAADgAAAAvVXNlcnMvaGthbmVkYS8uY2FyZ28vcmVnaXN0cnkvc3JjL2luZGV4LmNyYXRlcy5pby02ZjE3ZDIyYmJhMTUwMDFmL3dhc20tYmluZGdlbi1mdXR1cmVzLTAuNC41MC9zcmMvcXVldWUucnMIHxAAbAAAACgAAAApAAAAUgAAAAAAAAABAAAAOQAAAAgfEABsAAAAJQAAAC4AAAAIHxAAbAAAAD4AAAAaAAAAL1VzZXJzL2hrYW5lZGEvLmNhcmdvL3JlZ2lzdHJ5L3NyYy9pbmRleC5jcmF0ZXMuaW8tNmYxN2QyMmJiYTE1MDAxZi93YXNtLWJpbmRnZW4tZnV0dXJlcy0wLjQuNTAvc3JjL2xpYi5ycwAAtB8QAGoAAACxAAAADwAAALQfEABqAAAAkQAAACcAAAC0HxAAagAAALsAAAAkAAAAaW50ZXJuYWwgZXJyb3I6IGVudGVyZWQgdW5yZWFjaGFibGUgY29kZS9Vc2Vycy9oa2FuZWRhLy5jYXJnby9yZWdpc3RyeS9zcmMvaW5kZXguY3JhdGVzLmlvLTZmMTdkMjJiYmExNTAwMWYvbGliZmxhdGUtMS40LjAvc3JjL3psaWIucnMAAHggEABeAAAAOgAAABIAAABJbmRleCBvdXQgb2YgYm91bmRzAOggEAATAAAAL3J1c3RjL2NjNjZhZDQ2ODk1NTcxN2FiOTI2MDBjNzcwZGE4YzE2MDFhNGZmMzMvbGlicmFyeS9jb3JlL3NyYy9zbGljZS9zb3J0LnJzAAAEIRAATgAAADQEAAAOAAAABCEQAE4AAABBBAAAHAAAAAQhEABOAAAAQgQAAB0AAAAEIRAATgAAAEMEAAAlAAAAY2FsbGVkIGBPcHRpb246OnVud3JhcCgpYCBvbiBhIGBOb25lYCB2YWx1ZQAEIRAATgAAAIcEAABAAAAABCEQAE4AAACtBAAATgAAAAQhEABOAAAAuwQAAFYAAAAEIRAATgAAADcFAAApAAAAYXNzZXJ0aW9uIGZhaWxlZDogZW5kID49IHN0YXJ0ICYmIGVuZCA8PSBsZW4EIRAATgAAACYFAAAFAAAAYXNzZXJ0aW9uIGZhaWxlZDogb2Zmc2V0ICE9IDAgJiYgb2Zmc2V0IDw9IGxlbgAABCEQAE4AAACbAAAABQAAAC9Vc2Vycy9oa2FuZWRhLy5jYXJnby9yZWdpc3RyeS9zcmMvaW5kZXguY3JhdGVzLmlvLTZmMTdkMjJiYmExNTAwMWYvbGliZmxhdGUtMS40LjAvc3JjL2h1ZmZtYW4ucnMAAAB8IhAAYQAAAHIAAAAaAAAAQml0IHJlZ2lvbiBjb25mbGljdDogaT0sIG9sZF92YWx1ZT0sIG5ld192YWx1ZT0sIHN5bWJvbD0sIGNvZGU9APAiEAAXAAAAByMQAAwAAAATIxAADAAAAB8jEAAJAAAAKCMQAAcAAABVAAAADAAAAAQAAAAkAAAAVQAAAAwAAAAEAAAAJQAAACQAAABYIxAAVgAAAFcAAAAoAAAAVgAAAFgAAABDb2Rld2lkdGgAAABZAAAAAQAAAAEAAABaAAAAYml0c1sAAAAEAAAABAAAAFwAAAAvVXNlcnMvaGthbmVkYS8uY2FyZ28vcmVnaXN0cnkvc3JjL2luZGV4LmNyYXRlcy5pby02ZjE3ZDIyYmJhMTUwMDFmL2FkbGVyMzItMS4yLjAvc3JjL2xpYi5yc8QjEABcAAAAtAAAADcAAADEIxAAXAAAAKkAAAA3AAAAL1VzZXJzL2hrYW5lZGEvLmNhcmdvL3JlZ2lzdHJ5L3NyYy9pbmRleC5jcmF0ZXMuaW8tNmYxN2QyMmJiYTE1MDAxZi9saWJmbGF0ZV9sejc3LTEuMi4wL3NyYy9saWIucnMAAEAkEABiAAAA3wAAABUAAABAJBAAYgAAAPQAAAA2AAAAYXR0ZW1wdCB0byByZXBlYXQgZnJhZ21lbnQgb2Ygc2l6ZSAwL1VzZXJzL2hrYW5lZGEvLmNhcmdvL3JlZ2lzdHJ5L3NyYy9pbmRleC5jcmF0ZXMuaW8tNmYxN2QyMmJiYTE1MDAxZi9ybGUtZGVjb2RlLWZhc3QtMS4wLjMvc3JjL2xpYi5yc+gkEABkAAAAYQAAAAUAAAByZXR1cm4gdGhpcwD0cRAAAHIQAAxyEAAYchAAY2xvc3VyZSBpbnZva2VkIHJlY3Vyc2l2ZWx5IG9yIGFmdGVyIGJlaW5nIGRyb3BwZWQAAExhenkgaW5zdGFuY2UgaGFzIHByZXZpb3VzbHkgYmVlbiBwb2lzb25lZAAArCUQACoAAAAvVXNlcnMvaGthbmVkYS8uY2FyZ28vcmVnaXN0cnkvc3JjL2luZGV4LmNyYXRlcy5pby02ZjE3ZDIyYmJhMTUwMDFmL29uY2VfY2VsbC0xLjIxLjMvc3JjL2xpYi5ycwDgJRAAXwAAAAgDAAAZAAAAcmVlbnRyYW50IGluaXQAAFAmEAAOAAAA4CUQAF8AAAB6AgAADQAAAEpzVmFsdWUoKQAAAHgmEAAIAAAAgCYQAAEAAABMYXp5IGluc3RhbmNlIGhhcyBwcmV2aW91c2x5IGJlZW4gcG9pc29uZWQAAJQmEAAqAAAAL1VzZXJzL2hrYW5lZGEvLmNhcmdvL3JlZ2lzdHJ5L3NyYy9pbmRleC5jcmF0ZXMuaW8tNmYxN2QyMmJiYTE1MDAxZi9vbmNlX2NlbGwtMS4yMS4zL3NyYy9saWIucnMAyCYQAF8AAAAIAwAAGQAAAHJlZW50cmFudCBpbml0AAA4JxAADgAAAMgmEABfAAAAegIAAA0AAAAvVXNlcnMvaGthbmVkYS8uY2FyZ28vcmVnaXN0cnkvc3JjL2luZGV4LmNyYXRlcy5pby02ZjE3ZDIyYmJhMTUwMDFmL2Jhc2U2NC0wLjIyLjEvc3JjL2VuZ2luZS9nZW5lcmFsX3B1cnBvc2UvZGVjb2RlLnJzAABgJxAAdgAAAI0AAAAZAAAAL1VzZXJzL2hrYW5lZGEvLmNhcmdvL3JlZ2lzdHJ5L3NyYy9pbmRleC5jcmF0ZXMuaW8tNmYxN2QyMmJiYTE1MDAxZi9iYXNlNjQtMC4yMi4xL3NyYy9lbmdpbmUvZ2VuZXJhbF9wdXJwb3NlL2RlY29kZV9zdWZmaXgucnMAAADoJxAAfQAAAFQAAAAJAAAA6CcQAH0AAAAfAAAAJgAAAC9Vc2Vycy9oa2FuZWRhLy5jYXJnby9yZWdpc3RyeS9zcmMvaW5kZXguY3JhdGVzLmlvLTZmMTdkMjJiYmExNTAwMWYvYmFzZTY0LTAuMjIuMS9zcmMvZW5naW5lL2dlbmVyYWxfcHVycG9zZS9kZWNvZGUucnMAAIgoEAB2AAAAOAAAACYAAACIKBAAdgAAAF4AAAAuAAAAiCgQAHYAAABhAAAADQAAAIgoEAB2AAAAZQAAADgAAACIKBAAdgAAAD0AAAAnAAAAcQAAAAQAAAAEAAAAcgAAAHMAAAB0AAAAaW52YWxpZCBhcmdzaCkQAAwAAAAvcnVzdGMvY2M2NmFkNDY4OTU1NzE3YWI5MjYwMGM3NzBkYThjMTYwMWE0ZmYzMy9saWJyYXJ5L2NvcmUvc3JjL2ZtdC9tb2QucnMAfCkQAEsAAAA1AQAADQAAAGNhbGxlZCBgT3B0aW9uOjp1bndyYXAoKWAgb24gYSBgTm9uZWAgdmFsdWVBY2Nlc3NFcnJvck9zY29kZXEAAAAEAAAABAAAAHUAAABraW5kdgAAAAEAAAABAAAAdwAAAG1lc3NhZ2UAeAAAAAwAAAAEAAAAeQAAAEtpbmRFcnJvcgAAAHEAAAAIAAAABAAAAHoAAABtZW1vcnkgYWxsb2NhdGlvbiBvZiAgYnl0ZXMgZmFpbGVkAABsKhAAFQAAAIEqEAANAAAAbGlicmFyeS9zdGQvc3JjL2FsbG9jLnJzoCoQABgAAABUAQAACQAAAGxpYnJhcnkvc3RkL3NyYy9wYW5pY2tpbmcucnPIKhAAHAAAAFECAAAfAAAAyCoQABwAAABSAgAAHgAAAHgAAAAMAAAABAAAAHsAAABxAAAACAAAAAQAAAB8AAAAcQAAAAgAAAAEAAAAfQAAAH4AAAB/AAAAEAAAAAQAAACAAAAAgQAAAIIAAAAAAAAAAQAAAIMAAABVbnN1cHBvcnRlZEN1c3RvbWVycm9yAABxAAAABAAAAAQAAACEAAAATm90Rm91bmRQZXJtaXNzaW9uRGVuaWVkQ29ubmVjdGlvblJlZnVzZWRDb25uZWN0aW9uUmVzZXRIb3N0VW5yZWFjaGFibGVOZXR3b3JrVW5yZWFjaGFibGVDb25uZWN0aW9uQWJvcnRlZE5vdENvbm5lY3RlZEFkZHJJblVzZUFkZHJOb3RBdmFpbGFibGVOZXR3b3JrRG93bkJyb2tlblBpcGVBbHJlYWR5RXhpc3RzV291bGRCbG9ja05vdEFEaXJlY3RvcnlJc0FEaXJlY3RvcnlEaXJlY3RvcnlOb3RFbXB0eVJlYWRPbmx5RmlsZXN5c3RlbUZpbGVzeXN0ZW1Mb29wU3RhbGVOZXR3b3JrRmlsZUhhbmRsZUludmFsaWRJbnB1dEludmFsaWREYXRhVGltZWRPdXRXcml0ZVplcm9TdG9yYWdlRnVsbE5vdFNlZWthYmxlRmlsZXN5c3RlbVF1b3RhRXhjZWVkZWRGaWxlVG9vTGFyZ2VSZXNvdXJjZUJ1c3lFeGVjdXRhYmxlRmlsZUJ1c3lEZWFkbG9ja0Nyb3NzZXNEZXZpY2VzVG9vTWFueUxpbmtzSW52YWxpZEZpbGVuYW1lQXJndW1lbnRMaXN0VG9vTG9uZ0ludGVycnVwdGVkVW5leHBlY3RlZEVvZk91dE9mTWVtb3J5T3RoZXJVbmNhdGVnb3JpemVkb3BlcmF0aW9uIHN1Y2Nlc3NmdWwACAAAABAAAAARAAAADwAAAA8AAAASAAAAEQAAAAwAAAAJAAAAEAAAAAsAAAAKAAAADQAAAAoAAAANAAAADAAAABEAAAASAAAADgAAABYAAAAMAAAACwAAAAgAAAAJAAAACwAAAAsAAAAXAAAADAAAAAwAAAASAAAACAAAAA4AAAAMAAAADwAAABMAAAALAAAACwAAAA0AAAALAAAABQAAAA0AAACEKxAAjCsQAJwrEACtKxAAvCsQAMsrEADdKxAA7isQAPorEAADLBAAEywQAB4sEAAoLBAANSwQAD8sEABMLBAAWCwQAGksEAB7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AQAAKgEAACsBAAAsAQAALQEAAC4BAAAvAQAAMAEAAAAAQAAyAQAAMwEAADQBAAA1AQAANgEAADcBAAA5AQAAOgEAADsBAAA8AQAAPQEAAD4BAAA/AQAAQAEAAEEBAABCAQAAQwEAAEQBAABFAQAARgEAAEcBAABIAQAASgEAAEsBAABMAQAATQEAAE4BAABPAQAAUAEAAFEBAABSAQAAUwEAAFQBAABVAQAAVgEAAFcBAABYAQAAWQEAAFoBAABbAQAAXAEAAF0BAABeAQAAXwEAAGABAABhAQAAYgEAAGMBAABkAQAAZQEAAGYBAABnAQAAaAEAAGkBAABqAQAAawEAAGwBAABtAQAAbgEAAG8BAABwAQAAcQEAAHIBAABzAQAAdAEAAHUBAAB2AQAAdwEAAHgBAAD/AAAAeQEAAHoBAAB7AQAAfAEAAH0BAAB+AQAAgQEAAFMCAACCAQAAgwEAAIQBAACFAQAAhgEAAFQCAACHAQAAiAEAAIkBAABWAgAAigEAAFcCAACLAQAAjAEAAI4BAADdAQAAjwEAAFkCAACQAQAAWwIAAJEBAACSAQAAkwEAAGACAACUAQAAYwIAAJYBAABpAgAAlwEAAGgCAACYAQAAmQEAAJwBAABvAgAAnQEAAHICAACfAQAAdQIAAKABAAChAQAAogEAAKMBAACkAQAApQEAAKYBAACAAgAApwEAAKgBAACpAQAAgwIAAKwBAACtAQAArgEAAIgCAACvAQAAsAEAALEBAACKAgAAsgEAAIsCAACzAQAAtAEAALUBAAC2AQAAtwEAAJICAAC4AQAAuQEAALwBAAC9AQAAxAEAAMYBAADFAQAAxgEAAMcBAADJAQAAyAEAAMkBAADKAQAAzAEAAMsBAADMAQAAzQEAAM4BAADPAQAA0AEAANEBAADSAQAA0wEAANQBAADVAQAA1gEAANcBAADYAQAA2QEAANoBAADbAQAA3AEAAN4BAADfAQAA4AEAAOEBAADiAQAA4wEAAOQBAADlAQAA5gEAAOcBAADoAQAA6QEAAOoBAADrAQAA7AEAAO0BAADuAQAA7wEAAPEBAADzAQAA8gEAAPMBAAD0AQAA9QEAAPYBAACVAQAA9wEAAL8BAAD4AQAA+QEAAPoBAAD7AQAA/AEAAP0BAAD+AQAA/wEAAAACAAABAgAAAgIAAAMCAAAEAgAABQIAAAYCAAAHAgAACAIAAAkCAAAKAgAACwIAAAwCAAANAgAADgIAAA8CAAAQAgAAEQIAABICAAATAgAAFAIAABUCAAAWAgAAFwIAABgCAAAZAgAAGgIAABsCAAAcAgAAHQIAAB4CAAAfAgAAIAIAAJ4BAAAiAgAAIwIAACQCAAAlAgAAJgIAACcCAAAoAgAAKQIAACoCAAArAgAALAIAAC0CAAAuAgAALwIAADACAAAxAgAAMgIAADMCAAA6AgAAZSwAADsCAAA8AgAAPQIAAJoBAAA+AgAAZiwAAEECAABCAgAAQwIAAIABAABEAgAAiQIAAEUCAACMAgAARgIAAEcCAABIAgAASQIAAEoCAABLAgAATAIAAE0CAABOAgAATwIAAHADAABxAwAAcgMAAHMDAAB2AwAAdwMAAH8DAADzAwAAhgMAAKwDAACIAwAArQMAAIkDAACuAwAAigMAAK8DAACMAwAAzAMAAI4DAADNAwAAjwMAAM4DAACRAwAAsQMAAJIDAACyAwAAkwMAALMDAACUAwAAtAMAAJUDAAC1AwAAlgMAALYDAACXAwAAtwMAAJgDAAC4AwAAmQMAALkDAACaAwAAugMAAJsDAAC7AwAAnAMAALwDAACdAwAAvQMAAJ4DAAC+AwAAnwMAAL8DAACgAwAAwAMAAKEDAADBAwAAowMAAMMDAACkAwAAxAMAAKUDAADFAwAApgMAAMYDAACnAwAAxwMAAKgDAADIAwAAqQMAAMkDAACqAwAAygMAAKsDAADLAwAAzwMAANcDAADYAwAA2QMAANoDAADbAwAA3AMAAN0DAADeAwAA3wMAAOADAADhAwAA4gMAAOMDAADkAwAA5QMAAOYDAADnAwAA6AMAAOkDAADqAwAA6wMAAOwDAADtAwAA7gMAAO8DAAD0AwAAuAMAAPcDAAD4AwAA+QMAAPIDAAD6AwAA+wMAAP0DAAB7AwAA/gMAAHwDAAD/AwAAfQMAAAAEAABQBAAAAQQAAFEEAAACBAAAUgQAAAMEAABTBAAABAQAAFQEAAAFBAAAVQQAAAYEAABWBAAABwQAAFcEAAAIBAAAWAQAAAkEAABZBAAACgQAAFoEAAALBAAAWwQAAAwEAABcBAAADQQAAF0EAAAOBAAAXgQAAA8EAABfBAAAEAQAADAEAAARBAAAMQQAABIEAAAyBAAAEwQAADMEAAAUBAAANAQAABUEAAA1BAAAFgQAADYEAAAXBAAANwQAABgEAAA4BAAAGQQAADkEAAAaBAAAOgQAABsEAAA7BAAAHAQAADwEAAAdBAAAPQQAAB4EAAA+BAAAHwQAAD8EAAAgBAAAQAQAACEEAABBBAAAIgQAAEIEAAAjBAAAQwQAACQEAABEBAAAJQQAAEUEAAAmBAAARgQAACcEAABHBAAAKAQAAEgEAAApBAAASQQAACoEAABKBAAAKwQAAEsEAAAsBAAATAQAAC0EAABNBAAALgQAAE4EAAAvBAAATwQAAGAEAABhBAAAYgQAAGMEAABkBAAAZQQAAGYEAABnBAAAaAQAAGkEAABqBAAAawQAAGwEAABtBAAAbgQAAG8EAABwBAAAcQQAAHIEAABzBAAAdAQAAHUEAAB2BAAAdwQAAHgEAAB5BAAAegQAAHsEAAB8BAAAfQQAAH4EAAB/BAAAgAQAAIEEAACKBAAAiwQAAIwEAACNBAAAjgQAAI8EAACQBAAAkQQAAJIEAACTBAAAlAQAAJUEAACWBAAAlwQAAJgEAACZBAAAmgQAAJsEAACcBAAAnQQAAJ4EAACfBAAAoAQAAKEEAACiBAAAowQAAKQEAAClBAAApgQAAKcEAACoBAAAqQQAAKoEAACrBAAArAQAAK0EAACuBAAArwQAALAEAACxBAAAsgQAALMEAAC0BAAAtQQAALYEAAC3BAAAuAQAALkEAAC6BAAAuwQAALwEAAC9BAAAvgQAAL8EAADABAAAzwQAAMEEAADCBAAAwwQAAMQEAADFBAAAxgQAAMcEAADIBAAAyQQAAMoEAADLBAAAzAQAAM0EAADOBAAA0AQAANEEAADSBAAA0wQAANQEAADVBAAA1gQAANcEAADYBAAA2QQAANoEAADbBAAA3AQAAN0EAADeBAAA3wQAAOAEAADhBAAA4gQAAOMEAADkBAAA5QQAAOYEAADnBAAA6AQAAOkEAADqBAAA6wQAAOwEAADtBAAA7gQAAO8EAADwBAAA8QQAAPIEAADzBAAA9AQAAPUEAAD2BAAA9wQAAPgEAAD5BAAA+gQAAPsEAAD8BAAA/QQAAP4EAAD/BAAAAAUAAAEFAAACBQAAAwUAAAQFAAAFBQAABgUAAAcFAAAIBQAACQUAAAoFAAALBQAADAUAAA0FAAAOBQAADwUAABAFAAARBQAAEgUAABMFAAAUBQAAFQUAABYFAAAXBQAAGAUAABkFAAAaBQAAGwUAABwFAAAdBQAAHgUAAB8FAAAgBQAAIQUAACIFAAAjBQAAJAUAACUFAAAmBQAAJwUAACgFAAApBQAAKgUAACsFAAAsBQAALQUAAC4FAAAvBQAAMQUAAGEFAAAyBQAAYgUAADMFAABjBQAANAUAAGQFAAA1BQAAZQUAADYFAABmBQAANwUAAGcFAAA4BQAAaAUAADkFAABpBQAAOgUAAGoFAAA7BQAAawUAADwFAABsBQAAPQUAAG0FAAA+BQAAbgUAAD8FAABvBQAAQAUAAHAFAABBBQAAcQUAAEIFAAByBQAAQwUAAHMFAABEBQAAdAUAAEUFAAB1BQAARgUAAHYFAABHBQAAdwUAAEgFAAB4BQAASQUAAHkFAABKBQAAegUAAEsFAAB7BQAATAUAAHwFAABNBQAAfQUAAE4FAAB+BQAATwUAAH8FAABQBQAAgAUAAFEFAACBBQAAUgUAAIIFAABTBQAAgwUAAFQFAACEBQAAVQUAAIUFAABWBQAAhgUAAKAQAAAALQAAoRAAAAEtAACiEAAAAi0AAKMQAAADLQAApBAAAAQtAAClEAAABS0AAKYQAAAGLQAApxAAAActAACoEAAACC0AAKkQAAAJLQAAqhAAAAotAACrEAAACy0AAKwQAAAMLQAArRAAAA0tAACuEAAADi0AAK8QAAAPLQAAsBAAABAtAACxEAAAES0AALIQAAASLQAAsxAAABMtAAC0EAAAFC0AALUQAAAVLQAAthAAABYtAAC3EAAAFy0AALgQAAAYLQAAuRAAABktAAC6EAAAGi0AALsQAAAbLQAAvBAAABwtAAC9EAAAHS0AAL4QAAAeLQAAvxAAAB8tAADAEAAAIC0AAMEQAAAhLQAAwhAAACItAADDEAAAIy0AAMQQAAAkLQAAxRAAACUtAADHEAAAJy0AAM0QAAAtLQAAoBMAAHCrAAChEwAAcasAAKITAAByqwAAoxMAAHOrAACkEwAAdKsAAKUTAAB1qwAAphMAAHarAACnEwAAd6sAAKgTAAB4qwAAqRMAAHmrAACqEwAAeqsAAKsTAAB7qwAArBMAAHyrAACtEwAAfasAAK4TAAB+qwAArxMAAH+rAACwEwAAgKsAALETAACBqwAAshMAAIKrAACzEwAAg6sAALQTAACEqwAAtRMAAIWrAAC2EwAAhqsAALcTAACHqwAAuBMAAIirAAC5EwAAiasAALoTAACKqwAAuxMAAIurAAC8EwAAjKsAAL0TAACNqwAAvhMAAI6rAAC/EwAAj6sAAMATAACQqwAAwRMAAJGrAADCEwAAkqsAAMMTAACTqwAAxBMAAJSrAADFEwAAlasAAMYTAACWqwAAxxMAAJerAADIEwAAmKsAAMkTAACZqwAAyhMAAJqrAADLEwAAm6sAAMwTAACcqwAAzRMAAJ2rAADOEwAAnqsAAM8TAACfqwAA0BMAAKCrAADREwAAoasAANITAACiqwAA0xMAAKOrAADUEwAApKsAANUTAAClqwAA1hMAAKarAADXEwAAp6sAANgTAACoqwAA2RMAAKmrAADaEwAAqqsAANsTAACrqwAA3BMAAKyrAADdEwAArasAAN4TAACuqwAA3xMAAK+rAADgEwAAsKsAAOETAACxqwAA4hMAALKrAADjEwAAs6sAAOQTAAC0qwAA5RMAALWrAADmEwAAtqsAAOcTAAC3qwAA6BMAALirAADpEwAAuasAAOoTAAC6qwAA6xMAALurAADsEwAAvKsAAO0TAAC9qwAA7hMAAL6rAADvEwAAv6sAAPATAAD4EwAA8RMAAPkTAADyEwAA+hMAAPMTAAD7EwAA9BMAAPwTAAD1EwAA/RMAAJAcAADQEAAAkRwAANEQAACSHAAA0hAAAJMcAADTEAAAlBwAANQQAACVHAAA1RAAAJYcAADWEAAAlxwAANcQAACYHAAA2BAAAJkcAADZEAAAmhwAANoQAACbHAAA2xAAAJwcAADcEAAAnRwAAN0QAACeHAAA3hAAAJ8cAADfEAAAoBwAAOAQAAChHAAA4RAAAKIcAADiEAAAoxwAAOMQAACkHAAA5BAAAKUcAADlEAAAphwAAOYQAACnHAAA5xAAAKgcAADoEAAAqRwAAOkQAACqHAAA6hAAAKscAADrEAAArBwAAOwQAACtHAAA7RAAAK4cAADuEAAArxwAAO8QAACwHAAA8BAAALEcAADxEAAAshwAAPIQAACzHAAA8xAAALQcAAD0EAAAtRwAAPUQAAC2HAAA9hAAALccAAD3EAAAuBwAAPgQAAC5HAAA+RAAALocAAD6EAAAvRwAAP0QAAC+HAAA/hAAAL8cAAD/EAAAAB4AAAEeAAACHgAAAx4AAAQeAAAFHgAABh4AAAceAAAIHgAACR4AAAoeAAALHgAADB4AAA0eAAAOHgAADx4AABAeAAARHgAAEh4AABMeAAAUHgAAFR4AABYeAAAXHgAAGB4AABkeAAAaHgAAGx4AABweAAAdHgAAHh4AAB8eAAAgHgAAIR4AACIeAAAjHgAAJB4AACUeAAAmHgAAJx4AACgeAAApHgAAKh4AACseAAAsHgAALR4AAC4eAAAvHgAAMB4AADEeAAAyHgAAMx4AADQeAAA1HgAANh4AADceAAA4HgAAOR4AADoeAAA7HgAAPB4AAD0eAAA+HgAAPx4AAEAeAABBHgAAQh4AAEMeAABEHgAARR4AAEYeAABHHgAASB4AAEkeAABKHgAASx4AAEweAABNHgAATh4AAE8eAABQHgAAUR4AAFIeAABTHgAAVB4AAFUeAABWHgAAVx4AAFgeAABZHgAAWh4AAFseAABcHgAAXR4AAF4eAABfHgAAYB4AAGEeAABiHgAAYx4AAGQeAABlHgAAZh4AAGceAABoHgAAaR4AAGoeAABrHgAAbB4AAG0eAABuHgAAbx4AAHAeAABxHgAAch4AAHMeAAB0HgAAdR4AAHYeAAB3HgAAeB4AAHkeAAB6HgAAex4AAHweAAB9HgAAfh4AAH8eAACAHgAAgR4AAIIeAACDHgAAhB4AAIUeAACGHgAAhx4AAIgeAACJHgAAih4AAIseAACMHgAAjR4AAI4eAACPHgAAkB4AAJEeAACSHgAAkx4AAJQeAACVHgAAnh4AAN8AAACgHgAAoR4AAKIeAACjHgAApB4AAKUeAACmHgAApx4AAKgeAACpHgAAqh4AAKseAACsHgAArR4AAK4eAACvHgAAsB4AALEeAACyHgAAsx4AALQeAAC1HgAAth4AALceAAC4HgAAuR4AALoeAAC7HgAAvB4AAL0eAAC+HgAAvx4AAMAeAADBHgAAwh4AAMMeAADEHgAAxR4AAMYeAADHHgAAyB4AAMkeAADKHgAAyx4AAMweAADNHgAAzh4AAM8eAADQHgAA0R4AANIeAADTHgAA1B4AANUeAADWHgAA1x4AANgeAADZHgAA2h4AANseAADcHgAA3R4AAN4eAADfHgAA4B4AAOEeAADiHgAA4x4AAOQeAADlHgAA5h4AAOceAADoHgAA6R4AAOoeAADrHgAA7B4AAO0eAADuHgAA7x4AAPAeAADxHgAA8h4AAPMeAAD0HgAA9R4AAPYeAAD3HgAA+B4AAPkeAAD6HgAA+x4AAPweAAD9HgAA/h4AAP8eAAAIHwAAAB8AAAkfAAABHwAACh8AAAIfAAALHwAAAx8AAAwfAAAEHwAADR8AAAUfAAAOHwAABh8AAA8fAAAHHwAAGB8AABAfAAAZHwAAER8AABofAAASHwAAGx8AABMfAAAcHwAAFB8AAB0fAAAVHwAAKB8AACAfAAApHwAAIR8AACofAAAiHwAAKx8AACMfAAAsHwAAJB8AAC0fAAAlHwAALh8AACYfAAAvHwAAJx8AADgfAAAwHwAAOR8AADEfAAA6HwAAMh8AADsfAAAzHwAAPB8AADQfAAA9HwAANR8AAD4fAAA2HwAAPx8AADcfAABIHwAAQB8AAEkfAABBHwAASh8AAEIfAABLHwAAQx8AAEwfAABEHwAATR8AAEUfAABZHwAAUR8AAFsfAABTHwAAXR8AAFUfAABfHwAAVx8AAGgfAABgHwAAaR8AAGEfAABqHwAAYh8AAGsfAABjHwAAbB8AAGQfAABtHwAAZR8AAG4fAABmHwAAbx8AAGcfAACIHwAAgB8AAIkfAACBHwAAih8AAIIfAACLHwAAgx8AAIwfAACEHwAAjR8AAIUfAACOHwAAhh8AAI8fAACHHwAAmB8AAJAfAACZHwAAkR8AAJofAACSHwAAmx8AAJMfAACcHwAAlB8AAJ0fAACVHwAAnh8AAJYfAACfHwAAlx8AAKgfAACgHwAAqR8AAKEfAACqHwAAoh8AAKsfAACjHwAArB8AAKQfAACtHwAApR8AAK4fAACmHwAArx8AAKcfAAC4HwAAsB8AALkfAACxHwAAuh8AAHAfAAC7HwAAcR8AALwfAACzHwAAyB8AAHIfAADJHwAAcx8AAMofAAB0HwAAyx8AAHUfAADMHwAAwx8AANgfAADQHwAA2R8AANEfAADaHwAAdh8AANsfAAB3HwAA6B8AAOAfAADpHwAA4R8AAOofAAB6HwAA6x8AAHsfAADsHwAA5R8AAPgfAAB4HwAA+R8AAHkfAAD6HwAAfB8AAPsfAAB9HwAA/B8AAPMfAAAmIQAAyQMAACohAABrAAAAKyEAAOUAAAAyIQAATiEAAGAhAABwIQAAYSEAAHEhAABiIQAAciEAAGMhAABzIQAAZCEAAHQhAABlIQAAdSEAAGYhAAB2IQAAZyEAAHchAABoIQAAeCEAAGkhAAB5IQAAaiEAAHohAABrIQAAeyEAAGwhAAB8IQAAbSEAAH0hAABuIQAAfiEAAG8hAAB/IQAAgyEAAIQhAAC2JAAA0CQAALckAADRJAAAuCQAANIkAAC5JAAA0yQAALokAADUJAAAuyQAANUkAAC8JAAA1iQAAL0kAADXJAAAviQAANgkAAC/JAAA2SQAAMAkAADaJAAAwSQAANskAADCJAAA3CQAAMMkAADdJAAAxCQAAN4kAADFJAAA3yQAAMYkAADgJAAAxyQAAOEkAADIJAAA4iQAAMkkAADjJAAAyiQAAOQkAADLJAAA5SQAAMwkAADmJAAAzSQAAOckAADOJAAA6CQAAM8kAADpJAAAACwAADAsAAABLAAAMSwAAAIsAAAyLAAAAywAADMsAAAELAAANCwAAAUsAAA1LAAABiwAADYsAAAHLAAANywAAAgsAAA4LAAACSwAADksAAAKLAAAOiwAAAssAAA7LAAADCwAADwsAAANLAAAPSwAAA4sAAA+LAAADywAAD8sAAAQLAAAQCwAABEsAABBLAAAEiwAAEIsAAATLAAAQywAABQsAABELAAAFSwAAEUsAAAWLAAARiwAABcsAABHLAAAGCwAAEgsAAAZLAAASSwAABosAABKLAAAGywAAEssAAAcLAAATCwAAB0sAABNLAAAHiwAAE4sAAAfLAAATywAACAsAABQLAAAISwAAFEsAAAiLAAAUiwAACMsAABTLAAAJCwAAFQsAAAlLAAAVSwAACYsAABWLAAAJywAAFcsAAAoLAAAWCwAACksAABZLAAAKiwAAFosAAArLAAAWywAACwsAABcLAAALSwAAF0sAAAuLAAAXiwAAC8sAABfLAAAYCwAAGEsAABiLAAAawIAAGMsAAB9HQAAZCwAAH0CAABnLAAAaCwAAGksAABqLAAAaywAAGwsAABtLAAAUQIAAG4sAABxAgAAbywAAFACAABwLAAAUgIAAHIsAABzLAAAdSwAAHYsAAB+LAAAPwIAAH8sAABAAgAAgCwAAIEsAACCLAAAgywAAIQsAACFLAAAhiwAAIcsAACILAAAiSwAAIosAACLLAAAjCwAAI0sAACOLAAAjywAAJAsAACRLAAAkiwAAJMsAACULAAAlSwAAJYsAACXLAAAmCwAAJksAACaLAAAmywAAJwsAACdLAAAniwAAJ8sAACgLAAAoSwAAKIsAACjLAAApCwAAKUsAACmLAAApywAAKgsAACpLAAAqiwAAKssAACsLAAArSwAAK4sAACvLAAAsCwAALEsAACyLAAAsywAALQsAAC1LAAAtiwAALcsAAC4LAAAuSwAALosAAC7LAAAvCwAAL0sAAC+LAAAvywAAMAsAADBLAAAwiwAAMMsAADELAAAxSwAAMYsAADHLAAAyCwAAMksAADKLAAAyywAAMwsAADNLAAAziwAAM8sAADQLAAA0SwAANIsAADTLAAA1CwAANUsAADWLAAA1ywAANgsAADZLAAA2iwAANssAADcLAAA3SwAAN4sAADfLAAA4CwAAOEsAADiLAAA4ywAAOssAADsLAAA7SwAAO4sAADyLAAA8ywAAECmAABBpgAAQqYAAEOmAABEpgAARaYAAEamAABHpgAASKYAAEmmAABKpgAAS6YAAEymAABNpgAATqYAAE+mAABQpgAAUaYAAFKmAABTpgAAVKYAAFWmAABWpgAAV6YAAFimAABZpgAAWqYAAFumAABcpgAAXaYAAF6mAABfpgAAYKYAAGGmAABipgAAY6YAAGSmAABlpgAAZqYAAGemAABopgAAaaYAAGqmAABrpgAAbKYAAG2mAACApgAAgaYAAIKmAACDpgAAhKYAAIWmAACGpgAAh6YAAIimAACJpgAAiqYAAIumAACMpgAAjaYAAI6mAACPpgAAkKYAAJGmAACSpgAAk6YAAJSmAACVpgAAlqYAAJemAACYpgAAmaYAAJqmAACbpgAAIqcAACOnAAAkpwAAJacAACanAAAnpwAAKKcAACmnAAAqpwAAK6cAACynAAAtpwAALqcAAC+nAAAypwAAM6cAADSnAAA1pwAANqcAADenAAA4pwAAOacAADqnAAA7pwAAPKcAAD2nAAA+pwAAP6cAAECnAABBpwAAQqcAAEOnAABEpwAARacAAEanAABHpwAASKcAAEmnAABKpwAAS6cAAEynAABNpwAATqcAAE+nAABQpwAAUacAAFKnAABTpwAAVKcAAFWnAABWpwAAV6cAAFinAABZpwAAWqcAAFunAABcpwAAXacAAF6nAABfpwAAYKcAAGGnAABipwAAY6cAAGSnAABlpwAAZqcAAGenAABopwAAaacAAGqnAABrpwAAbKcAAG2nAABupwAAb6cAAHmnAAB6pwAAe6cAAHynAAB9pwAAeR0AAH6nAAB/pwAAgKcAAIGnAACCpwAAg6cAAISnAACFpwAAhqcAAIenAACLpwAAjKcAAI2nAABlAgAAkKcAAJGnAACSpwAAk6cAAJanAACXpwAAmKcAAJmnAACapwAAm6cAAJynAACdpwAAnqcAAJ+nAACgpwAAoacAAKKnAACjpwAApKcAAKWnAACmpwAAp6cAAKinAACppwAAqqcAAGYCAACrpwAAXAIAAKynAABhAgAAracAAGwCAACupwAAagIAALCnAACeAgAAsacAAIcCAACypwAAnQIAALOnAABTqwAAtKcAALWnAAC2pwAAt6cAALinAAC5pwAAuqcAALunAAC8pwAAvacAAL6nAAC/pwAAwKcAAMGnAADCpwAAw6cAAMSnAACUpwAAxacAAIICAADGpwAAjh0AAMenAADIpwAAyacAAMqnAADQpwAA0acAANanAADXpwAA2KcAANmnAAD1pwAA9qcAACH/AABB/wAAIv8AAEL/AAAj/wAAQ/8AACT/AABE/wAAJf8AAEX/AAAm/wAARv8AACf/AABH/wAAKP8AAEj/AAAp/wAASf8AACr/AABK/wAAK/8AAEv/AAAs/wAATP8AAC3/AABN/wAALv8AAE7/AAAv/wAAT/8AADD/AABQ/wAAMf8AAFH/AAAy/wAAUv8AADP/AABT/wAANP8AAFT/AAA1/wAAVf8AADb/AABW/wAAN/8AAFf/AAA4/wAAWP8AADn/AABZ/wAAOv8AAFr/AAAABAEAKAQBAAEEAQApBAEAAgQBACoEAQADBAEAKwQBAAQEAQAsBAEABQQBAC0EAQAGBAEALgQBAAcEAQAvBAEACAQBADAEAQAJBAEAMQQBAAoEAQAyBAEACwQBADMEAQAMBAEANAQBAA0EAQA1BAEADgQBADYEAQAPBAEANwQBABAEAQA4BAEAEQQBADkEAQASBAEAOgQBABMEAQA7BAEAFAQBADwEAQAVBAEAPQQBABYEAQA+BAEAFwQBAD8EAQAYBAEAQAQBABkEAQBBBAEAGgQBAEIEAQAbBAEAQwQBABwEAQBEBAEAHQQBAEUEAQAeBAEARgQBAB8EAQBHBAEAIAQBAEgEAQAhBAEASQQBACIEAQBKBAEAIwQBAEsEAQAkBAEATAQBACUEAQBNBAEAJgQBAE4EAQAnBAEATwQBALAEAQDYBAEAsQQBANkEAQCyBAEA2gQBALMEAQDbBAEAtAQBANwEAQC1BAEA3QQBALYEAQDeBAEAtwQBAN8EAQC4BAEA4AQBALkEAQDhBAEAugQBAOIEAQC7BAEA4wQBALwEAQDkBAEAvQQBAOUEAQC+BAEA5gQBAL8EAQDnBAEAwAQBAOgEAQDBBAEA6QQBAMIEAQDqBAEAwwQBAOsEAQDEBAEA7AQBAMUEAQDtBAEAxgQBAO4EAQDHBAEA7wQBAMgEAQDwBAEAyQQBAPEEAQDKBAEA8gQBAMsEAQDzBAEAzAQBAPQEAQDNBAEA9QQBAM4EAQD2BAEAzwQBAPcEAQDQBAEA+AQBANEEAQD5BAEA0gQBAPoEAQDTBAEA+wQBAHAFAQCXBQEAcQUBAJgFAQByBQEAmQUBAHMFAQCaBQEAdAUBAJsFAQB1BQEAnAUBAHYFAQCdBQEAdwUBAJ4FAQB4BQEAnwUBAHkFAQCgBQEAegUBAKEFAQB8BQEAowUBAH0FAQCkBQEAfgUBAKUFAQB/BQEApgUBAIAFAQCnBQEAgQUBAKgFAQCCBQEAqQUBAIMFAQCqBQEAhAUBAKsFAQCFBQEArAUBAIYFAQCtBQEAhwUBAK4FAQCIBQEArwUBAIkFAQCwBQEAigUBALEFAQCMBQEAswUBAI0FAQC0BQEAjgUBALUFAQCPBQEAtgUBAJAFAQC3BQEAkQUBALgFAQCSBQEAuQUBAJQFAQC7BQEAlQUBALwFAQCADAEAwAwBAIEMAQDBDAEAggwBAMIMAQCDDAEAwwwBAIQMAQDEDAEAhQwBAMUMAQCGDAEAxgwBAIcMAQDHDAEAiAwBAMgMAQCJDAEAyQwBAIoMAQDKDAEAiwwBAMsMAQCMDAEAzAwBAI0MAQDNDAEAjgwBAM4MAQCPDAEAzwwBAJAMAQDQDAEAkQwBANEMAQCSDAEA0gwBAJMMAQDTDAEAlAwBANQMAQCVDAEA1QwBAJYMAQDWDAEAlwwBANcMAQCYDAEA2AwBAJkMAQDZDAEAmgwBANoMAQCbDAEA2wwBAJwMAQDcDAEAnQwBAN0MAQCeDAEA3gwBAJ8MAQDfDAEAoAwBAOAMAQChDAEA4QwBAKIMAQDiDAEAowwBAOMMAQCkDAEA5AwBAKUMAQDlDAEApgwBAOYMAQCnDAEA5wwBAKgMAQDoDAEAqQwBAOkMAQCqDAEA6gwBAKsMAQDrDAEArAwBAOwMAQCtDAEA7QwBAK4MAQDuDAEArwwBAO8MAQCwDAEA8AwBALEMAQDxDAEAsgwBAPIMAQCgGAEAwBgBAKEYAQDBGAEAohgBAMIYAQCjGAEAwxgBAKQYAQDEGAEApRgBAMUYAQCmGAEAxhgBAKcYAQDHGAEAqBgBAMgYAQCpGAEAyRgBAKoYAQDKGAEAqxgBAMsYAQCsGAEAzBgBAK0YAQDNGAEArhgBAM4YAQCvGAEAzxgBALAYAQDQGAEAsRgBANEYAQCyGAEA0hgBALMYAQDTGAEAtBgBANQYAQC1GAEA1RgBALYYAQDWGAEAtxgBANcYAQC4GAEA2BgBALkYAQDZGAEAuhgBANoYAQC7GAEA2xgBALwYAQDcGAEAvRgBAN0YAQC+GAEA3hgBAL8YAQDfGAEAQG4BAGBuAQBBbgEAYW4BAEJuAQBibgEAQ24BAGNuAQBEbgEAZG4BAEVuAQBlbgEARm4BAGZuAQBHbgEAZ24BAEhuAQBobgEASW4BAGluAQBKbgEAam4BAEtuAQBrbgEATG4BAGxuAQBNbgEAbW4BAE5uAQBubgEAT24BAG9uAQBQbgEAcG4BAFFuAQBxbgEAUm4BAHJuAQBTbgEAc24BAFRuAQB0bgEAVW4BAHVuAQBWbgEAdm4BAFduAQB3bgEAWG4BAHhuAQBZbgEAeW4BAFpuAQB6bgEAW24BAHtuAQBcbgEAfG4BAF1uAQB9bgEAXm4BAH5uAQBfbgEAf24BAADpAQAi6QEAAekBACPpAQAC6QEAJOkBAAPpAQAl6QEABOkBACbpAQAF6QEAJ+kBAAbpAQAo6QEAB+kBACnpAQAI6QEAKukBAAnpAQAr6QEACukBACzpAQAL6QEALekBAAzpAQAu6QEADekBAC/pAQAO6QEAMOkBAA/pAQAx6QEAEOkBADLpAQAR6QEAM+kBABLpAQA06QEAE+kBADXpAQAU6QEANukBABXpAQA36QEAFukBADjpAQAX6QEAOekBABjpAQA66QEAGekBADvpAQAa6QEAPOkBABvpAQA96QEAHOkBAD7pAQAd6QEAP+kBAB7pAQBA6QEAH+kBAEHpAQAg6QEAQukBACHpAQBD6QEAQejjwQALOQIAAABTAAAAaQAAAAIAAAAAAAAAagAAAAIAAAAAAAAAawAAAAIAAAAAAAAAbAAAAAIAAAAAAAAAbQBBvOTBAAsBbwBwCXByb2R1Y2VycwIIbGFuZ3VhZ2UBBFJ1c3QADHByb2Nlc3NlZC1ieQMFcnVzdGMdMS43My4wIChjYzY2YWQ0NjggMjAyMy0xMC0wMykGd2FscnVzBjAuMjMuMwx3YXNtLWJpbmRnZW4HMC4yLjEwMAAsD3RhcmdldF9mZWF0dXJlcwIrD211dGFibGUtZ2xvYmFscysIc2lnbi1leHQ=';
     const EBJ_GLUE_BYTES = 11072;
     const EBJ_GLUE_SUM = 'b3af6137';
 
-    /** FNV-1a, 32-bit, over UTF-16 code units. Mirrored by the extraction tooling. */
     function ebjGlueChecksum(str) {
         let h = 0x811c9dc5;
         for (let i = 0; i < str.length; i++) {
@@ -8909,7 +9443,6 @@
         return ('0000000' + h.toString(16)).slice(-8);
     }
 
-    /** base64 -> Uint8Array, without a multi-megabyte intermediate string. */
     function ebjB64ToBytes(b64) {
         const bin = atob(b64);
         const out = new Uint8Array(bin.length);
@@ -8917,9 +9450,6 @@
         return out;
     }
 
-    // The page may have replaced the global Function as an anti-scraping
-    // measure. Keep a reference to the intrinsic so the glue can still be
-    // compiled, and fall back to an iframe realm if even that is gone.
     const ebjIntrinsicFunction = (function () {
         try {
             const F = Function;
@@ -8941,18 +9471,10 @@
         return null;
     }
 
-    // One module per run: decrypt_session is single-shot and a second call
-    // traps, and after the first shuffle even read-only calls trap, so the
-    // core is built fresh for each run and rebuilt when a shape has to change.
     let ebjCore = null;
 
     function ebjResetCore() { ebjCore = null; }
 
-    /**
-     * Compile the pinned glue and instantiate the wasm module.
-     * Resolves to the module's exports ({ default, decrypt_session, open_param,
-     * get_page_name, shuffle, ... }).
-     */
     async function ebjLoadGlue() {
         if (ebjCore) return ebjCore;
         let src;
@@ -8996,31 +9518,7 @@
         ebjCore = mod;
         return ebjCore;
     }
-    // =====================================================================
-    // ebookjapan — canvas realms, the portable encoder, and the descrambler
-    // =====================================================================
-    // Ported from the standalone script, where every part of this was forced by
-    // a real failure rather than chosen:
-    //
-    //   * The wasm draws with drawImage, and those draws only land on a canvas
-    //     from the PAGE's realm — which is why makeCanvas() builds there. The
-    //     viewer's own canvases being page-realm is the proof.
-    //   * That page deletes getImageData/toBlob/convertToBlob from its own
-    //     prototypes, so pixels are read and images encoded through a hidden
-    //     about:blank iframe with untouched prototypes. WebIDL brand checks are
-    //     per-interface, not per-realm, so its methods read a page-realm canvas.
-    //   * If no canvas encoder exists in any realm, pngFromRgba writes the PNG.
-    //   * canvasStats() reads pixels so "the shuffle ran" is never mistaken for
-    //     "the page painted": a shape that traps nothing and paints nothing is
-    //     exactly how a whole book of identical black pages once shipped. The
-    //     run's canary refuses to adopt any shape whose first page fails it.
-    //   * The wasm module is single-shot, and its autograph argument must be a
-    //     loaded <img> for its page and `undefined` everywhere else — never
-    //     null, or it unwraps a None and traps at src/book.rs:910:17.
-    //
-    // Only the functions this fragment owns are defined here: anything else it
-    // calls (crc32Bytes, fmtBytes, safeLogText, ...) comes from the shared core,
-    // because two definitions of one name in a single closure would shadow it.
+
     const ebjShuffleUnwraps = {
         '0x1653b': 'src/book.rs:856:17',
         '0x170b5': 'src/book.rs:717:14',
@@ -9038,7 +9536,6 @@
     let ebjSimulatedTraps = 0;
     let ebjFrameRealmSlot = null;
 
-    /** Debug-gated log, matching the core's quiet-by-default posture. */
     function ebjLog(kind, text) {
         try {
             if (typeof BWDD_DEBUG !== 'undefined' && BWDD_DEBUG) {
@@ -9076,7 +9573,7 @@
         const parts = hits.map(m => {
             const off = parseInt(m[2], 16);
             let where = null;
-            // Chrome reports either the instruction or its return address.
+
             for (let d = 0; d <= 4 && !where; d++) {
                 where = ebjShuffleUnwraps['0x' + (off - d).toString(16)] || null;
             }
@@ -9105,10 +9602,7 @@
     async function decodeImage(buf, { asImage = null } = {}) {
         const wantImg = asImage ? asImage === 'img' : ebjShape.image === 'img';
         const blob = new Blob([buf], { type: 'image/webp' });
-        // createImageBitmap() is the fast path, and it decodes from memory, so
-        // the page's `img-src` cannot stop it. The bare name can still be
-        // missing inside a userscript sandbox even when the page has it, so ask
-        // every root before giving up on it.
+
         const roots = [typeof createImageBitmap === 'function' ? createImageBitmap : null,
             (typeof window !== 'undefined' && window && typeof window.createImageBitmap === 'function')
                 ? window.createImageBitmap : null,
@@ -9119,21 +9613,17 @@
             try {
                 const bitmap = await cib.call(null, blob);
                 try {
-                    // Some callers look for the <img> spelling of the size.
+
                     bitmap.naturalWidth = bitmap.width;
                     bitmap.naturalHeight = bitmap.height;
-                } catch (e) { /* expando refused */ }
+                } catch (e) { }
                 ebjLastDecodePath = 'createImageBitmap';
                 return bitmap;
             } catch (e) {
                 ebjLastDecodePath = 'createImageBitmap threw: ' + ((e && e.message) || e);
             }
         }
-        // Fallback for engines without createImageBitmap (or a WebP variant it
-        // refuses): decode an <img> from the bytes. This used a blob: URL, which
-        // on ebookjapan can never work — the viewer's CSP is
-        // `img-src 'self' https: data:` with no blob:, so the load is blocked
-        // before it starts. A data: URL is allowed, so the bytes go in as base64.
+
         ebjLastDecodePath = 'data: URL';
         const url = `data:image/webp;base64,${bytesToBase64(new Uint8Array(buf))}`;
         try {
@@ -9154,13 +9644,6 @@
 
     function ebjPageDoc() { return (ebjPage && ebjPage.document) || document; }
 
-    /**
-     * The page deletes toBlob/toDataURL/convertToBlob/getImageData from its own
-     * canvas prototypes (a tainted canvas would still *have* them and throw, so
-     * deletion is what the console shows). An about:blank iframe is a fresh
-     * realm with its own untouched prototypes, and a method from there works on
-     * our canvas: WebIDL brand checks are per-interface, not per-realm.
-     */
     function frameRealm() {
         if (ebjFrameRealmSlot !== undefined) return ebjFrameRealmSlot;
         ebjFrameRealmSlot = null;
@@ -9228,14 +9711,11 @@
 
     function makeCanvas(w, h, kind = null) {
         const want = kind || ebjShape.canvas;
-        // The canvas has to come from the page's realm: that is where the wasm's
-        // drawImage actually lands (the viewer's own canvases are proof). The
-        // spare realm is only used to *read* pixels back, because the page has
-        // deleted getImageData/toBlob from its own prototypes.
+
         const Off = (ebjPage && ebjPage.OffscreenCanvas) ||
             (typeof OffscreenCanvas === 'function' ? OffscreenCanvas : null);
         if (want !== 'html' && Off) {
-            try { return new Off(w, h); } catch (e) { /* fall back */ }
+            try { return new Off(w, h); } catch (e) { }
         }
         const doc = (ebjPage && ebjPage.document) || document;
         const c = doc.createElement('canvas');
@@ -9310,13 +9790,6 @@
         if (!ctx) throw new Error('no 2d canvas context');
         ctx.clearRect(0, 0, geo.width, geo.height);
 
-        // The wasm only ever reads ctx.canvas.{width,height} and calls
-        // ctx.drawImage(image, sx, sy, sw, sh, dx, dy) — the destination offsets
-        // come from the page's own geometry, which is why the canvas must be the
-        // book's intrinsic size rather than the page's display box.
-        // Control mark: if our own fill is gone after the shuffle, we are reading a
-        // different surface than the wasm painted on; if it survives while the rest
-        // is black, the wasm genuinely painted nothing.
         const probing = ebjProbeOnce;
         if (probing) {
             ebjProbeOnce = false;
@@ -9326,10 +9799,6 @@
             } catch (e) { ebjLog('wasm', `control fill failed: ${(e && e.message) || e}`); }
         }
 
-        // The first shuffle of a run is traced: a trap that happens before the
-        // wasm has asked for a single tile is a state failure, and one after
-        // dozens of drawImage calls is a geometry failure. The two need
-        // completely different fixes, and the trap itself says neither.
         let ctxForShuffle = ctx;
         if (ebjTraceNextShuffle) {
             ebjTraceNextShuffle = false;
@@ -9340,8 +9809,6 @@
         glue.shuffle({ ctx: ctxForShuffle, x: 0, y: 0, data: { image: bitmap },
             autographed, page: row.page });
 
-        // Trim the transparent padding the tile grid leaves past the page box so
-        // small pages do not ship as mostly-empty full-intrinsic canvases.
         const w = row.width || geo.width;
         const h = row.height || geo.height;
         let out = canvas;
@@ -9374,8 +9841,7 @@
         const blob = await canvasToBlob(out, codec);
         if (bitmap && typeof bitmap.close === 'function') { try { bitmap.close(); } catch (e) {} }
         const buf = new Uint8Array(await blob.arrayBuffer());
-        // An encoder may quietly hand back PNG when asked for something it will
-        // not produce, so the blob's own type decides the extension.
+
         const mime = blob.type || codec.mime;
         const ext = { 'image/png': 'png', 'image/jpeg': 'jpg', 'image/webp': 'webp' }[mime] || codec.ext;
         return { blob, width: outW, height: outH, ext, mime, stats,
@@ -9404,15 +9870,15 @@
         const stride = width * 4;
         const raw = new Uint8Array(height * (stride + 1));
         for (let y = 0; y < height; y++) {
-            raw[y * (stride + 1)] = 0;                       // filter: none
+            raw[y * (stride + 1)] = 0;
             raw.set(rgba.subarray(y * stride, (y + 1) * stride), y * (stride + 1) + 1);
         }
         const ihdr = new Uint8Array(13);
         const dv = new DataView(ihdr.buffer);
         dv.setUint32(0, width);
         dv.setUint32(4, height);
-        ihdr[8] = 8;    // bit depth
-        ihdr[9] = 6;    // colour type: RGBA
+        ihdr[8] = 8;
+        ihdr[9] = 6;
         const sig = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
         return new Blob([sig, pngChunk('IHDR', ihdr), pngChunk('IDAT', await deflateBytes(raw)),
             pngChunk('IEND', new Uint8Array(0))], { type: 'image/png' });
@@ -9486,8 +9952,7 @@
         const q = codec.qualityValue;
         return new Promise((resolve, reject) => {
             const notes = [];
-            // A sandbox may strip the encoder off the object it hands over; the
-            // page realm still carries it on the prototype, so call that instead.
+
             const from = name => {
                 if (canvas && typeof canvas[name] === 'function') return canvas[name].bind(canvas);
                 for (const w of realms()) {
@@ -9495,7 +9960,7 @@
                     for (const C of [w.OffscreenCanvas, w.HTMLCanvasElement]) {
                         if (!C || !C.prototype || typeof C.prototype[name] !== 'function') continue;
                         try { if (canvas instanceof C) return C.prototype[name].bind(canvas); }
-                        catch (e) { /* cross-realm instanceof can refuse */ }
+                        catch (e) { }
                     }
                 }
                 return null;
@@ -9512,7 +9977,7 @@
 
             let pxNotes = [];
             function lastResort() {
-                // toDataURL is the encoder a patched page usually leaves alone.
+
                 if (enc.toDataURL) {
                     try {
                         const url = enc.toDataURL(codec.mime, q);
@@ -9568,7 +10033,7 @@
     function asArrayBuffer(v) {
         if (!v) return null;
         if (typeof v.byteLength === 'number' && typeof v.slice === 'function') {
-            // ArrayBuffer, or a typed-array view over one.
+
             return v instanceof Uint8Array
                 ? v.buffer.slice(v.byteOffset, v.byteOffset + v.byteLength)
                 : v;
@@ -9579,34 +10044,18 @@
     async function asBytes(v) {
         const direct = asArrayBuffer(v);
         if (direct) return direct;
-        if (v && typeof v.arrayBuffer === 'function') {   // Blob-like
+        if (v && typeof v.arrayBuffer === 'function') {
             const ab = await v.arrayBuffer();
             return asArrayBuffer(ab) || ab;
         }
-        if (typeof v === 'string') {                      // a manager that ignored responseType
+        if (typeof v === 'string') {
             return new TextEncoder().encode(v).buffer;
         }
         return null;
     }
-    // =====================================================================
-    // ebookjapan — off-thread descrambling, on the shared pool
-    // =====================================================================
-    // The shuffle is a synchronous burst on whatever thread runs it, so a run of
-    // pages starves the UI thread. A worker is a clean realm: its OffscreenCanvas
-    // keeps convertToBlob and getImageData, and the glue's Window shim already
-    // accepts a worker global. Each worker installs its own copy of the pack,
-    // because the module is single-shot and a second decrypt_session traps.
-    //
-    // The pool itself is core's makePool, the same one BookWalker uses. What is
-    // local here is only the job envelope and the worker source, which is what
-    // makePool's sixth argument exists for.
+
     const EBJ_MIME_EXT = { 'image/png': 'png', 'image/jpeg': 'jpg', 'image/webp': 'webp' };
 
-    /**
-     * The job envelope this store posts. makePool ships BookWalker's
-     * relPath/seeds/q shape by default; this one carries the page's geometry and
-     * the session material the worker needs to install its own pack.
-     */
     function ebjJobMessage(job) {
         return {
             id: job.id,
@@ -9625,13 +10074,6 @@
         };
     }
 
-    /**
-     * The worker source. Both the glue and the wasm ride inside it as base64, so
-     * nothing heavy crosses postMessage and a spawn costs one Blob URL for the
-     * whole pool. The module is installed lazily on the first page and reused for
-     * every page after, and a batch is walked in order so two pages never race on
-     * one canvas.
-     */
     function ebjWorkerSource() {
         return '"use strict";\n' +
             'const GLUE = (function () { ' + atob(EBJ_GLUE_B64) + ' })();\n' +
@@ -9707,7 +10149,6 @@
             '};\n';
     }
 
-    // Core's pool is callback per job; the run wants a promise per page.
     const ebjPoolWaiters = new Map();
 
     function ebjPoolDone(result) {
@@ -9725,11 +10166,6 @@
         });
     }
 
-    /**
-     * One page as a pool job. The worker installs its pack from the first job it
-     * sees and keeps it, so this carries the session material every time and the
-     * worker ignores it after the first.
-     */
     function ebjPoolJob(geo, codec, index, row, buf, withSrc) {
         const p = ebjState.payload || {};
         const book = ebjState.book;
@@ -9750,14 +10186,6 @@
         };
     }
 
-    /**
-     * Can this page run a worker at all? ebookjapan sets no worker-src, so
-     * script-src governs and it allows no blob:, which means new Worker(blobURL)
-     * is refused. That refusal does not throw the constructor — the worker fires
-     * error instead — so core's pool would respawn a blocked worker on every
-     * failure and bury the console. One probe answers it, and the run then stays
-     * on this thread by choice rather than by accident.
-     */
     function ebjWorkerAllowed() {
         return new Promise(resolve => {
             let url = null, w = null, done = false;
@@ -9777,21 +10205,9 @@
             setTimeout(() => finish(false), 1500);
         });
     }
-    // =====================================================================
-    // ebookjapan — run pipeline and adapter registration
-    // =====================================================================
-    // The shape follows sites/cmoa/02-run.js: wait for the viewer, take the
-    // title, hand everything to the shared run harness, fetch and descramble
-    // pages across a worker pool, and let the harness own the bars, the Mokuro
-    // session, the ZIP and the reporting.
-    function ebjSleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-    /**
-     * The shared codec speaks {fmt,type,quality,ext,lossless}; the ported
-     * encoder reads {mime,qualityValue}. Left unmapped, every page would be
-     * encoded with the wrong MIME and nobody would notice until the file was
-     * opened again.
-     */
+function ebjSleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
     function ebjCodec() {
         const c = resolveImageCodec();
         return {
@@ -9801,22 +10217,11 @@
         };
     }
 
-    // =====================================================================
-    // Per-page stage timing
-    // =====================================================================
-    // "It starts off fast and then slows down to 1 page/s" has three candidate
-    // owners: the network fetch, the main-thread decode+descramble+encode, and
-    // handing the finished blob to the run harness (ZIP entry, page cache, OCR
-    // queue). Guessing between them is what makes a slow run expensive, so
-    // every page records how long each stage took and the run ends with the
-    // totals and the distribution.
-    //
-    // It is deliberately cheap: two performance.now() calls per stage per page,
-    // no per-page log line, and a bounded sample ring so a 1000-page volume
-    // cannot grow the accumulator. The ring keeps min/max exactly (running
-    // values) and the median from a fixed 512-slot rotating sample, which is
-    // representative without holding a million numbers for a long series.
     const EBJ_TIMING_SAMPLES = 512;
+
+    let ebjLastTiming = null;
+
+    let ebjLastPrep = null;
 
     function ebjNow() {
         try { return performance.now(); } catch (e) { return Date.now(); }
@@ -9827,11 +10232,11 @@
         return {
             fetch: stage(), decode: stage(), descramble: stage(), write: stage(),
             lanes: Object.create(null),
-            pages: 0,   // pages that reached the harness (the write stage)
-            failed: 0,  // pages whose stage threw; excluded from the min/median/max
+            pages: 0,
+            failed: 0,
             retried: 0,
-            start: 0,   // set when the page phase begins, not at run entry
-            phaseMs: 0, // wall clock the page phase actually took
+            start: 0,
+            phaseMs: 0,
         };
     }
 
@@ -9847,7 +10252,6 @@
         else s.ring[s.next++ % EBJ_TIMING_SAMPLES] = v;
     }
 
-    /** Which transport actually served a page (gm / page / px:7010 / edge). */
     function ebjTimingLane(t, lane) {
         const k = lane || '?';
         t.lanes[k] = (t.lanes[k] || 0) + 1;
@@ -9858,6 +10262,40 @@
         const a = ring.slice().sort((x, y) => x - y);
         const mid = a.length >> 1;
         return a.length % 2 ? a[mid] : (a[mid - 1] + a[mid]) / 2;
+    }
+
+    let ebjSlotsBusy = 0;
+    let ebjSlotLimit = 16;
+    let ebjSlotQueue = [];
+
+    let ebjSlotsPeak = 0;
+
+    function ebjSetSlotLimit(limit) {
+        const n = limit | 0;
+        ebjSlotLimit = (n > 0 && n <= 64) ? n : 16;
+        ebjSlotsBusy = 0;
+        ebjSlotQueue = [];
+        ebjSlotsPeak = 0;
+    }
+
+    function ebjAcquireSlot() {
+        if (ebjSlotsBusy < ebjSlotLimit) {
+            ebjSlotsBusy++;
+            if (ebjSlotsBusy > ebjSlotsPeak) ebjSlotsPeak = ebjSlotsBusy;
+            return Promise.resolve();
+        }
+        return new Promise(resolve => ebjSlotQueue.push(resolve));
+    }
+
+    function ebjReleaseSlot() {
+        const next = ebjSlotQueue.shift();
+        if (next) { next(); return; }
+        ebjSlotsBusy = Math.max(0, ebjSlotsBusy - 1);
+    }
+
+    function ebjProcessDepth() {
+        return { busy: ebjSlotsBusy, queued: ebjSlotQueue.length, limit: ebjSlotLimit,
+                 peak: ebjSlotsPeak };
     }
 
     function ebjMs(v) {
@@ -9873,15 +10311,12 @@
             ' min/median/max over ' + s.n + ' pages';
     }
 
-    /**
-     * The one-line breakdown. fetch is the CDN/GM transport, cpu is everything
-     * this thread spent between the bytes arriving and an encoded blob existing
-     * (decode split out so a slow JPEG decode is not blamed on the shuffle),
-     * write is the harness hand-off. The stage that dominates is the one to fix.
-     */
     function ebjTimingLine(t) {
+
+        const par = (t.phaseMs > 0 && t.fetch.total > 0)
+            ? (t.fetch.total / t.phaseMs) : 0;
         const parts = [
-            'fetch ' + ebjMs(t.fetch.total),
+            'fetch ' + ebjMs(t.fetch.total) + (par ? ' (~' + par.toFixed(1) + ' in flight)' : ''),
             'cpu ' + ebjMs(t.decode.total + t.descramble.total) +
                 ' (decode ' + ebjMs(t.decode.total) + ' + descramble ' + ebjMs(t.descramble.total) + ')',
             'write ' + ebjMs(t.write.total),
@@ -9890,6 +10325,8 @@
                 (t.retried ? ', ' + t.retried + ' retried' : '') +
                 (t.failed ? ', ' + t.failed + ' failed attempt(s)' : ''),
         ];
+        const depth = ebjProcessDepth();
+        parts.push('gate peak ' + depth.peak + '/' + depth.limit);
         const lanes = Object.keys(t.lanes).sort((a, b) => t.lanes[b] - t.lanes[a]);
         if (lanes.length) parts.push('lanes ' + lanes.map(k => k + ' ' + t.lanes[k]).join(' / '));
         return 'timing: ' + parts.join(' \u00b7 ');
@@ -9904,9 +10341,7 @@
         const lines = ['fetch', 'decode', 'descramble', 'write']
             .map(name => ebjTimingStageText(t, name))
             .filter(Boolean);
-        // The wall clock is what makes the stages interpretable: stage totals are
-        // summed over concurrent workers, so only the descramble total (one main
-        // thread) and this wall clock are directly comparable.
+
         if (t.phaseMs > 0) {
             lines.push('wall: ' + ebjMs(t.phaseMs) + ' for the page phase' + ebjTimingRate(t));
         }
@@ -9917,21 +10352,14 @@
         return !t || (!t.pages && !t.failed);
     }
 
-    /**
-     * Surface the measurement where a run is actually read. The harness has
-     * usually already written the outcome into the details element, so append
-     * the timing line instead of replacing it, and put the per-stage
-     * distribution plus the raw failure lines in the collapsible block. EbjLog
-     * carries the same line to the console, debug-gated like every other
-     * ebookjapan diagnostic. A failure path calls this too: "which stage ate
-     * the run" is exactly what a failed run needs to answer.
-     */
     function ebjTimingPublish(ui, harness, t) {
         if (ebjTimingEmpty(t)) return;
         const line = ebjTimingLine(t);
+
+        t.prep = ebjLastPrep;
+        ebjLastTiming = t;
         try { ebjLog('timing', line); } catch (e) {}
-        // Automation callers read the result object, not the panel; put the same
-        // numbers there so a headless run can be measured without scraping logs.
+
         try {
             const rr = harness && harness.runResult;
             if (rr) {
@@ -9953,38 +10381,16 @@
         } catch (e) {}
     }
 
-    /**
-     * Fetch one page. GM first, the shared lanes as backup — and that order is
-     * deliberate, not inertia. It was re-derived from the transport code:
-     *
-     * - `laneFetch()` is the only path that can pick a mokuro-bridge proxy lane
-     *   (the bridge's accelerator ports). Its eligibility opt is `allowProxy`:
-     *   a lane table with proxy entries is used unless the caller passes
-     *   `{allowProxy:false}`, so a bare `laneFetch(url, ms)` is nominally
-     *   eligible. But the ports have to be *discovered* first, and every
-     *   discovery and every proxy request is a page-realm fetch to
-     *   `http://127.0.0.1:<port>` (`probeBridgeFetchProxy` -> the bridge's
-     *   /health; `laneAttempt` -> `proxyUrlFor`). ebookjapan serves
-     *   `connect-src 'self' https: wss:` (see core/31-mokuro.js, which is why
-     *   the bridge client there goes through GM_xmlhttpRequest), so those plain
-     *   http:// loopback fetches are refused by this page's CSP. The proxy lane
-     *   therefore cannot carry a byte here, and `laneFetch` would burn a
-     *   refused request per page before falling through.
-     * - The remaining lanes cannot beat GM either: `page`/`dot` hit the CDN
-     *   cross-origin (no ACAO -> CORS refusal), and `gm` is GM_xmlhttpRequest —
-     *   the same transport this function already uses first. `edge` is an
-     *   opt-in mirror that is not configured by default.
-     *
-     * So the accelerator is genuinely unreachable for prod-contents-br-page
-     * .akamaized.net on this site, and reordering cannot help; GM is the one
-     * lane that works and the lanes stay the fallback for managers without it.
-     * If ebookjapan's CSP ever gains a loopback connect-src, revisit this.
-     */
     async function ebjFetchPage(url) {
-        // The page CDN sends no Access-Control-Allow-Origin, so a page-realm
-        // fetch is refused outright — one CORS error per lane attempt per page.
-        // GM_xmlhttpRequest is not subject to that and @connect already lists
-        // the host, so go through it first and keep the shared lanes as backup.
+
+        if (typeof proxyLaneFetch === 'function' && proxyLaneAvailable()) {
+            const viaProxy = await proxyLaneFetch(url, 30000);
+            if (viaProxy && viaProxy.ok) {
+                const blob = await viaProxy.blob();
+                return { buf: await blob.arrayBuffer(), lane: 'px' };
+            }
+        }
+
         if (typeof GM_xmlhttpRequest === 'function') {
             try {
                 const r = await new Promise((ok, no) => {
@@ -9996,11 +10402,9 @@
                 if (r && r.status >= 200 && r.status < 300 && r.response) {
                     return { buf: await r.response.arrayBuffer(), lane: 'gm' };
                 }
-            } catch (e) { /* fall through to the shared lanes */ }
+            } catch (e) { }
         }
-        // laneFetch resolves rather than rejecting, and the gm lane answers with
-        // {ok,status,blob} only — no headers, no arrayBuffer. So: check res.ok,
-        // then go through blob().
+
         const res = await laneFetch(url, 30000);
         if (!res || !res.ok) throw new Error('HTTP ' + ((res && res.status) || '?'));
         const blob = await res.blob();
@@ -10009,15 +10413,10 @@
 
     async function ebjRun(ui, mode, options) {
         const runOptions = normalizeRunOptions(options, mode);
-        // Function scope on purpose: the arming block below sets these inside a
-        // try, but the finally has to terminate the pool, and a `let` inside that
-        // try is invisible there — which threw ebjPool is not defined after a
-        // run had already saved successfully.
+
         let ebjPool = null;
         let ebjCanary = null;
-        // Per-page stage totals for this whole run (main pass, retry pass and
-        // the canary fetches). Function scope for the same reason as ebjPool:
-        // the failure path has to be able to report it.
+
         const ebjTiming = ebjTimingNew();
         const runResult = runOptions.automation
             ? (runOptions.result || newAutomationResult(mode, ebjState.code || '', runOptions.deferFinalize))
@@ -10032,8 +10431,10 @@
             ebjState.running = true;
             ebjResetCore();
 
-            // The viewer learns the volume a beat after the page loads, and its
-            // manifest needs a session the viewer has already negotiated.
+            const prep = { start: ebjNow(), resolveMs: 0 };
+            const discovery = (typeof probeFetchProxy === 'function')
+                ? Promise.resolve().then(probeFetchProxy).catch(() => null) : null;
+
             let book = null;
             let lastErr = null;
             for (let i = 0; i < 30; i++) {
@@ -10043,21 +10444,25 @@
                 } catch (e) {
                     lastErr = e;
                     book = null;
-                    // Say it the first time it happens, not fifteen seconds later:
-                    // swallowing this is what made the whole failure invisible.
+
                     if (i === 0) ebjLog('resolve', 'attempt failed: ' + safeLogText((e && e.message) || e));
                 }
                 if (book && book.pages && book.pages.length) break;
+
+                if (i === 0 || (i + 1) % 5 === 0) {
+                    ebjLog('resolve', 'the viewer has not reported the volume yet — retry ' +
+                        (i + 1) + '/30 after ' + ebjMs(ebjNow() - prep.start));
+                }
                 await ebjSleep(500);
             }
+            prep.resolveMs = ebjNow() - prep.start;
             if (!book || !book.pages || !book.pages.length) {
                 throw new Error('the ebookjapan viewer has not reported this volume yet — open ' +
                     'the book and let a page render, then try again.' +
                     (lastErr ? ' (last resolve error: ' + safeLogText((lastErr && lastErr.message) || lastErr) + ')'
                              : ' (the resolve returned no pages and reported no error)'));
             }
-            // The autograph overlay is the one page whose scrambled tiles are a
-            // separate image. ebjState.payload is what decrypt_session was given.
+
             try {
                 book.autograph = autographSpec(ebjState.payload && ebjState.payload.drmPayload);
             } catch (e) { book.autograph = null; }
@@ -10099,12 +10504,10 @@
             let glue = null;
             let gatePassed = false;
 
-            // One cursor drives both passes. During the main pass it walks every
-            // row in order; the retry pass below re-points it at only the indexes
-            // that failed and runs the *same* worker() under the *same*
-            // concurrency gate. That is what turns the retry tail from N serial
-            // main-thread descrambles into one bounded batch, without a second
-            // scheduling mechanism to keep in sync with the first.
+            let releaseFirstPaint = () => {};
+            const firstPainted = new Promise(res => { releaseFirstPaint = res; });
+            const firstPaintTimer = setTimeout(() => releaseFirstPaint(), 20000);
+
             let nextIndex = 0;
             let ebjRetryList = null;
             let ebjRetryAt = 0;
@@ -10131,10 +10534,7 @@
                         harness.bumpFetched(1);
                         let out = null;
                         let tDone = tFetched;
-                        // A run that adopted the pool descrambles there, which is
-                        // what the canary was for and what the retry pass always
-                        // did. No pool (ebookjapan's CSP refuses blob: workers)
-                        // means the in-thread path below, exactly as before.
+
                         if (ebjPool && ebjCanary) {
                             try {
                                 const res = await ebjPoolPage(ebjPool,
@@ -10148,28 +10548,35 @@
                             }
                         }
                         if (!out) {
-                            const bitmap = await decodeImage(got.buf);
-                            const tDecoded = ebjNow();
-                            ebjTimingAdd(ebjTiming, 'decode', tDecoded - tFetched);
-                            const aov = (book.autograph && book.autograph.page === row.page)
-                                ? await loadAutographImage(book.autograph) : undefined;
-                            out = await descramblePage(glue, bitmap, row, geo,
-                                { codec: codec, autographed: aov });
-                            tDone = ebjNow();
-                            ebjTimingAdd(ebjTiming, 'descramble', tDone - tDecoded);
+
+                            await ebjAcquireSlot();
+                            try {
+                                const tDecodeStart = ebjNow();
+                                const bitmap = await decodeImage(got.buf);
+                                const tDecoded = ebjNow();
+                                ebjTimingAdd(ebjTiming, 'decode', tDecoded - tDecodeStart);
+                                const aov = (book.autograph && book.autograph.page === row.page)
+                                    ? await loadAutographImage(book.autograph) : undefined;
+                                out = await descramblePage(glue, bitmap, row, geo,
+                                    { codec: codec, autographed: aov });
+                                tDone = ebjNow();
+                                ebjTimingAdd(ebjTiming, 'descramble', tDone - tDecoded);
+                            } finally { ebjReleaseSlot(); }
                         }
-                        // The paint gate: "the shuffle ran" is not "the page
-                        // painted". The first page decides whether this shape is
-                        // believable at all.
+
                         if (!gatePassed) {
                             const st = out.stats || await canvasStats(null);
                             if (st && !st.error && st.mean < 6) {
                                 gatePassed = true;
+                                releaseFirstPaint();
                                 throw new Error('the descrambler painted an empty page (' + statsText(st) +
                                     ') — refusing to save a book of blank images');
                             }
                             gatePassed = true;
-                            ebjLog('canary', 'page 1 painted ' + statsText(st));
+                            prep.firstPageMs = ebjNow() - prep.start;
+                            releaseFirstPaint();
+                            ebjLog('canary', 'page 1 painted ' + statsText(st) +
+                                ' — ' + ebjMs(prep.firstPageMs) + ' after the run started');
                         }
                         harness.notePage(pageIdx, out.blob, out.crc, out.ext);
                         ebjTimingAdd(ebjTiming, 'write', ebjNow() - tDone);
@@ -10182,26 +10589,20 @@
                 }
             };
 
-            // Off-thread, on core's own pool. Nothing is trusted on faith: the
-            // first page goes through a worker and is adopted only if those pixels
-            // pass the same paint gate as any other page. Otherwise this run keeps
-            // descrambling on this thread and the cost is one log line.
-            // The page phase is what the user experiences as "the download", so
-            // its wall clock starts here, after the viewer resolve and the bars.
+            ebjSetSlotLimit(16);
             ebjTiming.start = ebjNow();
             try {
                 if (typeof makePool === 'function' && typeof Worker !== 'undefined' &&
                     typeof OffscreenCanvas !== 'undefined' && rows[0] && rows[0].url) {
-                    if (!(await ebjWorkerAllowed())) {
+                    const tCanary = ebjNow();
+                    const allowed = await ebjWorkerAllowed();
+                    prep.canaryMs = ebjNow() - tCanary;
+                    if (!allowed) {
                         ebjLog('worker-canary', 'this page\u2019s CSP refuses a blob: worker — ' +
                             'descrambling on this thread');
                         throw { ebjSkipPool: true };
                     }
-                    // workerPoolSize() is core's own answer for this machine. The old
-                    // cap of 8 was mine, and the real bottleneck here is the shuffle plus
-                    // the encode, so use what core asks for. Two pages in flight per
-                    // worker overlaps convertToBlob with the next page's shuffle, which is
-                    // the same ~10% BookWalker measured.
+
                     const size = Math.max(2, workerPoolSize());
                     ebjPool = makePool(size, ebjWorkerSource(), ebjPoolDone, 60000, 2, ebjJobMessage);
                     const tCanaryFetch = ebjNow();
@@ -10242,22 +10643,46 @@
                 }
             }
 
+            let probeMs = 0;
+            const knownPorts = (typeof proxyPorts !== 'undefined' && proxyPorts && proxyPorts.length) || 0;
+            if (discovery && !knownPorts) {
+                const tProbe = ebjNow();
+                try { await discovery; } catch (e) {}
+                probeMs = ebjNow() - tProbe;
+            } else if (discovery) {
+
+                try { discovery.catch(() => {}); } catch (e) {}
+            }
+            prep.probeMs = probeMs;
+            prep.totalMs = ebjNow() - prep.start;
+            ebjLastPrep = prep;
             const budget = (typeof fetchSocketBudget === 'function' ? fetchSocketBudget(true) : 6) || 6;
-            const concurrency = Math.max(1, Math.min(total, Math.max(2, Math.min(16, budget))));
+
+            let inflightCap = 256;
+            try {
+                if (typeof window !== 'undefined' && window.__bwddMaxInflight > 0) {
+                    inflightCap = Math.max(4, Math.min(256, window.__bwddMaxInflight | 0));
+                }
+            } catch (e) {}
+            const concurrency = Math.max(2, Math.min(total, Math.min(inflightCap,
+                budget + Math.max(8, Math.round(budget * 0.2)))));
             ebjLog('run', 'concurrency ' + concurrency + ' on ' + budget + ' sockets');
+
+            ebjLog('run', 'prep ' + ebjMs(prep.totalMs) + ' (resolve ' + ebjMs(prep.resolveMs) +
+                ' + canary ' + ebjMs(prep.canaryMs || 0) + ' + probe ' + ebjMs(probeMs) +
+                ') before the first page');
             glue = await ebjLoadGlue();
             const workers = [];
-            for (let w = 0; w < concurrency; w++) workers.push(worker());
+
+            const firstWave = Math.max(1, Math.min(concurrency, 12));
+            for (let w = 0; w < firstWave; w++) workers.push(worker());
+            await firstPainted;
+            clearTimeout(firstPaintTimer);
+            if (workers.length < concurrency) {
+                for (let w = firstWave; w < concurrency; w++) workers.push(worker());
+            }
             await Promise.all(workers);
 
-            // One retry pass: a page that failed once is usually a transient lane
-            // or session rollover, and the viewer will have settled by now. It is
-            // driven through the same worker() and the same `concurrency` gate as
-            // the main pass, just with the cursor re-pointed at the failed
-            // indexes — a serial awaited loop here was one full main-thread
-            // descramble per iteration, which is the "fast, then one page a
-            // second" tail this run was reported for. A page that throws again
-            // stays failed and is reported below, exactly as before.
             if (harness.failedIdx.size && !runOptions.headless) {
                 ebjRetryList = Array.from(harness.failedIdx)
                     .map(n => n - 1)
@@ -10274,8 +10699,6 @@
                 }
             }
 
-            // Close the page-phase clock here, before the ZIP is assembled or
-            // the OCR finalize runs, so "wall" means fetch+descramble time only.
             if (ebjTiming.start) ebjTiming.phaseMs = ebjNow() - ebjTiming.start;
 
             const missing = total - harness.okIdx.size;
@@ -10302,17 +10725,13 @@
         } catch (e) {
             const text = safeLogText((e && e.stack) || (e && e.message) || e);
             ebjLog('run', 'failed: ' + text);
-            // Core's launch() catches a rejected run and only console.warns it,
-            // which from the panel is indistinguishable from the button doing
-            // nothing. Put it where it will actually be read.
+
             try {
                 setRunDetails(ui.details, 'the run failed: ' + text,
                     harness ? harness.errors : []);
             } catch (e2) {}
             const reported = harness ? harness.reportFailure(e) : null;
-            // Last, because reportFailure writes its own one-line panel message:
-            // a failed run is exactly when "which stage ate the time" matters,
-            // so the timing line is appended after it rather than erased by it.
+
             ebjTimingPublish(ui, harness, ebjTiming);
             if (reported) throw reported;
             throw e;
@@ -10323,16 +10742,26 @@
         }
     }
 
+    function ebjOwnsHost() {
+        try { return /(^|\.)ebookjapan\.yahoo\.co\.jp$/i.test(location.hostname); } catch (e) { return false; }
+    }
     registerSite({
         id: 'ebookjapan',
         label: 'ebookjapan',
         panelTitle: 'ebookjapan Native Downloader',
+        ownsHost() {
+            return ebjOwnsHost();
+        },
         matches() {
-            try { return /(^|\.)ebookjapan\.yahoo\.co\.jp$/i.test(location.hostname); } catch (e) { return false; }
+
+            try { return ebjOwnsHost() && /^\/viewer\//.test(location.pathname); } catch (e) { return false; }
+        },
+        headlessMatches() {
+
+            return ebjOwnsHost();
         },
         install() {
-            // The viewer URL carries the volume code, so the adapter knows
-            // its id from load. A network resolve only confirms it.
+
             try {
                 const t = ebjParseTarget(location.href);
                 if (t && t.code) ebjState.code = t.code;
@@ -10358,16 +10787,13 @@
         },
         getCid() {
             if (ebjState.code) return ebjState.code;
-            // Fall back to the URL: the page-cache key and the availability
-            // badge read this before anything has been fetched.
+
             try {
                 const t = ebjParseTarget(location.href);
                 return (t && (t.code || t.publication)) || '';
             } catch (e) { return ''; }
         },
-        // The shared panel awaits this before reading getBook/getPreview, so the
-        // title, page count and page size are on the card before a run starts —
-        // which is exactly where the standalone script had to bolt this on.
+
         async refresh() {
             try {
                 const b = await ebjResolvePages(location.href);
@@ -10392,15 +10818,15 @@
         debug: {
             get state() { return ebjState; },
             get shape() { return ebjShape; },
+
+            get processDepth() { return ebjProcessDepth(); },
             get lastDecodePath() { return ebjLastDecodePath; },
             get encodePath() { return ebjEncodePath; },
             get lastShuffleTrace() { return ebjLastShuffleTrace; },
             get probeOnce() { return ebjProbeOnce; },
             get simulatedTraps() { return ebjSimulatedTraps; },
         },
-        // Call __bwddEbookjapanDebug() from the console for a live answer to
-        // "where did it stop?". The standalone had this and it was the fastest
-        // way to tell a realm problem from a session problem.
+
         debugGlobals: {
             __bwddEbookjapan: ebjState,
             __bwddEbookjapanDebug: function ebjDiag() {
@@ -10412,6 +10838,21 @@
                     pages: (ebjState.book && ebjState.book.pages) ? ebjState.book.pages.length : 0,
                     canvas: ebjState.book && ebjState.book.canvas ? ebjState.book.canvas : null,
                     shape: { canvas: ebjShape.canvas, image: ebjShape.image },
+
+                    timing: ebjLastTiming ? {
+                        wallMs: Math.round(ebjLastTiming.phaseMs),
+                        pages: ebjLastTiming.pages, failed: ebjLastTiming.failed,
+                        retried: ebjLastTiming.retried,
+                        fetchMs: Math.round(ebjLastTiming.fetch.total),
+                        fetchMedianMs: Math.round(ebjMedian(ebjLastTiming.fetch.ring)),
+                        decodeMs: Math.round(ebjLastTiming.decode.total),
+                        descrambleMs: Math.round(ebjLastTiming.descramble.total),
+                        descrambleMedianMs: Math.round(ebjMedian(ebjLastTiming.descramble.ring)),
+                        writeMs: Math.round(ebjLastTiming.write.total),
+                        lanes: Object.assign({}, ebjLastTiming.lanes),
+                        pagesPerSecond: ebjLastTiming.phaseMs > 0
+                            ? +(ebjLastTiming.pages / (ebjLastTiming.phaseMs / 1000)).toFixed(2) : 0,
+                    } : null,
                     lastDecodePath: ebjLastDecodePath,
                     encodePath: ebjEncodePath,
                     lastShuffleTrace: ebjLastShuffleTrace,
@@ -10421,21 +10862,7 @@
             },
         },
     });
-    // =====================================================================
-    // CMOA site adapter — metadata
-    // =====================================================================
-    // CMOA (コミックシーモア) serves its "speed reader" from a per-volume CDN
-    // (binb-cmoa.akamaized.net) as individually scrambled JPEG tiles. The page
-    // list lives on viewer.content.page, and the viewer's reader exposes
-    // getImageDescrambleCoords(), the only correct way to unshuffle a page.
-    //
-    // Everything the user sees (panel, bars, Mokuro bridge, stats, automation
-    // protocol) comes from core, identical to the BookWalker path.
-    // The image endpoint's `q` parameter is a quality *index* and lower is
-    // better: the reader's own getImageUrl() uses q=0 for high-quality images
-    // and q=1 for the viewer default, never 2 or 3. So the ladder tries the
-    // original first and falls back to the standard rendition only when the
-    // store refuses the best one (as a free/trial volume does).
+
     const CMOA_QUALITY_ORDER = (function () {
         try {
             const custom = window.__bwddCmoaQualityOrder;
@@ -10447,8 +10874,7 @@
     })();
     const CMOA_FETCH_CONCURRENCY = 6;
     const cmoaState = {
-        // True while a download owns the quality field, so a state refresh
-        // cannot reset the rung the run has settled on.
+
         running: false,
         cid: null,
         contentsServer: null,
@@ -10458,8 +10884,8 @@
         u0: null,
         u1: null,
         extraParams: {},
-        title: null,          // display title (SubTitle when the API gives one)
-        rawTitle: null,       // whatever the page/viewer called this volume
+        title: null,
+        rawTitle: null,
         pages: [],
         quality: null,
         originalQuality: null,
@@ -10471,11 +10897,15 @@
         reader: null,
         viewer: null,
         qualityBlacklist: new Set(),
+
+        winningRungs: new Set(),
+
+        scrambleTables: null,
+        scrambleKey: null,
+        protocolTried: false,
+        protocolError: null,
     };
 
-    // The viewer's globals (SpeedBinb, its reader) live on the page window. A
-    // userscript manager may hand us a sandboxed `window`, so prefer the real
-    // page window when it is reachable and fall back when it is not.
     function cmoaPageWindow() {
         try {
             if (typeof unsafeWindow !== 'undefined' && unsafeWindow) {
@@ -10490,11 +10920,6 @@
         try { console.log.apply(console, ['[bwdd/cmoa]'].concat([].slice.call(arguments))); } catch (e) {}
     }
 
-    // --- token pool -------------------------------------------------------
-    // CMOA signs image requests with a short-lived `p` token that the viewer
-    // mints as the reader pages through the volume. Keeping every token seen
-    // and retrying the next on a 403 is what makes a long download survive a
-    // token rolling over mid-run.
     function cmoaRememberToken(tokenValue, options) {
         options = options || {};
         if (!tokenValue && tokenValue !== 0) return;
@@ -10518,17 +10943,28 @@
         }
     }
 
-    // --- parameter ingestion ---------------------------------------------
-    // Every URL the viewer touches (page URL, data-ptbinb, its API calls)
-    // carries a slice of the session; merge them all in, first writer wins for
-    // the identity fields.
+    const CMOA_CID_RE = /^([0-9]{10})_jp_([0-9]{4})$/;
+    const CMOA_CONTENT_ID_RE = /^1([0-9]{10})([0-9]{4})$/;
+    function cmoaNormalizeCid(value) {
+        const raw = String(value == null ? '' : value).trim();
+        if (!raw) return '';
+        if (CMOA_CID_RE.test(raw)) return raw;
+        const m = CMOA_CONTENT_ID_RE.exec(raw);
+        if (m) return m[1] + '_jp_' + m[2];
+        return raw;
+    }
+
     function cmoaAssignParam(key, rawValue, force) {
         if (rawValue == null) return;
         const value = typeof rawValue === 'string' ? rawValue.trim() : String(rawValue);
         if (!value) return;
         const lower = key.toLowerCase();
         const shouldSet = current => force || current == null || current === '';
-        if (lower === 'cid') { if (shouldSet(cmoaState.cid)) cmoaState.cid = value; return; }
+        if (lower === 'cid' || lower === 'content_id') {
+            const cid = cmoaNormalizeCid(value);
+            if (shouldSet(cmoaState.cid)) cmoaState.cid = cid;
+            return;
+        }
         if (lower === 'contentsserver' || lower === 'sbcurl') {
             if (shouldSet(cmoaState.contentsServer)) cmoaState.contentsServer = value.replace(/\/$/, '');
             return;
@@ -10556,7 +10992,7 @@
             cmoaApplySearchParams(new URLSearchParams(location.search || ''));
             if (!cmoaState.cid) {
                 const m = location.href.match(/[?&]cid=([^&#]+)/);
-                if (m) cmoaState.cid = decodeURIComponent(m[1]);
+                if (m) cmoaState.cid = cmoaNormalizeCid(decodeURIComponent(m[1]));
             }
         } catch (e) {}
     }
@@ -10575,12 +11011,9 @@
             }
         }
         const cidAttr = node.getAttribute('data-ptbinb-cid');
-        if (cidAttr && !cmoaState.cid) cmoaState.cid = cidAttr;
+        if (cidAttr && !cmoaState.cid) cmoaState.cid = cmoaNormalizeCid(cidAttr);
     }
 
-    // The viewer's performance timeline still holds the signed URLs it used,
-    // including the ContentsServer origin, token and quality. This is what
-    // keeps working when the script starts after the viewer's own requests.
     function cmoaExtractFromPerformance() {
         if (!window.performance || typeof window.performance.getEntriesByType !== 'function') return;
         let entries = [];
@@ -10610,7 +11043,6 @@
         }
     }
 
-    // --- viewer access ----------------------------------------------------
     function cmoaGetViewer() {
         try {
             const w = cmoaPageWindow();
@@ -10629,9 +11061,6 @@
         return !!(candidate && typeof candidate.getImageDescrambleCoords === 'function');
     }
 
-    // The reader is the object that can unshuffle a page. Ask the viewer
-    // directly first, then walk one level of its own properties, because the
-    // exact accessor has changed between viewer builds.
     function cmoaGetReader() {
         const viewer = cmoaState.viewer || cmoaGetViewer();
         if (!viewer) return cmoaState.reader;
@@ -10662,9 +11091,6 @@
         return cmoaState.reader;
     }
 
-    // Page list. Each entry keeps the image descriptor the viewer parsed from
-    // the volume's XML (relative path, dimensions, spread hint) because that
-    // descriptor is what getImageDescrambleCoords() expects, not a flat path.
     function cmoaCollectPages(viewer) {
         const pages = [];
         if (!viewer) return pages;
@@ -10694,11 +11120,39 @@
         return pages;
     }
 
-    // --- content info -----------------------------------------------------
-    // The viewer only keeps items[0].Title, the store's SEO page title
-    // ("無料・試し読みページ … ｜ author ｜ 漫画…"). The API also returns a clean
-    // SubTitle ("… 1巻"), so re-issuing the viewer's own request gives the
-    // archive a real name and the stat lookups a real series to search for.
+    function cmoaViewerCapabilities() {
+        const out = { href: '' };
+        try { out.href = location.pathname; } catch (e) {}
+        const w = cmoaPageWindow();
+        try { out.speedbinb = !!(w.SpeedBinb && typeof w.SpeedBinb.getInstance === 'function'); } catch (e) { out.speedbinb = 'throws'; }
+        const viewer = cmoaState.viewer || cmoaGetViewer();
+        out.viewer = !!viewer;
+        if (viewer) {
+            const direct = cmoaSafe(() => viewer.reader);
+            out.reader = (direct === null || direct === undefined) ? String(direct)
+                : (cmoaIsReader(direct) ? 'scrambler' : typeof direct);
+            try { out.pageCount = (viewer.content && viewer.content.page && viewer.content.page.length) || 0; } catch (e) {}
+            try {
+                out.keys = Object.keys(viewer).filter(k => /read|scram|binb|content/i.test(k)).slice(0, 10);
+            } catch (e) { out.keys = 'unreadable'; }
+        }
+        out.stateReader = !!cmoaState.reader;
+        out.frames = (function () {
+            try { return window.top === window.self ? 'top' : 'frame'; } catch (e) { return 'cross-origin'; }
+        })();
+        return out;
+    }
+
+    function cmoaScrambleParamsFromUrl(url) {
+        try {
+            const params = new URL(String(url), location.href).searchParams;
+            const k = params.get('k');
+            if (!k) return null;
+            const cid = params.get('cid') || params.get('content_id') || cmoaState.cid;
+            return cid ? { cid: cid, key: k } : null;
+        } catch (e) { return null; }
+    }
+
     function cmoaContentInfoUrl() {
         const reader = cmoaGetReader();
         const fromReader = cmoaSafe(() => reader && reader.requestUrl);
@@ -10709,10 +11163,18 @@
             encodeURIComponent(cmoaState.cid) + '&dmytime=' + Date.now() + '&u0=' + encodeURIComponent(u0);
     }
 
-    function cmoaIngestContentInfo(payload, sourceUrl) {
+    function cmoaIngestContentInfo(payload, sourceUrl, scrambleKey, scrambleCid) {
         let data = payload;
         if (typeof payload === 'string') {
             try { data = JSON.parse(payload); } catch (e) { data = null; }
+        }
+        if (data && typeof data === 'object' && data.result != null) {
+
+            cmoaState.contentResult = Number(data.result);
+            if (Number(data.result) !== 1) {
+                console.warn('[bwdd/cmoa] bibGetCntntInfo refused the request (result=' +
+                    data.result + (data.eurl ? ', ' + data.eurl : '') + ') for ' + sourceUrl);
+            }
         }
         if (data && typeof data === 'object' && Array.isArray(data.items) && data.items.length) {
             const item = data.items[0] || {};
@@ -10720,10 +11182,21 @@
                 cmoaState.contentsServer = String(item.ContentsServer).replace(/\/$/, '');
             }
             if (item.p) cmoaRememberToken(item.p, { force: !cmoaState.lastGoodToken });
+
+            const fromUrl = cmoaScrambleParamsFromUrl(sourceUrl);
+            const decodeCid = scrambleCid || (fromUrl && fromUrl.cid);
+            const key = scrambleKey || (fromUrl && fromUrl.key);
+            if (decodeCid && key && !cmoaState.scrambleTables) {
+                const tables = cmoaDecodeTables(decodeCid, key, item);
+                if (tables && (Array.isArray(tables.ctbl) || Array.isArray(tables.ptbl))) {
+                    cmoaState.scrambleTables = tables;
+                    cmoaState.scrambleKey = key;
+                    cmoaLog('scramble tables recovered', Object.keys(tables).join(','));
+                }
+            }
             if (item.ViewMode != null && cmoaState.viewMode == null) cmoaState.viewMode = String(item.ViewMode);
             if (item.ContentDate && !cmoaState.dmytime) cmoaState.dmytime = String(item.ContentDate);
-            // Prefer the clean product title the store itself uses for the
-            // volume; fall back to the SEO title only when it is absent.
+
             const clean = typeof item.SubTitle === 'string' ? item.SubTitle.trim() : '';
             const raw = typeof item.Title === 'string' ? item.Title.trim() : '';
             if (clean) cmoaState.title = clean;
@@ -10754,30 +11227,22 @@
         }
     }
 
-    // The SEO title is "<label> <volume> ｜ <author> ｜ <store>"; the volume is
-    // the part before the first full-width pipe, minus the store's own prefix.
     const CMOA_JUNK_TITLE = /^(?:binb(?:\s*speed\s*reader)?|speed\s*binb(?:\s*reader)?|speed\s*reader|cmoa|コミックシーモア|無料[・･]?試し読み(?:ページ)?|試し読みページ|ローディング|loading)$/i;
     function cmoaCleanTitle(raw) {
         let s = String(raw || '').trim();
         if (!s) return '';
         s = s.split('｜')[0].trim();
         s = s.replace(/^(?:無料[・･]?)?(?:試し読み|立ち読み)(?:ページ)?\s*/, '').trim();
-        // A trailing imprint group ("（ビッグガンガンコミックス）") belongs to the
-        // publisher, not the series, and would derail the manga-kotoba search.
+
         const m = s.match(/^(.*?[0-9０-９]{1,3}\s*[巻話])\s*[（(][^）)]*[）)]\s*$/);
         if (m && m[1]) s = m[1].trim();
-        // The viewer rewrites document.title to its own name ("BinB Speed
-        // Reader") once it boots; that is not the volume's title.
+
         if (CMOA_JUNK_TITLE.test(s)) return '';
         return s;
     }
 
-    // Where the volume title can come from, best first. The viewer's own
-    // bibliography only ever carries the store's SEO title, so the API's
-    // SubTitle (see cmoaIngestContentInfo) is the one that yields a real name.
     function cmoaTitleFromDom() {
-        // The reader's header still holds the SEO title after the viewer has
-        // replaced document.title with its own name.
+
         try {
             const el = document.getElementById('menu_header_tittle');
             const t = el && el.textContent ? el.textContent.trim() : '';
@@ -10786,12 +11251,123 @@
         return document.title || '';
     }
 
-    // --- readiness --------------------------------------------------------
+    function cmoaProtocolTarget() {
+        const candidates = [];
+        candidates.push(location.href);
+        for (const cand of candidates) {
+            if (!cand) continue;
+            try {
+                const u = new URL(String(cand), location.href);
+                const cid = u.searchParams.get('cid') || u.searchParams.get('content_id');
+                if (cid) return { cid: cmoaNormalizeCid(cid), params: u.searchParams };
+
+                const m = /\/([0-9]{10}_jp_[0-9]{4})\b/.exec(u.pathname);
+                if (m) return { cid: cmoaNormalizeCid(m[1]), params: u.searchParams };
+            } catch (e) {}
+        }
+        return cmoaState.cid
+            ? { cid: cmoaNormalizeCid(cmoaState.cid), params: new URLSearchParams() }
+            : null;
+    }
+
+    async function cmoaFetchProtocolState() {
+        if (cmoaState.protocolTried) return false;
+        cmoaState.protocolTried = true;
+        const target = cmoaProtocolTarget();
+        if (!target || !target.cid) {
+            cmoaState.protocolError = 'no content ID for the viewer-free path';
+            return false;
+        }
+        const cid = target.cid;
+        cmoaState.cid = cmoaState.cid || cid;
+        const k = cmoaGenerateK(cid);
+        cmoaState.scrambleKey = k;
+
+        const forwarded = new URLSearchParams();
+        try {
+            target.params.forEach(function (value, key) {
+                const lower = String(key).toLowerCase();
+
+                if (lower === 'cid' || lower === 'content_id' || lower === 'title_id' ||
+                    lower === 'k' || lower === 'dmytime' || lower === 'rurl') return;
+                forwarded.set(key, value);
+            });
+        } catch (e) {}
+        if (!forwarded.has('u0')) forwarded.set('u0', String(cmoaState.u0 || '1'));
+        const applyForwarded = url => {
+            forwarded.forEach(function (value, key) { url.searchParams.set(key, value); });
+            return url;
+        };
+        try {
+            const info = new URL('https://www.cmoa.jp/bib/sws/bibGetCntntInfo.php');
+            info.searchParams.set('cid', cid);
+            info.searchParams.set('dmytime', String(Date.now()));
+            info.searchParams.set('k', k);
+            applyForwarded(info);
+            const infoRes = await fetchWithTimeout(info.toString(), {
+                headers: { 'Accept': 'application/json, text/javascript, */*; q=0.01' },
+                credentials: 'include',
+            }, 15000);
+            if (!infoRes || !infoRes.ok) throw new Error('content info HTTP ' + (infoRes && infoRes.status));
+            const infoText = await infoRes.text();
+            cmoaIngestContentInfo(infoText, info.toString(), k, cid);
+            if (!cmoaState.contentsServer || cmoaState.contentResult === -100) {
+                throw new Error('bibGetCntntInfo refused this volume (result=' +
+                    (cmoaState.contentResult != null ? cmoaState.contentResult : 'none') + ') for ' + cid);
+            }
+            const token = cmoaState.token;
+            const viewMode = cmoaState.viewMode != null ? cmoaState.viewMode : '2';
+            const dmytime = cmoaState.dmytime || String(Date.now());
+            const list = new URL('sbcGetCntnt.php', cmoaState.contentsServer + '/');
+            list.searchParams.set('cid', cid);
+            if (token) list.searchParams.set('p', token);
+            list.searchParams.set('vm', viewMode);
+            list.searchParams.set('dmytime', dmytime);
+            applyForwarded(list);
+
+            const listRes = await fetchWithTimeout(list.toString(), { credentials: 'omit' }, 15000);
+            if (!listRes || !listRes.ok) throw new Error('page list HTTP ' + (listRes && listRes.status));
+            const payload = await listRes.text();
+            let doc = payload;
+            try {
+                const parsed = JSON.parse(payload);
+
+                if (parsed && parsed.result != null && Number(parsed.result) !== 1) {
+                    throw new Error('sbcGetCntnt returned result=' + parsed.result);
+                }
+                doc = parsed && parsed.ttx ? parsed.ttx : payload;
+            } catch (e) {
+                if (e && /sbcGetCntnt returned result/.test(e.message || '')) throw e;
+            }
+            const pages = cmoaParsePageList(doc);
+            if (!pages.length) throw new Error('the page list came back empty');
+            cmoaState.pages = pages.map(function (page, index) {
+                return {
+                    index: index,
+                    src: page.src,
+                    id: page.id || ('page_' + (index + 1)),
+                    width: page.width,
+                    height: page.height,
+                    spread: page.spread,
+                    image: { src: page.src, id: page.id || '', orgwidth: page.width, orgheight: page.height },
+                };
+            });
+            cmoaLog('viewer-free page list', cmoaState.pages.length, 'pages');
+            return true;
+        } catch (e) {
+            cmoaState.protocolError = safeLogText((e && e.message) || e);
+            cmoaLog('viewer-free state failed', cmoaState.protocolError);
+            return false;
+        }
+    }
+
     function cmoaComputeReadiness() {
         const missing = [];
         if (!cmoaState.cid) missing.push('content ID');
         if (!cmoaState.contentsServer) missing.push('contents server');
         if (!cmoaState.pages.length) missing.push('page list');
+
+        if (!cmoaState.reader && !cmoaState.scrambleTables) missing.push('descramble reader');
         cmoaState.ready = missing.length === 0;
         return missing;
     }
@@ -10803,10 +11379,7 @@
             cmoaGatherFromUrl();
             cmoaGatherFromDataset();
             cmoaExtractFromPerformance();
-            // The performance timeline normally supplies the contents server and
-            // the token before this runs, but it can never supply the volume's
-            // real name: only bibGetCntntInfo carries SubTitle. So fetch until we
-            // actually have a title, not merely until we can fetch pages.
+
             if (!cmoaState.contentsServer || !cmoaState.token || !cmoaState.title) {
                 await cmoaFetchContentInfo();
             }
@@ -10820,8 +11393,7 @@
             }
             if (!cmoaState.title) {
                 const fromViewer = cmoaSafe(() => viewer && viewer.content && viewer.content.bibliography && viewer.content.bibliography.title);
-                // The reader header keeps the store's SEO title even after the
-                // viewer has renamed document.title, so it ranks above it.
+
                 const candidates = [cmoaState.rawTitle, cmoaTitleFromDom(), fromViewer, document.title];
                 for (const cand of candidates) {
                     const cleaned = cmoaCleanTitle(cand);
@@ -10832,10 +11404,7 @@
                     }
                 }
             }
-            // A run in progress owns this field (cmoaFetchPage records the rung
-            // that actually worked), so a state refresh must not fight it. When
-            // idle, always reset to the head of the ladder: the viewer's own
-            // default (q=1) must never cap what we are willing to fetch.
+
             if (!cmoaState.running && cmoaState.quality !== CMOA_QUALITY_ORDER[0]) {
                 cmoaState.quality = CMOA_QUALITY_ORDER[0];
             }
@@ -10846,6 +11415,12 @@
                     quality: cmoaState.quality, pages: cmoaState.pages.length,
                 });
             }
+
+            if (!cmoaState.reader || !cmoaState.pages.length) {
+                if (!cmoaState.protocolTried || (!cmoaState.pages.length && !cmoaState.protocolError)) {
+                    await cmoaFetchProtocolState();
+                }
+            }
             cmoaComputeReadiness();
         } catch (e) {
             cmoaState.error = e;
@@ -10855,10 +11430,6 @@
         }
     }
 
-    // --- passive capture --------------------------------------------------
-    // Everything above already works without this, so the fetch wrapper is a
-    // best-effort bonus: it keeps the token pool and quality fresh while the
-    // user pages, which is what lets a long download ride out a token rollover.
     let cmoaCaptureInstalled = false;
     function cmoaInstallCapture() {
         if (cmoaCaptureInstalled) return;
@@ -10895,16 +11466,9 @@
                 }
                 return promise;
             };
-        } catch (e) { /* a frozen fetch is not fatal: passive capture is optional */ }
+        } catch (e) { }
     }
 
-    // =====================================================================
-    // CMOA site adapter — fetch & descramble
-    // =====================================================================
-    // One CMOA page is a scrambled JPEG tile served by sbcGetImg.php; the URL
-    // carries the volume id, page path, quality and a short-lived `p` token,
-    // and the CDN answers 403 for any of them wrong. The retry ladder below
-    // walks quality × token, so one bad token cannot fail a whole volume.
     function cmoaBuildImageUrl(descriptor, qualityOverride, tokenOverride) {
         if (!cmoaState.contentsServer) throw new Error('CMOA contents server is not available');
         if (!cmoaState.cid) throw new Error('CMOA content ID is not available');
@@ -10944,21 +11508,12 @@
         return null;
     }
 
-    // The image CDN is cross-origin, so a plain page fetch is CORS-blocked.
-    // Real parallelism comes from the shared transport lanes: the gm lane plus
-    // every local fetch-proxy port the bridge advertises, each its own
-    // HTTP/1.1 origin, so the 6-connections-per-origin limit stops being the
-    // ceiling. Hence laneFetch() rather than GM_xmlhttpRequest (one lane).
-    async function cmoaFetchViaLanes(url) {
+    async function cmoaFetchViaLanes(url, signal) {
         await waitOutCooldown();
         const t0 = performance.now();
-        // Opt in only when the bridge is willing to fetch this CDN: the fetch
-        // proxy is not transparent - it forwards to the host named in
-        // x-bwdd-upstream and refuses the rest - so a port configured for
-        // another store would answer a CMOA path from the wrong CDN. A generic
-        // bridge allows every port; one hardcoded to BookWalker allows none.
+
         const allowProxy = proxyCanServe(hostOf(url));
-        const res = await laneFetch(url, 45000, { allowProxy: allowProxy });
+        const res = await laneFetch(url, 45000, { allowProxy: allowProxy, signal: signal });
         if (!res || !res.ok) {
             const e = new Error('HTTP ' + (res ? res.status : '0'));
             e.status = res ? res.status : 0;
@@ -10971,9 +11526,7 @@
         return { bytes, type };
     }
 
-    // Fallback for environments with no gm lane (no GM_xmlhttpRequest exposed,
-    // or no grant); a plain same-context fetch is the last resort.
-    async function cmoaFetchBinary(url) {
+    async function cmoaFetchBinary(url, signal) {
         const referer = location.href;
         const viaGM = () => new Promise((resolve, reject) => {
             if (typeof GM_xmlhttpRequest !== 'function') { reject(new Error('GM_xmlhttpRequest unavailable')); return; }
@@ -11003,11 +11556,9 @@
             } catch (e) { finish(() => reject(e)); }
         });
         try {
-            return await cmoaFetchViaLanes(url);
+            return await cmoaFetchViaLanes(url, signal);
         } catch (laneError) {
-            // A real HTTP answer (403/404/...) is meaningful and repeating the
-            // identical request on another lane just wastes a round trip; only a
-            // transport failure (status 0 / no response) is worth another lane.
+
             if (laneError && laneError.status) throw laneError;
             cmoaLog('lane transport failed, falling back', safeLogText(laneError && laneError.message));
         }
@@ -11015,11 +11566,8 @@
             return await viaGM();
         } catch (gmError) {
             if (typeof GM_xmlhttpRequest === 'function' && !/unavailable/.test(gmError && gmError.message || '')) throw gmError;
-            // The CDN URL is self-signed (cid + src + p), so it needs no
-            // cookies; sending them would also make this request fail CORS
-            // preflight, since a credentialed request cannot use a wildcard
-            // Access-Control-Allow-Origin.
-            const res = await fetchWithTimeout(url, { credentials: 'omit', referer: referer }, 45000);
+
+            const res = await fetchWithTimeout(url, { credentials: 'omit', referer: referer, signal: signal }, 45000);
             if (!res.ok) { const e = new Error('HTTP ' + res.status); e.status = res.status; throw e; }
             const buf = await res.arrayBuffer();
             return { bytes: new Uint8Array(buf), type: res.headers.get('content-type') || 'image/jpeg' };
@@ -11037,7 +11585,7 @@
                     element: bmp, width: bmp.width, height: bmp.height,
                     cleanup: () => { try { if (bmp.close) bmp.close(); } catch (e) {} },
                 };
-            } catch (e) { /* fall through to an <img> decode */ }
+            } catch (e) { }
         }
         return new Promise((resolve, reject) => {
             const objectUrl = URL.createObjectURL(blob);
@@ -11054,8 +11602,6 @@
         });
     }
 
-    // Re-encode through a canvas. This is where the correct output codec is
-    // applied (and, for a lossless selection, where PNG/WebP is chosen).
     async function cmoaCanvasToBlob(canvas, mime, quality) {
         const q = typeof quality === 'number' ? quality : undefined;
         if (typeof canvas.toBlob === 'function') {
@@ -11082,86 +11628,249 @@
         return null;
     }
 
-    // Reassemble one scrambled page and re-encode it to the selected codec.
-    // ext is set only when the original payload was kept as-is.
-    async function cmoaProcessPage(descriptor, payload) {
+    function cmoaReadJpegSize(bytes) {
+        const data = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+        if (data.length < 4 || data[0] !== 0xff || data[1] !== 0xd8) return null;
+        let pos = 2;
+        while (pos + 9 < data.length) {
+            if (data[pos] !== 0xff) { pos++; continue; }
+            const marker = data[pos + 1];
+            if (marker === 0xff || marker === 0x01 || (marker >= 0xd0 && marker <= 0xd9)) { pos += 2; continue; }
+            const length = (data[pos + 2] << 8) | data[pos + 3];
+
+            const isFrame = marker >= 0xc0 && marker <= 0xcf &&
+                marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc;
+            if (isFrame) {
+                const height = (data[pos + 5] << 8) | data[pos + 6];
+                const width = (data[pos + 7] << 8) | data[pos + 8];
+                return (width > 0 && height > 0) ? { width: width, height: height } : null;
+            }
+            if (length < 2) return null;
+            pos += 2 + length;
+        }
+        return null;
+    }
+
+    function cmoaIsJpegType(type) {
+        const t = typeof type === 'string' ? type.split(';')[0].trim().toLowerCase() : '';
+        return t === 'image/jpeg' || t === 'image/jpg';
+    }
+
+    function cmoaNeedsNoWork(descriptor, width, height) {
+        try {
+            const reader = cmoaState.reader || cmoaGetReader();
+            if (reader && typeof reader.getImageDescrambleCoords === 'function') {
+                const plan = reader.getImageDescrambleCoords(descriptor.image || descriptor, width, height);
+                return !plan || !plan.transfers;
+            }
+            const picked = cmoaSelectScramble(descriptor.src, cmoaState.scrambleTables);
+            if (!picked) return false;
+            const plan = cmoaScramblePlan(picked.coordTable, picked.pieceTable, width, height);
+            return !plan || !plan.transfers;
+        } catch (e) {
+            return false;
+        }
+    }
+
+    function cmoaBlitPlan(plan) {
+        const out = [];
+        if (!plan || !Array.isArray(plan.transfers) || !plan.transfers.length) return out;
+        plan.transfers.forEach(transfer => {
+            if (!transfer || (typeof transfer.index === 'number' && transfer.index !== 0)) return;
+            const coords = Array.isArray(transfer.coords) ? transfer.coords : [];
+            coords.forEach(piece => {
+                if (!piece) return;
+                const w = piece.width || 0, h = piece.height || 0;
+                if (w <= 0 || h <= 0) return;
+                out.push({
+                    sx: piece.xsrc || 0, sy: piece.ysrc || 0,
+                    dx: piece.xdest || 0, dy: piece.ydest || 0,
+                    w: w, h: h,
+                });
+            });
+        });
+        return out;
+    }
+
+    function cmoaDescrambleError(index, why, cause) {
+        const err = new Error('Cannot descramble page ' + (index + 1) + ': ' + why +
+            '. CMOA pages are scrambled, so it is not being saved rather than saved unreadable.');
+        err.fatal = true;
+        if (cause) err.cause = cause;
+        return err;
+    }
+
+    async function cmoaPreparePage(descriptor, payload) {
         const reader = cmoaState.reader || cmoaGetReader();
-        if (!reader || typeof reader.getImageDescrambleCoords !== 'function' || !descriptor || !descriptor.image) {
-            cmoaLog('descramble skipped: reader unavailable', descriptor && descriptor.index);
-            return { blob: new Blob([payload.bytes], { type: payload.type }), ext: cmoaExtFor(payload.type) };
+        const hasReader = !!(reader && typeof reader.getImageDescrambleCoords === 'function');
+        if (!descriptor) throw cmoaDescrambleError(0, 'the page descriptor is missing');
+        if (!hasReader && !cmoaState.scrambleTables) {
+            console.warn('[bwdd/cmoa] nothing can descramble this frame: no reader and no scramble ' +
+                'tables on ' + location.href + ' (viewer=' + !!cmoaState.viewer + ')');
+            throw cmoaDescrambleError(descriptor.index,
+                'neither the volume\u2019s reader nor its scramble tables are available on ' + location.href);
+        }
+
+        if (IMAGE_CODEC.type === 'image/jpeg' && cmoaIsJpegType(payload.type)) {
+            const header = cmoaReadJpegSize(payload.bytes);
+            if (header && cmoaNeedsNoWork(descriptor, header.width, header.height)) {
+                cmoaReassembly.passthrough++;
+                cmoaLog('page ' + (descriptor.index + 1) + ' needs no reassembly; kept as delivered');
+                return { keepOriginal: true, close: function () {} };
+            }
         }
         let decoded = null;
         try {
             decoded = await cmoaDecodeImage(payload.bytes, payload.type);
         } catch (e) {
-            cmoaLog('decode failed', safeLogText(e && e.message));
-            return { blob: new Blob([payload.bytes], { type: payload.type }), ext: cmoaExtFor(payload.type) };
+            throw cmoaDescrambleError(descriptor.index, 'the image could not be decoded', e);
         }
         if (!decoded || !decoded.element || !decoded.width || !decoded.height) {
             if (decoded && decoded.cleanup) decoded.cleanup();
-            return { blob: new Blob([payload.bytes], { type: payload.type }), ext: cmoaExtFor(payload.type) };
+            throw cmoaDescrambleError(descriptor.index, 'the image decoded to nothing');
         }
         let plan = null;
-        try {
-            plan = reader.getImageDescrambleCoords(descriptor.image, decoded.width, decoded.height);
-        } catch (e) {
-            cmoaLog('getImageDescrambleCoords failed', safeLogText(e && e.message));
-        }
-        try {
-            const canvas = document.createElement('canvas');
-            canvas.width = (plan && plan.width > 0) ? plan.width : decoded.width;
-            canvas.height = (plan && plan.height > 0) ? plan.height : decoded.height;
-            const ctx = canvas.getContext('2d');
-            if (!ctx) throw new Error('no 2D context');
-            // With no plan the page is already whole; the straight copy still
-            // re-encodes, so the archive extension always matches the bytes.
-            ctx.clearRect(0, 0, canvas.width, canvas.height);
-            if (plan && Array.isArray(plan.transfers) && plan.transfers.length) {
-                plan.transfers.forEach(transfer => {
-                    if (!transfer || (typeof transfer.index === 'number' && transfer.index !== 0)) return;
-                    const coords = Array.isArray(transfer.coords) ? transfer.coords : [];
-                    coords.forEach(piece => {
-                        if (!piece) return;
-                        const pw = piece.width || 0;
-                        const ph = piece.height || 0;
-                        if (pw <= 0 || ph <= 0) return;
-                        try {
-                            ctx.drawImage(decoded.element,
-                                piece.xsrc || 0, piece.ysrc || 0, pw, ph,
-                                piece.xdest || 0, piece.ydest || 0, pw, ph);
-                        } catch (drawError) { /* keep the remaining pieces */ }
-                    });
-                });
-            } else {
-                ctx.drawImage(decoded.element, 0, 0);
+        if (hasReader) {
+            try {
+
+                plan = reader.getImageDescrambleCoords(descriptor.image || descriptor, decoded.width, decoded.height);
+            } catch (e) {
+                if (decoded.cleanup) decoded.cleanup();
+                throw cmoaDescrambleError(descriptor.index, 'the reader refused the page geometry', e);
             }
-            const blob = await cmoaCanvasToBlob(canvas, IMAGE_CODEC.type, IMAGE_CODEC.quality);
-            if (!blob) throw new Error('canvas encode produced nothing');
-            return { blob, ext: cmoaExtFor(blob.type) };
+        } else {
+
+            const picked = cmoaSelectScramble(descriptor.src, cmoaState.scrambleTables);
+            if (!picked) {
+                if (decoded.cleanup) decoded.cleanup();
+                throw cmoaDescrambleError(descriptor.index,
+                    'the volume\u2019s scramble tables do not cover this page');
+            }
+            try {
+                plan = cmoaScramblePlan(picked.coordTable, picked.pieceTable, decoded.width, decoded.height);
+            } catch (e) {
+                if (decoded.cleanup) decoded.cleanup();
+                throw cmoaDescrambleError(descriptor.index, 'the scramble tables were rejected', e);
+            }
+            if (plan.kind === 'none') {
+                cmoaLog('page ' + (descriptor.index + 1) + ' is served whole (no scramble tables for it)');
+            }
+        }
+        if (!plan || !plan.transfers) {
+
+            console.warn('[bwdd/cmoa] the reader returned no scramble plan for page ' +
+                (descriptor.index + 1) + '; keeping the image as delivered');
+        }
+        return {
+            element: decoded.element,
+
+            bitmap: (typeof ImageBitmap !== 'undefined' && decoded.element instanceof ImageBitmap)
+                ? decoded.element : null,
+            blits: cmoaBlitPlan(plan),
+            width: (plan && plan.width > 0) ? plan.width : decoded.width,
+            height: (plan && plan.height > 0) ? plan.height : decoded.height,
+            close: () => { try { if (decoded.cleanup) decoded.cleanup(); } catch (e) {} },
+        };
+    }
+
+    async function cmoaBlitInline(prepared) {
+        const canvas = document.createElement('canvas');
+        canvas.width = prepared.width;
+        canvas.height = prepared.height;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) throw new Error('no 2D context');
+
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        if (prepared.blits.length) {
+            for (const b of prepared.blits) {
+                try {
+                    ctx.drawImage(prepared.element, b.sx, b.sy, b.w, b.h, b.dx, b.dy, b.w, b.h);
+                } catch (drawError) { }
+            }
+        } else {
+            ctx.drawImage(prepared.element, 0, 0);
+        }
+        const blob = await cmoaCanvasToBlob(canvas, IMAGE_CODEC.type, IMAGE_CODEC.quality);
+        if (!blob) throw new Error('canvas encode produced nothing');
+        return { blob, ext: cmoaExtFor(blob.type) };
+    }
+
+    function cmoaBlitInWorker(prepared, id) {
+        return cmoaPoolSubmit({
+            id: id,
+            bitmap: prepared.bitmap,
+            blits: prepared.blits,
+            width: prepared.width,
+            height: prepared.height,
+            codec: { type: IMAGE_CODEC.type, quality: IMAGE_CODEC.quality },
+
+            transfer: [prepared.bitmap],
+        }).then(res => ({ blob: res.blob, ext: cmoaExtFor(res.blob.type) }));
+    }
+
+    async function cmoaProcessPage(descriptor, payload, id) {
+        const passthrough = () => ({
+            blob: new Blob([payload.bytes], { type: payload.type }),
+            ext: cmoaExtFor(payload.type),
+        });
+
+        await cmoaAcquireSlot();
+        let prepared = null;
+        try {
+            prepared = await cmoaPreparePage(descriptor, payload);
+            if (!prepared) return passthrough();
+            if (prepared.keepOriginal) return passthrough();
+            if (cmoaPool && prepared.bitmap) {
+                try {
+                    const out = await cmoaBlitInWorker(prepared, id);
+                    cmoaReassembly.worker++;
+                    return out;
+                } catch (e) {
+
+                    cmoaReassembly.fallback++;
+                    cmoaLog('worker descramble failed, reassembling inline', safeLogText(e && e.message));
+                    try { prepared.close(); } catch (e2) {}
+                    prepared = await cmoaPreparePage(descriptor, payload);
+                    if (!prepared) return passthrough();
+                    if (prepared.keepOriginal) return passthrough();
+                }
+            }
+            const inline = await cmoaBlitInline(prepared);
+            cmoaReassembly.inline++;
+            return inline;
         } catch (e) {
+
+            if (e && e.fatal) throw e;
             cmoaLog('descramble pipeline failed', safeLogText(e && e.message));
-            return { blob: new Blob([payload.bytes], { type: payload.type }), ext: cmoaExtFor(payload.type) };
+            return passthrough();
         } finally {
-            if (decoded && decoded.cleanup) decoded.cleanup();
+            if (prepared) { try { prepared.close(); } catch (e) {} }
+            cmoaReleaseSlot();
         }
     }
 
-    // Walk quality × token until a page comes back. A 403 means that
-    // combination is refused: blacklist the quality and evict the token, then
-    // try the next, so a stale credential degrades instead of failing the volume.
-    async function cmoaFetchPage(descriptor, index) {
+    async function cmoaFetchPage(descriptor, index, signal) {
         const preferred = cmoaState.quality || CMOA_QUALITY_ORDER[0];
-        const qualities = [];
-        const pushQuality = q => {
-            if (q == null) return;
-            const s = String(q);
-            if (qualities.includes(s)) return;
-            if (cmoaState.qualityBlacklist.has(s)) return;
-            qualities.push(s);
+        const collectQualities = () => {
+            const list = [];
+            const push = q => {
+                if (q == null) return;
+                const s = String(q);
+                if (list.includes(s)) return;
+                if (cmoaState.qualityBlacklist.has(s)) return;
+                list.push(s);
+            };
+            push(preferred);
+            CMOA_QUALITY_ORDER.forEach(push);
+            return list;
         };
-        pushQuality(preferred);
-        CMOA_QUALITY_ORDER.forEach(pushQuality);
-        if (!qualities.length) qualities.push('1');
+        let qualities = collectQualities();
+
+        if (!qualities.length) {
+            cmoaState.qualityBlacklist.clear();
+            qualities = collectQualities();
+        }
+        if (!qualities.length) qualities = [String(preferred || '1')];
 
         const tokens = [];
         const pushToken = t => {
@@ -11176,20 +11885,22 @@
 
         let lastError = null;
         for (const token of tokens) {
-            let forbidden = false;
+
+            let trustedRefusal = false;
             for (const quality of qualities) {
                 if (cmoaState.qualityBlacklist.has(String(quality))) continue;
                 try {
                     const url = cmoaBuildImageUrl(descriptor, quality, token);
                     cmoaLog('fetching page', index, 'quality', quality, 'token', token);
                     const tFetch = performance.now();
-                    const payload = await cmoaFetchBinary(url);
+                    const payload = await cmoaFetchBinary(url, signal);
                     const fetchMs = performance.now() - tFetch;
                     if (quality !== cmoaState.quality) cmoaState.quality = quality;
                     if (token) cmoaRememberToken(token, { markGood: true, force: true });
                     cmoaState.qualityBlacklist.delete(String(quality));
+                    cmoaState.winningRungs.add(String(quality));
                     const tProc = performance.now();
-                    const processed = await cmoaProcessPage(descriptor, payload);
+                    const processed = await cmoaProcessPage(descriptor, payload, descriptor.index);
                     if (BWDD_DEBUG) {
                         cmoaLog('page timing', index, {
                             fetchMs: Math.round(fetchMs),
@@ -11200,25 +11911,40 @@
                     }
                     return processed;
                 } catch (e) {
+
+                    if (e && e.fatal) throw e;
                     lastError = e || new Error('fetch failed');
                     const text = safeLogText((e && e.message) || e);
+                    const status = Number(e && e.status) || 0;
                     cmoaLog('page fetch failed', index, 'quality', quality, text);
-                    if (/(^|\D)403(\D|$)/.test(text)) {
-                        forbidden = true;
+
+                    if (status === 429 || status === 503 || (status >= 500 && status < 600)) {
+                        await new Promise(r => setTimeout(r, 120 + Math.round(Math.random() * 280)));
+                        continue;
+                    }
+                    if (status === 403 || /(^|\D)403(\D|$)/.test(text)) {
+                        if (cmoaState.winningRungs.has(String(quality))) trustedRefusal = true;
                         cmoaState.qualityBlacklist.add(String(quality));
                     }
                 }
             }
-            if (token && forbidden) cmoaEvictToken(token);
+            if (token && trustedRefusal) cmoaEvictToken(token);
         }
-        throw lastError || new Error('Failed to download page ' + (index + 1));
+        if (lastError) throw lastError;
+        throw new Error('Failed to download page ' + (index + 1) + ' \u2014 every image quality (' +
+            CMOA_QUALITY_ORDER.join('/') + ') was refused for this volume.');
     }
-    // =====================================================================
-    // CMOA site adapter — run pipeline & registration
-    // =====================================================================
-    // The shared harness owns the bars, Mokuro session, ZIP assembly and
-    // reporting; what is left here is CMOA's own shape: wait for the viewer,
-    // enumerate its pages, fetch a bounded number at a time.
+
+    async function cmoaWarmQualityRung(descriptor) {
+        try {
+            const processed = await cmoaFetchPage(descriptor, 0);
+            return !!(processed && processed.blob);
+        } catch (e) {
+            cmoaLog('rung warm failed', safeLogText(e && e.message));
+            return false;
+        }
+    }
+
     async function cmoaRun(ui, mode, options) {
         const runOptions = normalizeRunOptions(options, mode);
         const runResult = runOptions.automation
@@ -11233,13 +11959,12 @@
         try {
             reportRunProgress(runOptions, 'started', { mode: mode, cid: cmoaState.cid || '' });
             cmoaState.qualityBlacklist.clear();
+
+            cmoaState.winningRungs.clear();
             cmoaState.running = true;
-            // Always start at the head of the ladder, whatever rung the viewer
-            // itself was using.
+
             cmoaState.quality = CMOA_QUALITY_ORDER[0];
 
-            // The viewer learns the volume a beat after the page loads; poll
-            // rather than failing a click that lands a moment too early.
             let ready = false;
             for (let i = 0; i < 30; i++) {
                 await cmoaRefreshState();
@@ -11248,8 +11973,12 @@
             }
             if (!ready) {
                 const missing = cmoaComputeReadiness();
-                throw new Error('CMOA reader is not ready yet (missing ' + missing.join(', ') + '). ' +
-                    'Open the volume in the speed reader and let a page render, then try again.');
+
+                const cap = (missing.indexOf('descramble reader') !== -1)
+                    ? ' viewer=' + JSON.stringify(cmoaViewerCapabilities()) : '';
+                throw new Error('CMOA reader is not ready yet (missing ' + missing.join(', ') +
+                    ') on ' + location.href + '.' + cap + ' Open the volume in the speed reader and ' +
+                    'let a page render, then try again.');
             }
             reportRunProgress(runOptions, 'state-refresh-ready');
 
@@ -11296,71 +12025,162 @@
             harness.showBars();
             if (harness.mokuro) await harness.mokuro.open();
 
-            // The CDN is HTTP/1.1 only, so the browser pins a download to 6
-            // sockets per origin and that cap - not the worker count - sets the
-            // ceiling. The trailing-dot hostname is the same server but a
-            // different origin, worth 6 more sockets, with no local helper; if it
-            // does not answer the lane simply stays off.
+            cmoaSetSlotLimit(await cmoaOpenProcessPool());
+
             try {
-                // Probe with the least-restricted rung, not the best one: a free
-                // or trial volume refuses the original rendition, so probing q=0
-                // would 403 on exactly the most common volumes and leave the
-                // extra origin quietly switched off.
                 const probeRung = CMOA_QUALITY_ORDER[CMOA_QUALITY_ORDER.length - 1];
                 const probeUrl = cmoaBuildImageUrl(
                     cmoaState.pages[0],
                     probeRung,
                     cmoaState.lastGoodToken || cmoaState.token || cmoaState.tokenPool[0] || null
                 );
-                await probeDotLane(probeUrl);
+                probeDotLane(probeUrl).catch(e => {
+                    cmoaLog('dot lane probe skipped', safeLogText(e && e.message));
+                });
             } catch (e) {
                 cmoaLog('dot lane probe skipped', safeLogText(e && e.message));
             }
 
             let nextIndex = 0;
-            const worker = async () => {
-                while (true) {
-                    const i = nextIndex++;
-                    if (i >= total) return;
-                    const descriptor = descriptors[i];
-                    const pageIdx = descriptor.index;
-                    try {
-                        // A page from a previous run needs neither a fetch nor a
-                        // descramble; replaying it keeps a resumed volume cheap.
-                        let cached = null;
-                        if (runOptions.usePageCache && cmoaState.cid) {
-                            cached = await getCachedPage(cmoaState.cid, pageIdx);
-                        }
-                        if (cached) {
+            try {
+                const first = descriptors[0];
+                const cachedFirst = (runOptions.usePageCache && cmoaState.cid)
+                    ? await getCachedPage(cmoaState.cid, first.index)
+                    : null;
+                if (cachedFirst) {
+
+                    harness.bumpCached(1);
+                    harness.noteCached(first.index, cachedFirst, cachedPageCrc.get(cachedFirst));
+                    await cmoaWarmQualityRung(first);
+                } else {
+                    const processed = await cmoaFetchPage(first, 0);
+                    harness.bumpFetched(1);
+                    if (processed && processed.blob) {
+                        harness.notePage(first.index, processed.blob, undefined, processed.ext);
+                    } else {
+                        harness.noteFailure(first.index, 'page ' + first.index + ': empty response');
+                    }
+                }
+                nextIndex = 1;
+            } catch (e) {
+
+                cmoaLog('rung probe failed, the fan-out will run the ladder per page',
+                    safeLogText((e && e.message) || e));
+            }
+
+            const live = new Map();
+            const hedgeTasks = new Set();
+            const latencies = [];
+            let attemptsInFlight = 0;
+            let hedgedPages = 0;
+            const HEDGE_FLOOR_MS = 1500;
+            const HEDGE_DRAINED_FLOOR_MS = 700;
+            const HEDGE_FACTOR = 2.5;
+            const HEDGE_MAX = 2;
+            function hedgeAfterMs(drained) {
+                const floor = drained ? HEDGE_DRAINED_FLOOR_MS : HEDGE_FLOOR_MS;
+                if (latencies.length < 8) return floor;
+                const sorted = latencies.slice().sort((a, b) => a - b);
+                const p75 = sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * 0.75))] || floor;
+
+                return Math.max(floor, Math.round(p75 * (drained ? 1.5 : HEDGE_FACTOR)));
+            }
+            function noteLatency(ms) {
+                latencies.push(ms);
+                if (latencies.length > 64) latencies.shift();
+            }
+            function settlePage(pageIdx, fn) {
+                const rec = live.get(pageIdx);
+                if (rec && rec.settled) return false;
+                if (rec) {
+                    rec.settled = true;
+
+                    for (const ctrl of rec.aborters) { try { ctrl.abort(); } catch (e) {} }
+                }
+                fn();
+                return true;
+            }
+            async function attemptPage(i, hedged) {
+                const descriptor = descriptors[i];
+                const pageIdx = descriptor.index;
+                let rec = live.get(pageIdx);
+                if (!rec) {
+                    rec = { i: i, startedAt: performance.now(), hedges: 0, settled: false, aborters: new Set() };
+                    live.set(pageIdx, rec);
+                } else if (hedged) {
+                    rec.hedges++;
+                }
+                const ctrl = (typeof AbortController === 'function') ? new AbortController() : null;
+                if (ctrl) rec.aborters.add(ctrl);
+                attemptsInFlight++;
+                const t0 = performance.now();
+                try {
+
+                    let cached = null;
+                    if (!hedged && runOptions.usePageCache && cmoaState.cid) {
+                        cached = await getCachedPage(cmoaState.cid, pageIdx);
+                    }
+                    if (cached) {
+                        if (settlePage(pageIdx, () => {
                             harness.bumpCached(1);
                             harness.noteCached(pageIdx, cached, cachedPageCrc.get(cached));
-                            continue;
-                        }
-                        const processed = await cmoaFetchPage(descriptor, i);
+                        })) noteLatency(performance.now() - t0);
+                        return;
+                    }
+                    const processed = await cmoaFetchPage(descriptor, i, ctrl && ctrl.signal);
+                    if (!settlePage(pageIdx, () => {
                         harness.bumpFetched(1);
                         if (processed && processed.blob) {
                             harness.notePage(pageIdx, processed.blob, undefined, processed.ext);
                         } else {
                             harness.noteFailure(pageIdx, 'page ' + pageIdx + ': empty response');
                         }
-                    } catch (e) {
+                    })) return;
+                    noteLatency(performance.now() - t0);
+                } catch (e) {
+
+                    if (settlePage(pageIdx, () => {
                         harness.bumpFetched(1);
                         harness.noteFailure(pageIdx, safeLogText((e && e.message) || e));
-                    }
+                    })) noteLatency(performance.now() - t0);
+                } finally {
+                    attemptsInFlight--;
+                    if (ctrl) rec.aborters.delete(ctrl);
+                    const r = live.get(pageIdx);
+                    if (r && r.settled && !r.aborters.size) live.delete(pageIdx);
+                }
+            }
+            const worker = async () => {
+                while (true) {
+                    const i = nextIndex++;
+                    if (i >= total) return;
+                    await attemptPage(i, false);
                 }
             };
-            // Size the fan-out from real transport capacity, like the BookWalker
-            // pipeline: every online lane carries ~6 connections and is a
-            // separate origin, so the page's 6-connection ceiling is not the
-            // limit. A hardcoded worker count leaves those ports idle, which is
-            // what made CMOA run at one page per request round-trip.
+
+            let hedgeTimer = null;
+            hedgeTimer = setBackgroundInterval(() => {
+                if (attemptsInFlight >= concurrency) return;
+                const drained = nextIndex >= total;
+                const limit = hedgeAfterMs(drained);
+                const now = performance.now();
+                for (const [pageIdx, rec] of live) {
+                    if (rec.settled || rec.hedges >= HEDGE_MAX) continue;
+                    if (now - rec.startedAt < limit) continue;
+                    const age = Math.round(now - rec.startedAt);
+                    rec.startedAt = now;
+                    hedgedPages++;
+                    cmoaLog('hedging slow page', pageIdx, age + 'ms, limit ' + limit + 'ms');
+                    const p = attemptPage(rec.i, true);
+                    hedgeTasks.add(p);
+                    const drop = () => hedgeTasks.delete(p);
+                    p.then(drop, drop);
+                    return;
+                }
+            }, 250);
+
             const LANE_SLOTS = fetchSocketBudget(true);
-            // Unlike BookWalker, a CMOA worker *is* its own concurrency: it
-            // holds a fetched page then a decoded bitmap, so the ceiling is about
-            // memory as much as sockets. 256 matches what the bridge can feed (48
-            // proxy ports x 6 sockets plus the page and dot origins) while staying
-            // short of the browser's ~300 socket budget; lower it with
-            // window.__bwddMaxInflight if a low-RAM machine starts swapping.
+
             let inflightCap = 256;
             try {
                 if (typeof window !== 'undefined' && window.__bwddMaxInflight > 0) {
@@ -11381,17 +12201,31 @@
             for (let w = 0; w < concurrency; w++) workers.push(worker());
             await Promise.all(workers);
 
-            // Retry failed pages once after re-reading viewer state: a token
-            // rollover mid-run is the common cause.
-            if (harness.failedIdx.size && !runOptions.headless) {
+            if (hedgeTimer !== null) { clearBackgroundInterval(hedgeTimer); hedgeTimer = null; }
+            while (hedgeTasks.size) { await Promise.all(Array.from(hedgeTasks)); }
+            if (hedgedPages) cmoaLog('hedged ' + hedgedPages + ' slow page(s) this run');
+
+            const retryFailures = runOptions.retryFailedPages === true || !runOptions.headless;
+            if (harness.failedIdx.size && retryFailures) {
                 await cmoaRefreshState();
                 const retry = descriptors.filter(d => harness.failedIdx.has(d.index));
-                for (const descriptor of retry) {
-                    try {
-                        const processed = await cmoaFetchPage(descriptor, descriptor.index - 1);
-                        if (processed && processed.blob) harness.notePage(descriptor.index, processed.blob, undefined, processed.ext);
-                    } catch (e) { /* stays failed; reported below */ }
-                }
+                let retryCursor = 0;
+                const retryWorker = async () => {
+                    while (true) {
+                        const i = retryCursor++;
+                        if (i >= retry.length) return;
+                        const descriptor = retry[i];
+                        try {
+                            const processed = await cmoaFetchPage(descriptor, descriptor.index - 1);
+                            if (processed && processed.blob) harness.notePage(descriptor.index, processed.blob, undefined, processed.ext);
+                        } catch (e) { }
+                    }
+                };
+
+                const retryWidth = Math.max(CMOA_FETCH_CONCURRENCY, Math.min(24, retry.length));
+                const retryWorkers = [];
+                for (let w = 0; w < retryWidth; w++) retryWorkers.push(retryWorker());
+                await Promise.all(retryWorkers);
             }
 
             const missing = total - harness.okIdx.size;
@@ -11419,17 +12253,28 @@
             throw e;
         } finally {
             cmoaState.running = false;
+
+            cmoaCloseProcessPool();
             if (harness) await harness.cleanup();
         }
     }
 
+    function cmoaOwnsHost() {
+        try { return /(^|\.)cmoa\.jp$/i.test(location.hostname); } catch (e) { return false; }
+    }
     registerSite({
         id: 'cmoa',
         label: 'CMOA',
         panelTitle: 'CMOA Native Downloader',
+        ownsHost() {
+            return cmoaOwnsHost();
+        },
         matches() {
+
             try {
-                return /(^|\.)cmoa\.jp$/i.test(location.hostname);
+                if (!cmoaOwnsHost()) return false;
+                const path = location.pathname;
+                return /^\/bib\/speedreader\/?$/.test(path) || /^\/reader\//.test(path);
             } catch (e) { return false; }
         },
         install() {
@@ -11453,12 +12298,10 @@
             };
         },
         getCid() { return cmoaState.cid || ''; },
-        // The panel calls this before getBook/getPreview, so the page list and
-        // real title show up as soon as the viewer has them.
+
         refresh() { return cmoaRefreshState(); },
         afterBoot() {
-            // Keep refreshing while the viewer is still coming up; stop as soon
-            // as it is ready so an idle page does not poll forever.
+
             let ticks = 0;
             const timer = setInterval(async () => {
                 ticks++;
@@ -11469,53 +12312,2823 @@
         archiveDefault(rawTitle) { return archiveDefaultName(rawTitle) || fsSafePath(cmoaState.cid || ''); },
         run(ui, mode, options) { return cmoaRun(ui, mode, options); },
         state: cmoaState,
-        debug: { cmoaState },
-        debugGlobals: { __bwddCmoa: cmoaState },
+
+        debug: {
+            cmoaState,
+            get cmoaReassembly() { return cmoaReassembly; },
+            get cmoaProcessDepth() { return cmoaProcessDepth; },
+        },
+        debugGlobals: {
+            __bwddCmoa: cmoaState,
+
+            __bwddCmoaScramble: {
+                decodeTables: cmoaDecodeTables,
+                selectScramble: cmoaSelectScramble,
+                plan: cmoaScramblePlan,
+                parsePageList: cmoaParsePageList,
+            },
+        },
     });
-    // =====================================================================
-    // Initialization
-    // =====================================================================
-    // One entry point for both stores. The adapter is chosen from the host,
-    // given the chance to install its page hooks, and then the shared panel is
-    // brought up against it. A host no adapter claims still gets the
-    // BookWalker adapter, which is what a bare injected copy expects.
+
+    const CMOA_JOB_TIMEOUT = 60000;
+
+    const cmoaReassembly = { worker: 0, inline: 0, fallback: 0, passthrough: 0 };
+
+    function cmoaInlineForced() {
+        try { return typeof window !== 'undefined' && window.__bwddCmoaInline === true; }
+        catch (e) { return false; }
+    }
+
+    function cmoaJobMessage(job) {
+        return {
+            id: job.id,
+            bitmap: job.bitmap,
+            blits: job.blits,
+            width: job.width,
+            height: job.height,
+            codec: job.codec,
+        };
+    }
+
+    function cmoaWorkerSource() {
+        return '"use strict";\n' +
+            'let canvas = null;\n' +
+            'function surface(w, h) {\n' +
+            '    if (!canvas) canvas = new OffscreenCanvas(w, h);\n' +
+            '    else if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }\n' +
+            '    return canvas;\n' +
+            '}\n' +
+            'async function one(job) {\n' +
+            '    const cv = surface(job.width, job.height);\n' +
+            '    const ctx = cv.getContext("2d");\n' +
+            '    if (!ctx) throw new Error("no 2D context");\n' +
+            '    ctx.clearRect(0, 0, cv.width, cv.height);\n' +
+            '    if (job.blits && job.blits.length) {\n' +
+            '        for (const b of job.blits) {\n' +
+            '            try { ctx.drawImage(job.bitmap, b.sx, b.sy, b.w, b.h, b.dx, b.dy, b.w, b.h); }\n' +
+            '            catch (e) { /* keep the remaining pieces */ }\n' +
+            '        }\n' +
+            '    } else {\n' +
+            '        ctx.drawImage(job.bitmap, 0, 0);\n' +
+            '    }\n' +
+            '    if (job.bitmap && job.bitmap.close) { try { job.bitmap.close(); } catch (e) {} }\n' +
+            '    const blob = await cv.convertToBlob({ type: job.codec.type, quality: job.codec.quality });\n' +
+            '    if (!blob) throw new Error("canvas encode produced nothing");\n' +
+            '    return blob;\n' +
+            '}\n' +
+            'self.onmessage = async ev => {\n' +
+            '    const m = ev.data || {};\n' +
+            '    for (const job of (m.jobs || [])) {\n' +
+            '        try {\n' +
+            '            const blob = await one(job);\n' +
+            '            self.postMessage({ id: job.id, batchId: m.batchId, blob: blob, mime: blob.type });\n' +
+            '        } catch (e) {\n' +
+            '            self.postMessage({ id: job.id, batchId: m.batchId, error: (e && e.message) || String(e) });\n' +
+            '        }\n' +
+            '    }\n' +
+            '};\n';
+    }
+
+    let cmoaPool = null;
+    let cmoaPoolSize = 0;
+
+    let cmoaLastWorkers = 0;
+    const cmoaPoolWaiters = new Map();
+
+    function cmoaPoolDone(result) {
+        const waiter = result && cmoaPoolWaiters.get(result.id);
+        if (!waiter) return;
+        cmoaPoolWaiters.delete(result.id);
+        if (result.error || !result.blob) waiter.no(new Error(result.error || 'the worker returned no image'));
+        else waiter.ok(result);
+    }
+
+    let cmoaJobSeq = 0;
+    function cmoaPoolSubmit(job) {
+        return new Promise((ok, no) => {
+            const id = String(job.id) + ':' + (++cmoaJobSeq);
+            cmoaPoolWaiters.set(id, { ok: ok, no: no });
+            cmoaPool.submit(Object.assign({}, job, { id: id }));
+        });
+    }
+
+    async function cmoaOpenProcessPool() {
+        const size = workerPoolSize();
+        const batch = workerBatchSize(IMAGE_CODEC.type);
+        if (cmoaInlineForced()) {
+            cmoaLog('worker', 'reassembly forced inline (__bwddCmoaInline)');
+            return size * batch;
+        }
+        if (!(await canSpawnBlobWorker())) {
+            cmoaLog('worker', 'this page\u2019s CSP refuses a blob: worker \u2014 reassembling on this thread');
+            return size * batch;
+        }
+        try {
+            cmoaPool = makePool(size, cmoaWorkerSource(), cmoaPoolDone, CMOA_JOB_TIMEOUT, batch, cmoaJobMessage);
+            cmoaPoolSize = size;
+            cmoaLastWorkers = size;
+            cmoaLog('worker', 'reassembling on ' + size + ' worker(s), ' + batch + ' page each');
+        } catch (e) {
+            cmoaPool = null;
+            cmoaLog('worker', 'pool unavailable: ' + safeLogText(e && e.message));
+        }
+        return size * batch;
+    }
+
+    function cmoaCloseProcessPool() {
+        if (cmoaPool) { try { cmoaPool.terminate(); } catch (e) {} }
+        cmoaPool = null;
+        cmoaPoolSize = 0;
+        for (const waiter of cmoaPoolWaiters.values()) {
+            try { waiter.no(new Error('CMOA descramble pool closed')); } catch (e) {}
+        }
+        cmoaPoolWaiters.clear();
+    }
+
+    let cmoaSlotLimit = 0;
+    let cmoaSlotsBusy = 0;
+    let cmoaSlotQueue = [];
+
+    function cmoaSetSlotLimit(limit) {
+        cmoaSlotLimit = Math.max(1, limit | 0);
+    }
+
+    function cmoaAcquireSlot() {
+        if (cmoaSlotsBusy < cmoaSlotLimit) {
+            cmoaSlotsBusy++;
+            return Promise.resolve();
+        }
+        return new Promise(resolve => cmoaSlotQueue.push(resolve));
+    }
+
+    function cmoaReleaseSlot() {
+        const next = cmoaSlotQueue.shift();
+        if (next) { next(); return; }
+        cmoaSlotsBusy = Math.max(0, cmoaSlotsBusy - 1);
+    }
+
+    function cmoaProcessDepth() {
+        return {
+            busy: cmoaSlotsBusy,
+            queued: cmoaSlotQueue.length,
+            limit: cmoaSlotLimit,
+            workers: cmoaPoolSize,
+            lastWorkers: cmoaLastWorkers,
+        };
+    }
+
+    const CMOA_B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
+    const CMOA_CHAR_VALUE = (function () {
+        const table = new Int8Array(128).fill(-1);
+        for (let i = 0; i < CMOA_B64.length; i++) table[CMOA_B64.charCodeAt(i)] = i;
+        return table;
+    })();
+
+    function cmoaCharValue(ch) {
+        const code = ch.charCodeAt(0);
+        return code < 128 ? CMOA_CHAR_VALUE[code] : -1;
+    }
+
+    function cmoaRandomString(length) {
+        let out = '';
+        for (let i = 0; i < length; i++) out += CMOA_B64[(Math.random() * CMOA_B64.length) | 0];
+        return out;
+    }
+
+    function cmoaGenerateK(cid) {
+        const nonce = cmoaRandomString(16);
+        const repeated = new Array(Math.ceil(16 / String(cid).length) + 1).join(String(cid));
+        const head = repeated.substr(0, 16);
+        const tail = repeated.substr(-16, 16);
+        let xorNonce = 0, xorHead = 0, xorTail = 0;
+        return nonce.split('').map(function (ch, i) {
+            xorNonce ^= nonce.charCodeAt(i);
+            xorHead ^= head.charCodeAt(i);
+            xorTail ^= tail.charCodeAt(i);
+            return ch + CMOA_B64[(xorNonce + xorHead + xorTail) & 63];
+        }).join('');
+    }
+
+    function cmoaDecodeTable(cid, k, encoded) {
+        if (typeof encoded !== 'string') throw new TypeError('cmoaDecodeTable: encoded table must be a string');
+        const seed = cid + ':' + k;
+        let hash = 0;
+        for (let i = 0; i < seed.length; i++) {
+
+            hash += seed.charCodeAt(i) << (i % 16);
+        }
+        hash &= 0x7fffffff;
+        if (hash === 0) hash = 0x12345678;
+        let state = hash;
+        let out = '';
+        for (let i = 0; i < encoded.length; i++) {
+            state = ((state >>> 1) ^ (1210056708 & -(state & 1))) >>> 0;
+            out += String.fromCharCode(((encoded.charCodeAt(i) - 32 + state) % 94) + 32);
+        }
+        return JSON.parse(out);
+    }
+
+    function cmoaDecodeTables(cid, k, item) {
+        const out = {};
+        for (const key of ['stbl', 'ttbl', 'ctbl', 'ptbl']) {
+            const encoded = item ? item[key] : null;
+            if (typeof encoded !== 'string' || !encoded) continue;
+            try {
+                out[key] = cmoaDecodeTable(cid, k, encoded);
+            } catch (e) {
+                cmoaLog('scramble table ' + key + ' did not decode', safeLogText(e && e.message));
+            }
+        }
+        return out;
+    }
+
+    function cmoaSelectScramble(src, tables) {
+        const sums = [0, 0];
+        if (src && tables) {
+            const start = String(src).lastIndexOf('/') + 1;
+            for (let i = 0; i < String(src).length - start; i++) {
+                sums[i % 2] += String(src).charCodeAt(start + i);
+            }
+            sums[0] %= 8;
+            sums[1] %= 8;
+        }
+        if (!tables || !Array.isArray(tables.ptbl) || !Array.isArray(tables.ctbl)) return null;
+        return {
+            checksum: sums,
+            pieceTable: tables.ptbl[sums[0]],
+            coordTable: tables.ctbl[sums[1]],
+        };
+    }
+
+    function cmoaDescribeScramble(coordTable, pieceTable) {
+        const coord = String(coordTable == null ? '' : coordTable);
+        const piece = String(pieceTable == null ? '' : pieceTable);
+        if (coord === '' && piece === '') return 'none';
+        if (coord.charAt(0) === '=' && piece.charAt(0) === '=') return 'tiled';
+        if (/^[0-9]/.test(coord) && /^[0-9]/.test(piece)) return 'numeric';
+        return 'unknown';
+    }
+
+    function cmoaParseTiledPattern(pattern) {
+        const m = /^=([0-9]+)-([0-9]+)([-+])([0-9]+)-([-_0-9A-Za-z]+)$/.exec(String(pattern));
+        if (!m) return null;
+        return {
+            rows: parseInt(m[1], 10),
+            cols: parseInt(m[2], 10),
+            sign: m[3],
+            padding: parseInt(m[4], 10),
+            body: m[5],
+        };
+    }
+
+    function cmoaTiledSection(T, j, body) {
+        const values = [];
+        for (let i = 0; i < T + j + T * j; i++) {
+            const value = cmoaCharValue(body.charAt(i));
+            values.push(value < 0 ? 0 : value);
+        }
+        return {
+            colShift: values.slice(0, T),
+            rowShift: values.slice(T, T + j),
+            perm: values.slice(T + j),
+        };
+    }
+
+    function cmoaTiledDescrambler(coordTable, pieceTable) {
+        const coord = cmoaParseTiledPattern(coordTable);
+        const piece = cmoaParseTiledPattern(pieceTable);
+        if (!coord || !piece) throw new Error('invalid tiled scramble pattern');
+        if (coord.rows !== piece.rows || coord.cols !== piece.cols ||
+            coord.padding !== piece.padding || coord.sign !== '+' || piece.sign !== '-') {
+            throw new Error('tiled scramble patterns disagree');
+        }
+        const T = coord.rows;
+        const j = coord.cols;
+        const Dt = coord.padding;
+        if (T > 8 || j > 8 || T * j > 64) throw new Error('tiled scramble pattern too large');
+        const expected = T + j + T * j;
+        if (coord.body.length !== expected || piece.body.length !== expected) {
+            throw new Error('tiled scramble body has the wrong length');
+        }
+        const s = cmoaTiledSection(T, j, coord.body);
+        const h = cmoaTiledSection(T, j, piece.body);
+
+        const Rt = s.rowShift, Ft = s.colShift, Lt = h.rowShift, Nt = h.colShift;
+        const kt = [];
+        for (let i = 0; i < T * j; i++) kt.push(s.perm[h.perm[i]]);
+
+        const applies = (width, height) => {
+            const t = 2 * T * Dt;
+            const jj = 2 * j * Dt;
+            return width >= 64 + t && height >= 64 + jj && width * height >= (320 + t) * (320 + jj);
+        };
+        return {
+            kind: 'tiled',
+            applies: applies,
+            displaySize: function (width, height) {
+                if (!applies(width, height)) return { width: width, height: height };
+                return { width: width - 2 * T * Dt, height: height - 2 * j * Dt };
+            },
+
+            regions: function (width, height) {
+                const identity = [{ xsrc: 0, ysrc: 0, width: width, height: height, xdest: 0, ydest: 0 }];
+                if (!applies(width, height)) return identity;
+                const i = width - 2 * T * Dt;
+                const n = height - 2 * j * Dt;
+                const r = Math.floor((i + T - 1) / T);
+                const e = i - (T - 1) * r;
+                const sz = Math.floor((n + j - 1) / j);
+                const hh = n - (j - 1) * sz;
+                const out = [];
+                for (let o = 0; o < T * j; o++) {
+                    const a = o % T;
+                    const f = Math.floor(o / T);
+                    const c = Dt + a * (r + 2 * Dt) + (Lt[f] < a ? e - r : 0);
+                    const l = Dt + f * (sz + 2 * Dt) + (Nt[a] < f ? hh - sz : 0);
+                    const v = kt[o] % T;
+                    const d = Math.floor(kt[o] / T);
+                    const ws = v * r + (Rt[d] < v ? e - r : 0);
+                    const hs = d * sz + (Ft[v] < d ? hh - sz : 0);
+                    const w = Lt[f] === a ? e : r;
+                    const m = Nt[a] === f ? hh : sz;
+                    if (i > 0 && n > 0) {
+                        out.push({ xsrc: c, ysrc: l, width: w, height: m, xdest: ws, ydest: hs });
+                    }
+                }
+                return out;
+            },
+        };
+    }
+
+    function cmoaCompileDescrambler(coordTable, pieceTable, where) {
+        const kind = cmoaDescribeScramble(coordTable, pieceTable);
+        if (kind === 'tiled') return cmoaTiledDescrambler(coordTable, pieceTable);
+        if (kind === 'numeric') {
+            throw new Error('this volume uses the numeric scramble layout, which is not implemented' +
+                (where ? ' (' + where + ')' : '') + '; only the tiled layout has been verified');
+        }
+        if (kind === 'unknown') {
+            throw new Error('unrecognised CMOA scramble tables' + (where ? ' (' + where + ')' : '') +
+                ': coord=' + JSON.stringify(String(coordTable).slice(0, 24)) +
+                ' piece=' + JSON.stringify(String(pieceTable).slice(0, 24)));
+        }
+        return {
+            kind: 'none',
+            applies: function () { return false; },
+            displaySize: function (width, height) { return { width: width, height: height }; },
+            regions: function (width, height) {
+                return [{ xsrc: 0, ysrc: 0, width: width, height: height, xdest: 0, ydest: 0 }];
+            },
+        };
+    }
+
+    function cmoaScramblePlan(coordTable, pieceTable, width, height) {
+        const engine = cmoaCompileDescrambler(coordTable, pieceTable, 'page ' + width + 'x' + height);
+        const size = engine.displaySize(width, height);
+        return {
+            kind: engine.kind,
+            width: size.width,
+            height: size.height,
+            transfers: [{ index: 0, coords: engine.regions(width, height) }],
+        };
+    }
+
+    function cmoaTtxAttributes(text) {
+        const out = {};
+        const re = /([A-Za-z_:][-A-Za-z0-9_:.]*)\s*=\s*"([^"]*)"/g;
+        let m;
+        while ((m = re.exec(text)) !== null) out[m[1].toLowerCase()] = m[2];
+        return out;
+    }
+
+    function cmoaTtxPages(ttx) {
+        const pages = [];
+        const re = /<(t-pb|t-img|img|a)(\s+([^>]*)|)>/gi;
+        let match;
+        while ((match = re.exec(ttx)) !== null) {
+            const tag = match[1].toLowerCase();
+            if (tag !== 't-img' && tag !== 'img') continue;
+            const attrs = cmoaTtxAttributes(match[2] || '');
+            const src = String(attrs.src || '').trim();
+            const width = parseInt(attrs.orgwidth, 10) || 0;
+            const height = parseInt(attrs.orgheight, 10) || 0;
+            if (!src || !width || !height) continue;
+            pages.push({
+                src: src,
+                id: attrs.id || '',
+                width: width,
+                height: height,
+                spread: attrs.a != null ? attrs.a : '',
+            });
+        }
+        return pages;
+    }
+
+    function cmoaParsePageList(ttx) {
+        if (typeof ttx !== 'string' || !ttx) return [];
+        const landscape = ttx.replace(/<t-case\s+[^>]*screen\.portrait[^>]*>([\s\S]*?)<\/t-case>/gi, '');
+        return cmoaTtxPages(landscape);
+    }
+
+    const KM_ORIGIN = 'https://comic.k-manga.jp';
+    const KM_READ_TIMEOUT_MS = 30000;
+
+    const KM_MAX_SOCKETS = 4;
+    const KM_PAGES_PER_SOCKET = 32;
+    const KM_DEFAULT_DEPTH = 8;
+    const KM_MAX_DEPTH = 32;
+    const KM_PROCESS_LIMIT = 4;
+    const KM_MAX_ATTEMPTS = 6;
+
+    const kmangaState = {
+        running: false,
+        bookId: null,
+        volume: null,
+        title: null,
+        rawTitle: null,
+        session: null,
+
+        launcher: null,
+        total: 0,
+        resolution: '',
+        ready: false,
+        error: null,
+    };
+
+    function kmangaLog() {
+        if (!BWDD_DEBUG) return;
+        try { console.log.apply(console, ['[bwdd/kmanga]'].concat([].slice.call(arguments))); } catch (e) {}
+    }
+
+    const KM_MAGIC = 'BCP000';
+    const KM_API_URL = 'https://bv.k-manga.jp/public/app/action/bd00.php';
+    const KM_WS_URL = 'wss://ws.viewer.k-manga.jp/';
+    const KM_PROFILES = ['64kb_QVGA_h', 'apple_h'];
+
+    function kmangaBuildHeaderRequest(opts) {
+        if (!opts || !opts.ticket || !opts.obfuid) throw new Error('k-manga header request needs a ticket and an obfuid');
+        return 'REQUEST HEADER\nt=' + opts.ticket + '&fn=' + (opts.profile || KM_PROFILES[0]) + '&o=' + opts.obfuid;
+    }
+
+    function kmangaBuildDataRequest(opts) {
+        if (!opts || !opts.ticket || !opts.obfuid) throw new Error('k-manga data request needs a ticket and an obfuid');
+        const dk = opts.decryptKey ? '&dk=' + opts.decryptKey : '';
+        return 'REQUEST DATA\nt=' + opts.ticket + '&fn=' + opts.name + '&o=' + opts.obfuid + dk;
+    }
+
+    function kmangaLatin1(bytes, start, end) {
+        let out = '';
+        for (let i = start; i < end; i++) out += String.fromCharCode(bytes[i]);
+        return out;
+    }
+
+    function kmangaReadField(bytes, offset, width, what) {
+        const raw = kmangaLatin1(bytes, offset, offset + width);
+        const text = raw.trim();
+        if (!/^\d+$/.test(text)) {
+            throw new Error('k-manga frame has a non-numeric ' + what + ': ' + JSON.stringify(raw));
+        }
+        return Number(text);
+    }
+
+    function kmangaParseFrame(input) {
+        const buf = input instanceof Uint8Array ? input : new Uint8Array(input || []);
+        if (buf.length < 6 || kmangaLatin1(buf, 0, 6) !== KM_MAGIC) {
+            throw new Error('k-manga frame does not start with ' + KM_MAGIC);
+        }
+
+        if (buf.length === 6) return { hello: true };
+
+        if (buf.length < 16) throw new Error('k-manga frame is ' + buf.length + ' bytes, too short for a length field');
+        const jsonLength = kmangaReadField(buf, 6, 10, 'JSON length');
+        const jsonEnd = 16 + jsonLength;
+        if (jsonEnd > buf.length) {
+            throw new Error('k-manga frame claims ' + jsonLength + ' bytes of JSON but only ' + (buf.length - 16) + ' remain');
+        }
+        let body;
+        try {
+            body = JSON.parse(new TextDecoder().decode(buf.subarray(16, jsonEnd)));
+        } catch (error) {
+            throw new Error('k-manga frame has unparseable JSON: ' + ((error && error.message) || error));
+        }
+
+        if (jsonEnd === buf.length) return { hello: false, body: body, chunks: null };
+
+        const count = kmangaReadField(buf, jsonEnd, 3, 'chunk count');
+        const chunks = [];
+        let cursor = jsonEnd + 3;
+        for (let i = 0; i < count; i++) {
+            if (cursor + 10 > buf.length) throw new Error('k-manga frame ended inside chunk ' + i + ' of ' + count);
+            const size = kmangaReadField(buf, cursor, 10, 'chunk ' + i + ' length');
+            cursor += 10;
+            if (cursor + size > buf.length) {
+                throw new Error('k-manga frame ended inside chunk ' + i + ' of ' + count + ': wanted ' + size
+                    + ' bytes, ' + (buf.length - cursor) + ' left');
+            }
+            chunks.push(buf.subarray(cursor, cursor + size));
+            cursor += size;
+        }
+        if (cursor !== buf.length) {
+            throw new Error('k-manga frame has ' + (buf.length - cursor) + ' trailing byte(s) after ' + count + ' chunk(s)');
+        }
+        return { hello: false, body: body, chunks: chunks };
+    }
+
+    function kmangaParseIndexJsonp(text) {
+        const source = String(text);
+        const start = source.indexOf('(');
+        const end = source.lastIndexOf(')');
+        if (start < 0 || end < start) throw new Error('k-manga index reply is not a JSONP call');
+        let rows;
+        try {
+            rows = JSON.parse(source.slice(start + 1, end));
+        } catch (error) {
+            throw new Error('k-manga index reply has unparseable JSON: ' + ((error && error.message) || error));
+        }
+        if (!Array.isArray(rows)) throw new Error('k-manga index reply is not an array');
+
+        const chapters = [];
+        const flags = [];
+        for (const row of rows) {
+            if (!Array.isArray(row)) continue;
+            if (row.length === 2 && row[0] && row[1]) {
+                const page = Number(row[1]);
+                if (Number.isInteger(page) && page > 0) chapters.push({ name: String(row[0]).trim(), page: page });
+            } else if (row.length === 2 && row[0] && !row[1]) {
+                flags.push(String(row[0]).trim());
+            }
+        }
+        return { chapters: chapters, flags: flags };
+    }
+
+    function kmangaBase64ToText(raw) {
+        let text = String(raw).replace(/-/g, '+').replace(/_/g, '/');
+        while (text.length % 4) text += '=';
+        const binary = atob(text);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+        return new TextDecoder().decode(bytes);
+    }
+
+    function kmangaParseViewerUrl(viewerUrl) {
+        let url;
+        try { url = new URL(viewerUrl, KM_ORIGIN); } catch (e) { url = new URL(KM_ORIGIN); }
+        const p = url.searchParams;
+        const decode = function (key) {
+            const raw = p.get(key);
+            if (!raw) return null;
+            try { return JSON.parse(kmangaBase64ToText(raw)); } catch (e) { return null; }
+        };
+        return {
+            url: url.toString(),
+            ticket: p.get('p0') || null,
+            obfuid: p.get('p1') || null,
+            bookId: p.get('p3') || null,
+            sid: p.get('p8') || null,
+            accessUuid: p.get('p20') || null,
+            config: decode('p5'),
+            nextConfig: decode('p9'),
+            params: p,
+        };
+    }
+
+    function kmangaIsScrambled(image) {
+        return Number(image && image.key) > 0;
+    }
+
+    function kmangaScrambleGeometry(box) {
+        let cell = 32;
+        if (box.declaredWidth > 1000 || box.declaredHeight > 1000) cell *= 3;
+        else if (box.declaredWidth > 300 || box.declaredHeight > 300) cell *= 2;
+
+        if (box.sourceWidth % cell || box.sourceHeight % cell) {
+            throw new Error('k-manga scrambled page is ' + box.sourceWidth + 'x' + box.sourceHeight
+                + ', which is not a whole number of ' + cell + 'px cells');
+        }
+        return {
+            cell: cell,
+            block: cell - 2,
+            gridX: box.sourceWidth / cell,
+            gridY: box.sourceHeight / cell,
+        };
+    }
+
+    function kmangaScrambleOrder(grid) {
+        const total = grid.gridX * grid.gridY;
+        const remaining = new Array(total);
+        for (let i = 0; i < total; i++) remaining[i] = i;
+
+        const order = new Uint32Array(total);
+        let value = Number(grid.key) || 0;
+        for (let t = 0; t < total; t++) {
+            value = (8741 * value + 30873) % 131071;
+            const pick = value % remaining.length;
+            order[t] = remaining[pick];
+            remaining.splice(pick, 1);
+        }
+        return order;
+    }
+
+    function kmangaReadJpegSize(input) {
+        const data = input instanceof Uint8Array ? input : new Uint8Array(input || []);
+        if (data.length < 4 || data[0] !== 0xff || data[1] !== 0xd8) return null;
+        let i = 2;
+        while (i + 9 < data.length) {
+            if (data[i] !== 0xff) { i++; continue; }
+            const marker = data[i + 1];
+            if (marker === 0xd8 || marker === 0xd9 || (marker >= 0xd0 && marker <= 0xd7)) { i += 2; continue; }
+            const size = (data[i + 2] << 8) | data[i + 3];
+            const isFrame = marker >= 0xc0 && marker <= 0xcf &&
+                marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc;
+            if (isFrame) {
+                const height = (data[i + 5] << 8) | data[i + 6];
+                const width = (data[i + 7] << 8) | data[i + 8];
+                return (width > 0 && height > 0) ? { width: width, height: height } : null;
+            }
+            if (size < 2) return null;
+            i += 2 + size;
+        }
+        return null;
+    }
+
+    function kmangaTextOf(html) {
+        return String(html).replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+    }
+
+    function kmangaReadAttributes(tag) {
+        const attrs = {};
+        const attribute = /([A-Za-z_:][-A-Za-z0-9_:.]*)\s*=\s*(?:"([^"]*)"|'([^']*)')/g;
+        let match;
+        while ((match = attribute.exec(String(tag))) !== null) {
+            attrs[match[1].toLowerCase()] = match[2] !== undefined ? match[2] : match[3];
+        }
+        return attrs;
+    }
+
+    function kmangaReadLauncherTemplate(html) {
+        const script = /<script\b[^>]*\bid=["']titlejs["'][^>]*>/i.exec(html);
+        const attrs = script ? kmangaReadAttributes(script[0]) : {};
+        const viewerId = attrs['data-viewer-id-pc'];
+        const book = attrs['data-book'];
+        const formatType = attrs['data-format-type'];
+        const quality = attrs['data-quality-default'];
+        if (viewerId && book && formatType && quality) {
+            return { viewerId: viewerId, book: book, formatType: formatType, quality: quality };
+        }
+        const rendered = /\/viewer-launcher\/(\d+)\/(\d+)\/(\d+)\/([^/"'\s]+)/.exec(html);
+        if (rendered) {
+            return { viewerId: rendered[1], quality: rendered[2], book: rendered[3], formatType: rendered[4] };
+        }
+        return null;
+    }
+
+    function kmangaBuildLauncherUrl(template, opts) {
+        if (!template) return null;
+        const attrs = (opts && opts.attrs) || {};
+        const volume = opts ? opts.volume : null;
+        const fcipath = attrs['data-chapter-fcipath'] != null ? attrs['data-chapter-fcipath'] : '1';
+        const readType = attrs['data-chapter-readtype'] != null ? attrs['data-chapter-readtype'] : '0';
+        const fcid = attrs['data-chapter-fcid'] != null ? attrs['data-chapter-fcid'] : '0';
+        const fcupdated = attrs['data-chapter-fcupdated'] != null ? attrs['data-chapter-fcupdated'] : '0';
+        return KM_ORIGIN + '/viewer-launcher/' + template.viewerId + '/' + template.quality + '/' + template.book
+            + '/' + template.formatType + '/' + volume + '/' + fcipath + '/' + readType + '/' + fcid + '/' + fcupdated;
+    }
+
+    function kmangaParseLauncherUrl(href) {
+        let url;
+        try { url = new URL(href, KM_ORIGIN); } catch (e) { return null; }
+        const parts = url.pathname.split('/').filter(Boolean);
+        if (parts[0] !== 'viewer-launcher' || parts.length < 9) return null;
+        return {
+            url: url.toString(),
+            bookId: parts[3],
+            mode: parts[4],
+            volume: Number(parts[5]),
+            readType: Number(parts[7]),
+            fcid: parts[8],
+        };
+    }
+
+    function kmangaRank(entry) {
+        if (entry.sample) return 2;
+        return entry.readType === 4 ? 0 : 1;
+    }
+
+    function kmangaDecodeEntities(value) {
+        return String(value)
+            .replace(/&quot;/g, '"').replace(/&#0?39;/g, "'").replace(/&apos;/g, "'")
+            .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
+    }
+
+    function kmangaParseTitlePage(html) {
+        const text = String(html);
+        const template = kmangaReadLauncherTemplate(text);
+        const anchor = /<a\b([^>]*)>([\s\S]*?)<\/a>/gi;
+
+        const best = new Map();
+
+        for (const match of text.matchAll(anchor)) {
+            const attrs = kmangaReadAttributes(match[1]);
+            const href = attrs.href || '';
+            const classes = attrs.class || '';
+            const rendered = href.indexOf('/viewer-launcher/') !== -1 ? kmangaParseLauncherUrl(href) : null;
+
+            if (!rendered && !/x-invoke-viewer--btn__selector|book-chapter--btn/.test(classes)) continue;
+
+            const volume = Number(attrs['data-chapter-exid'] != null ? attrs['data-chapter-exid'] : (rendered && rendered.volume));
+            if (!Number.isInteger(volume) || volume < 1) continue;
+
+            const launcher = rendered ? rendered.url : kmangaBuildLauncherUrl(template, { volume: volume, attrs: attrs });
+            if (!launcher) continue;
+
+            const label = kmangaTextOf(match[2]);
+            const readType = Number(attrs['data-chapter-readtype'] != null ? attrs['data-chapter-readtype'] : (rendered && rendered.readType));
+
+            const entry = {
+                volume: volume,
+                launcher: launcher,
+                readType: readType,
+
+                sample: readType === 0 || (readType !== 1 && readType !== 4 && /試し読み/.test(label)),
+            };
+            const previous = best.get(volume);
+            if (!previous || kmangaRank(entry) < kmangaRank(previous)) best.set(volume, entry);
+        }
+
+        const ld = /"@type"\s*:\s*"ProductGroup"[\s\S]{0,300}?"name"\s*:\s*"([^"]+)"/.exec(text);
+        const og = /<meta property="og:title" content="([^"]+)"/.exec(text);
+        const name = (ld && ld[1]) || (og && og[1]) || null;
+
+        return {
+            name: name ? kmangaDecodeEntities(name) : null,
+            volumes: Array.from(best.values()).sort(function (a, b) { return a.volume - b.volume; }),
+        };
+    }
+
+    function kmangaSocketFromWebSocket(ws, timeoutMs) {
+        const queue = [];
+        const waiters = [];
+        let closed = false;
+        let closeReason = null;
+
+        function deliver(message) {
+            const waiter = waiters.shift();
+            if (waiter) { clearTimeout(waiter.timer); waiter.resolve(message); }
+            else queue.push(message);
+        }
+        function shutdown(reason) {
+            closed = true;
+            closeReason = closeReason || reason;
+            while (waiters.length) {
+                const waiter = waiters.shift();
+                clearTimeout(waiter.timer);
+                waiter.reject(new Error(closeReason));
+            }
+        }
+
+        ws.binaryType = 'arraybuffer';
+        ws.onmessage = function (event) {
+            const data = event && event.data;
+            let payload;
+            if (data instanceof ArrayBuffer) payload = new Uint8Array(data);
+            else if (data && data.buffer instanceof ArrayBuffer) payload = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+            else if (typeof data === 'string') payload = new TextEncoder().encode(data);
+            else return;
+            deliver({ opcode: 2, payload: payload });
+        };
+        ws.onerror = function () { shutdown('k-manga viewer socket errored'); };
+        ws.onclose = function (event) {
+            shutdown('k-manga viewer socket closed' + (event && event.code ? ' (' + event.code + ')' : ''));
+        };
+
+        return {
+            send: function (text) {
+                if (closed) throw new Error(closeReason || 'k-manga viewer socket is closed');
+                ws.send(text);
+            },
+
+            next: function (readTimeoutMs) {
+                if (queue.length) return Promise.resolve(queue.shift());
+                if (closed) return Promise.reject(new Error(closeReason || 'k-manga viewer socket is closed'));
+                const ms = readTimeoutMs || timeoutMs || KM_READ_TIMEOUT_MS;
+                return new Promise(function (resolve, reject) {
+                    const waiter = { resolve: resolve, reject: reject, timer: null };
+                    waiter.timer = setTimeout(function () {
+                        const index = waiters.indexOf(waiter);
+                        if (index >= 0) waiters.splice(index, 1);
+                        reject(new Error('k-manga WebSocket read timed out after ' + ms + ' ms'));
+                    }, ms);
+                    waiters.push(waiter);
+                });
+            },
+            close: function () {
+                if (closed) return;
+                closed = true;
+                try { ws.close(); } catch (e) {}
+            },
+            get closed() { return closed; },
+        };
+    }
+
+    function kmangaConnectSocket(url, options) {
+        options = options || {};
+        const handshakeMs = options.timeoutMs || 20000;
+        return new Promise(function (resolve, reject) {
+            let ws;
+            try { ws = new WebSocket(url); } catch (e) { reject(new Error('k-manga WebSocket could not be opened: ' + ((e && e.message) || e))); return; }
+            let settled = false;
+            const timer = setTimeout(function () {
+                if (settled) return;
+                settled = true;
+                try { ws.close(); } catch (e) {}
+                reject(new Error('k-manga WebSocket to ' + url + ' timed out after ' + handshakeMs + ' ms'));
+            }, handshakeMs);
+            ws.onopen = function () {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timer);
+
+                resolve(kmangaSocketFromWebSocket(ws, KM_READ_TIMEOUT_MS));
+            };
+            ws.onerror = function () {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timer);
+                reject(new Error('k-manga WebSocket to ' + url + ' failed to open'));
+            };
+            ws.onclose = function () {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timer);
+                reject(new Error('k-manga WebSocket to ' + url + ' closed before it opened'));
+            };
+        });
+    }
+
+    async function kmangaDecodeImage(bytes, mimeType) {
+        const buffer = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes || []);
+        const blobType = (typeof mimeType === 'string' && mimeType !== 'application/octet-stream') ? mimeType : undefined;
+        const blob = new Blob([buffer], { type: blobType });
+        if (typeof createImageBitmap === 'function') {
+            try {
+                const bitmap = await createImageBitmap(blob);
+                return {
+                    element: bitmap, width: bitmap.width, height: bitmap.height,
+                    cleanup: function () { try { if (bitmap.close) bitmap.close(); } catch (e) {} },
+                };
+            } catch (e) { }
+        }
+        return new Promise(function (resolve, reject) {
+            const objectUrl = URL.createObjectURL(blob);
+            const img = new Image();
+            img.decoding = 'async';
+            img.onload = function () {
+                resolve({
+                    element: img,
+                    width: img.naturalWidth || img.width,
+                    height: img.naturalHeight || img.height,
+                    cleanup: function () { try { URL.revokeObjectURL(objectUrl); img.src = ''; } catch (e) {} },
+                });
+            };
+            img.onerror = function (e) { try { URL.revokeObjectURL(objectUrl); } catch (_) {} reject(e || new Error('image decode failed')); };
+            img.src = objectUrl;
+        });
+    }
+
+    async function kmangaCanvasToBlob(canvas, mime, quality) {
+        const q = typeof quality === 'number' ? quality : undefined;
+        if (typeof canvas.toBlob === 'function') {
+            const direct = await new Promise(function (resolve) { canvas.toBlob(resolve, mime, q); });
+            if (direct) return direct;
+            if (mime && mime !== 'image/png') {
+                const fallback = await new Promise(function (resolve) { canvas.toBlob(resolve, 'image/png'); });
+                if (fallback) return fallback;
+            }
+        }
+        const dataUrl = canvas.toDataURL(mime || 'image/png');
+        const comma = dataUrl.indexOf(',');
+        const binary = atob(comma !== -1 ? dataUrl.slice(comma + 1) : dataUrl);
+        const out = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) out[i] = binary.charCodeAt(i);
+        return new Blob([out], { type: mime || 'image/png' });
+    }
+
+    function kmangaExtFor(type) {
+        const t = typeof type === 'string' ? type.split(';')[0].trim().toLowerCase() : '';
+        if (t === 'image/png') return 'png';
+        if (t === 'image/webp') return 'webp';
+        if (t === 'image/jpeg' || t === 'image/jpg') return 'jpg';
+        return null;
+    }
+
+    async function kmangaDescrambleJpeg(jpeg, image) {
+        const decoded = await kmangaDecodeImage(jpeg, 'image/jpeg');
+        try {
+            const geometry = kmangaScrambleGeometry({
+                declaredWidth: Number(image.declaredWidth),
+                declaredHeight: Number(image.declaredHeight),
+                sourceWidth: decoded.width,
+                sourceHeight: decoded.height,
+            });
+            const block = geometry.block;
+            const gridX = geometry.gridX;
+            const order = kmangaScrambleOrder({ gridX: gridX, gridY: geometry.gridY, key: image.key });
+
+            const outWidth = gridX * block;
+            const outHeight = geometry.gridY * block;
+
+            const width = Math.min(Number(image.declaredWidth), outWidth);
+            const height = Math.min(Number(image.declaredHeight), outHeight);
+            const canvas = document.createElement('canvas');
+            canvas.width = width;
+            canvas.height = height;
+            const ctx = canvas.getContext('2d');
+            if (!ctx) throw new Error('k-manga descramble needs a 2D canvas context');
+
+            for (let t = 0; t < order.length; t++) {
+                const from = order[t];
+                const sourceX = (from % gridX) * geometry.cell + 1;
+                const sourceY = Math.floor(from / gridX) * geometry.cell + 1;
+                const targetX = (t % gridX) * block;
+                const targetY = Math.floor(t / gridX) * block;
+                ctx.drawImage(decoded.element, sourceX, sourceY, block, block, targetX, targetY, block, block);
+            }
+            const blob = await kmangaCanvasToBlob(canvas, IMAGE_CODEC.type, IMAGE_CODEC.quality);
+            if (!blob) throw new Error('k-manga descramble produced no image');
+            return { blob: blob, ext: kmangaExtFor(blob.type) };
+        } finally {
+            try { decoded.cleanup(); } catch (e) {}
+        }
+    }
+
+    async function kmangaPageBlob(frame, entry) {
+        const scenes = frame.body && frame.body.scenes;
+        if (!Array.isArray(scenes) || !scenes.length) {
+            throw new Error('k-manga page ' + entry.name + ' carried no scene');
+        }
+        const scene = scenes[0];
+        const images = scene.images || [];
+        if ((scene.sceneImagePartition || 1) > 1 || images.length > 1) {
+            throw new Error('k-manga page ' + entry.name + ' is a composite scene (partition '
+                + scene.sceneImagePartition + ', ' + images.length + ' image(s)), which is not supported');
+        }
+        const image = images[0];
+        if (!image || !frame.chunks || !frame.chunks.length) {
+            throw new Error('k-manga page ' + entry.name + ' carried no image data');
+        }
+        if (image.format !== 'jpeg') {
+            throw new Error('k-manga page ' + entry.name + ' is ' + image.format + ', which is not implemented');
+        }
+        const jpeg = frame.chunks[0];
+        if (!kmangaReadJpegSize(jpeg)) throw new Error('k-manga page ' + entry.name + ' is not a readable JPEG');
+
+        if (!kmangaIsScrambled(image)) {
+            return { blob: new Blob([jpeg], { type: 'image/jpeg' }), ext: 'jpg' };
+        }
+        return kmangaDescrambleJpeg(jpeg, {
+            key: Number(image.key),
+            declaredWidth: Number(image.width),
+            declaredHeight: Number(image.height),
+        });
+    }
+
+    function kmangaBookIdFromPath(pathname) {
+        const m = /\/title\/(\d+)/.exec(String(pathname || ''));
+        return m ? m[1] : null;
+    }
+
+    function kmangaTitleFromDocument() {
+        try {
+            const toolbar = document.querySelector('#ic-title');
+            const shown = toolbar && toolbar.textContent.replace(/\s+/g, ' ').trim();
+            if (shown) return shown;
+            const scripts = document.querySelectorAll('script[type="application/ld+json"]');
+            for (const script of scripts) {
+                const m = /"@type"\s*:\s*"ProductGroup"[\s\S]{0,300}?"name"\s*:\s*"([^"]+)"/.exec(script.textContent || '');
+                if (m) return kmangaDecodeEntities(m[1]);
+            }
+            const og = document.querySelector('meta[property="og:title"]');
+            if (og && og.content) return kmangaDecodeEntities(og.content);
+            const h1 = document.querySelector('h1');
+            if (h1 && h1.textContent.replace(/\s+/g, ' ').trim()) return h1.textContent.replace(/\s+/g, ' ').trim();
+            const doc = document.title || '';
+            return /viewer/i.test(doc) ? '' : doc;
+        } catch (e) { return ''; }
+    }
+
+    function kmangaTitleFromHtml(html) {
+        const text = String(html || '');
+        const ld = /"@type"\s*:\s*"ProductGroup"[\s\S]{0,300}?"name"\s*:\s*"([^"]+)"/.exec(text);
+        if (ld) return kmangaDecodeEntities(ld[1]);
+        const og = /<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']+)["']/i.exec(text)
+            || /<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:title["']/i.exec(text);
+        if (og) return kmangaDecodeEntities(og[1]);
+        const h1 = /<h1[^>]*>([\s\S]{1,200}?)<\/h1>/i.exec(text);
+        if (h1) {
+            const plain = kmangaDecodeEntities(h1[1].replace(/<[^>]*>/g, ' ')).replace(/\s+/g, ' ').trim();
+            if (plain) return plain;
+        }
+        return '';
+    }
+
+    function kmangaFetchSeriesTitle(bookId) {
+        if (!bookId) return Promise.resolve('');
+        const attempts = kmangaState.titleAttempts || (kmangaState.titleAttempts = {});
+        if ((attempts[bookId] || 0) >= 3) return Promise.resolve('');
+        attempts[bookId] = (attempts[bookId] || 0) + 1;
+        let request;
+        try {
+            request = fetch('https://comic.k-manga.jp/title/' + encodeURIComponent(bookId) + '/pv', {
+                credentials: 'same-origin',
+            }).then(res => (res && res.ok ? res.text() : ''))
+                .catch(() => '');
+        } catch (e) { return Promise.resolve(''); }
+        const timeout = new Promise(resolve => setTimeout(() => resolve(''), 4000));
+        return Promise.race([request, timeout]).then(html => (html ? kmangaTitleFromHtml(html) : ''));
+    }
+
+    async function kmangaRefreshState() {
+        const viewer = kmangaParseViewerUrl(location.href);
+        if (viewer.ticket && viewer.obfuid) {
+            kmangaState.session = viewer;
+            if (viewer.bookId) kmangaState.bookId = viewer.bookId;
+
+            const p4 = viewer.params && viewer.params.get ? viewer.params.get('p4') : null;
+            if (!Number.isInteger(kmangaState.volume) && p4 && /^\d{1,4}$/.test(p4) && Number(p4) > 0) {
+                kmangaState.volume = Number(p4);
+            }
+            kmangaState.launcher = null;
+        } else {
+            kmangaState.session = null;
+            const launcher = kmangaParseLauncherUrl(location.href);
+            if (launcher) {
+                kmangaState.launcher = launcher.url;
+                if (launcher.bookId) kmangaState.bookId = launcher.bookId;
+                if (Number.isInteger(launcher.volume)) kmangaState.volume = launcher.volume;
+            } else if (!kmangaState.bookId) {
+                kmangaState.bookId = kmangaBookIdFromPath(location.pathname);
+            }
+        }
+        kmangaState.rawTitle = kmangaState.rawTitle || kmangaTitleFromDocument();
+
+        if (!kmangaState.rawTitle) {
+            const fetched = await kmangaFetchSeriesTitle(kmangaState.bookId);
+            if (fetched) kmangaState.rawTitle = fetched;
+        }
+
+        if (kmangaState.rawTitle && Number.isInteger(kmangaState.volume) && kmangaState.volume > 0
+            && !/\(\s*\d+\s*\)\s*$/.test(kmangaState.rawTitle)) {
+            kmangaState.rawTitle = kmangaState.rawTitle + '(' + kmangaState.volume + ')';
+        }
+        if (!kmangaState.title) {
+            const cleaned = cleanTitle(kmangaState.rawTitle);
+            if (cleaned) kmangaState.title = cleaned;
+        }
+
+        if (!Number.isInteger(kmangaState.volume)) {
+            const sv = splitSeriesVolume(kmangaState.title || kmangaState.rawTitle || '');
+            if (sv && isFinite(sv.volNum) && sv.volNum) kmangaState.volume = sv.volNum;
+        }
+        kmangaState.ready = !!kmangaState.bookId;
+        return kmangaState.ready;
+    }
+
+    async function kmangaOpenSession() {
+        const viewer = kmangaParseViewerUrl(location.href);
+        if (viewer.ticket && viewer.obfuid) {
+            return { viewerUrl: location.href, session: viewer };
+        }
+        if (!kmangaState.launcher) {
+            const launcher = kmangaParseLauncherUrl(location.href);
+            kmangaState.launcher = launcher ? launcher.url : kmangaState.launcher;
+        }
+        if (!kmangaState.launcher) {
+            kmangaRefreshState();
+        }
+        if (!kmangaState.launcher) {
+            throw new Error('This is not a k-manga viewer page: open a volume (無料で読む / 試し読み) and start the download there.');
+        }
+        const response = await fetchWithTimeout(kmangaState.launcher, {
+            credentials: 'include',
+            redirect: 'follow',
+            headers: { Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8', 'Accept-Language': 'ja,en;q=0.8' },
+        }, 45000);
+        if (!response || !response.ok) {
+            throw new Error('k-manga launcher answered HTTP ' + (response ? response.status : '0') + ': ' + kmangaState.launcher);
+        }
+        const viewerUrl = response.url || '';
+        const session = kmangaParseViewerUrl(viewerUrl);
+        if (!session.ticket || !session.obfuid) {
+            throw new Error('k-manga launcher did not land on a viewer URL carrying a ticket and an obfuid: ' + viewerUrl);
+        }
+        return { viewerUrl: viewerUrl, session: session };
+    }
+
+    async function kmangaFetchIndex(session) {
+        const url = KM_API_URL + '?t=' + encodeURIComponent(session.ticket) + '&fn=index.csv'
+            + '&o=' + encodeURIComponent(session.obfuid) + '&type=index&callback=cb&u=' + Date.now();
+        try {
+            const response = await laneFetch(url, 45000, { allowProxy: proxyCanServe(hostOf(url)) });
+            if (!response || !response.ok) return null;
+            return kmangaParseIndexJsonp(await response.text());
+        } catch (e) {
+            return null;
+        }
+    }
+
+    async function kmangaGreetSocket(socket) {
+        const hello = await socket.next(KM_READ_TIMEOUT_MS);
+        const greeting = kmangaParseFrame(hello.payload);
+        if (!greeting.hello) throw new Error('k-manga socket did not greet with a bare BCP000 frame');
+    }
+
+    async function kmangaReadManifest(socket, session) {
+        socket.send(kmangaBuildHeaderRequest({
+            ticket: session.ticket,
+            obfuid: session.obfuid,
+            profile: KM_PROFILES[0],
+        }));
+        const reply = await socket.next(KM_READ_TIMEOUT_MS);
+        const frame = kmangaParseFrame(reply.payload);
+        if (frame.chunks !== null) throw new Error('k-manga header reply unexpectedly carried image data');
+        const body = frame.body || {};
+        if (!Array.isArray(body.contentInfos) || !body.contentInfos.length) {
+            throw new Error('k-manga header reply listed no pages: ' + JSON.stringify(body).slice(0, 200));
+        }
+        return body;
+    }
+
+    async function kmangaDrainPages(args) {
+        const socket = args.socket;
+        const session = args.session;
+        const manifest = args.manifest;
+        const work = args.work;
+        const depth = args.depth;
+        const processLimit = args.processLimit;
+        const onPage = args.onPage;
+
+        const outstanding = new Map();
+        const processing = new Set();
+        const errors = [];
+        let cursor = 0;
+
+        const fill = function () {
+            while (outstanding.size < depth && cursor < work.length) {
+                const item = work[cursor++];
+                outstanding.set(item.sceneNo, item);
+                socket.send(kmangaBuildDataRequest({
+                    ticket: session.ticket,
+                    obfuid: session.obfuid,
+                    name: item.entry.name,
+                    decryptKey: manifest.dk,
+                }));
+            }
+        };
+
+        fill();
+        while (outstanding.size) {
+
+            const reply = await socket.next(KM_READ_TIMEOUT_MS);
+            const frame = kmangaParseFrame(reply.payload);
+            const scenes = frame.body && frame.body.scenes;
+            const sceneNo = Array.isArray(scenes) && scenes.length ? scenes[0].sceneNo : undefined;
+            const item = outstanding.get(sceneNo);
+            if (!item) {
+
+                throw new Error('k-manga answered scene ' + sceneNo + ' while ' + outstanding.size
+                    + ' other page(s) were outstanding, so the reply cannot be matched to a request');
+            }
+            outstanding.delete(sceneNo);
+            fill();
+
+            const task = onPage(item, frame).catch(function (error) {
+                errors.push({ item: item, error: error || new Error('page failed') });
+            });
+            processing.add(task);
+            task.finally(function () { processing.delete(task); });
+            if (processing.size >= processLimit) await Promise.race(processing);
+        }
+        await Promise.all(processing);
+        return errors;
+    }
+
+    async function kmangaOpenManifest(session) {
+        const socket = await kmangaConnectSocket(KM_WS_URL);
+        try {
+            await kmangaGreetSocket(socket);
+            const manifest = await kmangaReadManifest(socket, session);
+            return { socket: socket, manifest: manifest };
+        } catch (e) {
+            try { socket.close(); } catch (e2) {}
+            throw e;
+        }
+    }
+
+    async function kmangaRun(ui, mode, options) {
+        const runOptions = normalizeRunOptions(options, mode);
+        const runResult = runOptions.automation
+            ? (runOptions.result || newAutomationResult(mode, kmangaState.bookId || '', runOptions.deferFinalize))
+            : null;
+        if (runResult) {
+            runOptions.result = runResult;
+            runOptions.errors = runResult.errors;
+        }
+
+        let harness = null;
+        try {
+            reportRunProgress(runOptions, 'started', { mode: mode, cid: kmangaState.bookId || '' });
+            kmangaState.running = true;
+            if (!kmangaState.bookId) kmangaRefreshState();
+
+            const opened = await kmangaOpenSession();
+            const session = opened.session;
+            const bookId = session.bookId || kmangaState.bookId || 'unknown';
+
+            let volume = kmangaState.volume;
+            const launcher = kmangaParseLauncherUrl(opened.viewerUrl || '');
+            if (launcher && Number.isInteger(launcher.volume)) volume = launcher.volume;
+            if (!Number.isInteger(volume)) {
+                const listed = kmangaParseLauncherUrl(location.href);
+                if (listed && Number.isInteger(listed.volume)) volume = listed.volume;
+            }
+            const rawTitle = kmangaState.rawTitle || kmangaTitleFromDocument();
+            const name = kmangaState.title || cleanTitle(rawTitle) || ('k-manga ' + bookId);
+            const title = volume ? name + ' (' + volume + ')' : name;
+            const sv = splitSeriesVolume(title);
+            const archiveName = ui.syncArchiveDefault(rawTitle) || zipBaseName(sv, title);
+            const cid = bookId + 'vol' + (volume == null ? '' : volume);
+
+            if (runResult) {
+                runResult.cid = bookId;
+                runResult.mode = mode;
+                runResult.title = title;
+                reportRunProgress(runOptions, 'book', { title: title, cid: bookId });
+            }
+
+            kmangaFetchIndex(session).then(function (index) {
+                if (index) kmangaLog('index listed ' + index.chapters.length + ' chapter(s)');
+            }, function () {});
+
+            const first = await kmangaOpenManifest(session);
+            const manifest = first.manifest;
+            let spare = first.socket;
+
+            const pages = manifest.contentInfos.slice().sort(function (a, b) {
+                return Number(a.startSceneNo) - Number(b.startSceneNo);
+            });
+            const total = pages.length;
+            if (!total) throw new Error('k-manga listed no pages for this volume.');
+            kmangaState.total = total;
+            kmangaState.manifest = manifest;
+
+            harness = createRunHarness(ui, mode, runOptions, {
+                title: title, archiveName: archiveName, sv: sv, total: total, cid: cid,
+            });
+            harness.setTotal(total);
+            if (runResult) {
+                runResult.total = total;
+                reportRunProgress(runOptions, 'manifest', { total: total, plaintext: true });
+            }
+            if (!runOptions.headless) {
+                renderBookCard(ui.statsEl, {
+                    title: title, pages: total, resolution: kmangaState.resolution, type: 'k-manga Viewer',
+                });
+                if (sv.series) fetchAndRenderStats(ui.statsEl, sv.series, sv.volNum);
+            }
+            harness.showBars();
+            if (harness.mokuro) await harness.mokuro.open();
+
+            const depth = Math.max(1, Math.min(KM_MAX_DEPTH, Number(runOptions.kmConcurrency) || KM_DEFAULT_DEPTH));
+            const processLimit = Math.max(1, Math.min(KM_PROCESS_LIMIT, depth));
+            const attempts = Math.max(1, Math.min(KM_MAX_ATTEMPTS, 1 + (Number(runOptions.retries) || 0)));
+
+            let downloaded = 0;
+            let cachedCount = 0;
+            let lastError = null;
+            const done = new Set();
+            const permanent = new Map();
+            const work = pages.map(function (entry, position) {
+                return { index: position, entry: entry, sceneNo: Number(entry.startSceneNo) };
+            });
+
+            if (runOptions.usePageCache && cid) {
+                for (const item of work) {
+                    let cached = null;
+                    try { cached = await getCachedPage(cid, item.index + 1); } catch (e) { cached = null; }
+                    if (!cached) continue;
+                    harness.bumpCached(1);
+                    harness.noteCached(item.index + 1, cached, cachedPageCrc.get(cached));
+                    done.add(item.index);
+                    cachedCount++;
+                }
+            }
+
+            for (let attempt = 1; attempt <= attempts; attempt++) {
+                const sockets = [];
+                try {
+                    let socket = spare;
+                    spare = null;
+                    if (socket) {
+                        sockets.push(socket);
+                    } else {
+                        socket = await kmangaConnectSocket(KM_WS_URL);
+                        await kmangaGreetSocket(socket);
+
+                        await kmangaReadManifest(socket, session);
+                        sockets.push(socket);
+                    }
+
+                    const todo = work.filter(function (item) {
+                        return !done.has(item.index) && !permanent.has(item.index);
+                    });
+                    if (!todo.length) break;
+
+                    const count = Math.max(1, Math.min(KM_MAX_SOCKETS, Math.ceil(todo.length / KM_PAGES_PER_SOCKET)));
+                    if (count > 1) {
+                        const rest = await Promise.all(Array.from({ length: count - 1 }, async function () {
+                            const extra = await kmangaConnectSocket(KM_WS_URL);
+                            await kmangaGreetSocket(extra);
+                            await kmangaReadManifest(extra, session);
+                            return extra;
+                        }));
+                        for (const extra of rest) sockets.push(extra);
+                    }
+
+                    const shards = sockets.map(function () { return []; });
+                    todo.forEach(function (item, i) { shards[i % sockets.length].push(item); });
+
+                    const perSocketProcess = Math.max(1, Math.round(processLimit / sockets.length));
+
+                    const settled = await Promise.allSettled(sockets.map(function (s, index) {
+                        return kmangaDrainPages({
+                            socket: s, session: session, manifest: manifest, work: shards[index],
+                            depth: depth, processLimit: perSocketProcess,
+                            onPage: async function (item, frame) {
+                                harness.bumpFetched(1);
+                                const out = await kmangaPageBlob(frame, item.entry);
+                                downloaded++;
+                                done.add(item.index);
+                                harness.notePage(item.index + 1, out.blob, undefined, out.ext);
+                            },
+                        });
+                    }));
+
+                    let shardError = null;
+                    for (const outcome of settled) {
+                        if (outcome.status === 'fulfilled') {
+                            for (const failure of outcome.value) {
+                                const message = (failure.error && failure.error.message) || String(failure.error);
+                                permanent.set(failure.item.index, message);
+                                harness.noteFailure(failure.item.index + 1, message);
+                            }
+                        } else {
+                            shardError = shardError || outcome.reason;
+                        }
+                    }
+                    if (shardError) throw shardError;
+                    if (!work.some(function (item) {
+                        return !done.has(item.index) && !permanent.has(item.index);
+                    })) break;
+                } catch (error) {
+                    lastError = error;
+                } finally {
+                    for (const socket of sockets) { try { socket.close(); } catch (e) {} }
+                }
+            }
+
+            const unfinished = work.filter(function (item) {
+                return !done.has(item.index) && !permanent.has(item.index);
+            });
+            if (unfinished.length) {
+                throw new Error('k-manga: ' + unfinished.length + ' of ' + total + ' pages of "' + title
+                    + '" were never fetched' + (lastError ? ': ' + lastError.message : ''));
+            }
+            if (!downloaded && !cachedCount) {
+                throw new Error('k-manga: every one of the ' + total + ' pages of "' + title + '" failed to download'
+                    + (lastError ? ': ' + lastError.message : ''));
+            }
+
+            if (mode === 'ocr' && harness.mokuro) {
+                await harness.mokuro.settle();
+                if (runOptions.deferFinalize) return harness.mokuro.deferred();
+                const fin = await harness.mokuro.finalize();
+                harness.markFinished();
+                return harness.outcome(fin.ok);
+            }
+            if (mode === 'ocr' && !harness.mokuro) {
+                throw new Error('Mokuro OCR is unavailable for this run');
+            }
+
+            const missing = total - harness.okIdx.size;
+            if (missing === total) {
+                setRunDetails(harness.details, msgAllFailedZip(), harness.errors);
+                return harness.outcome(false);
+            }
+            return await harness.finishZip();
+        } catch (e) {
+            const reported = harness ? harness.reportFailure(e) : null;
+            if (reported) throw reported;
+            throw e;
+        } finally {
+            kmangaState.running = false;
+            if (harness) await harness.cleanup();
+        }
+    }
+
+    function kmangaOwnsHost() {
+        try { return /(^|\.)k-manga\.jp$/i.test(location.hostname); } catch (e) { return false; }
+    }
+    registerSite({
+        id: 'kmanga',
+        label: 'k-manga',
+        panelTitle: 'k-manga Native Downloader',
+        ownsHost() {
+            return kmangaOwnsHost();
+        },
+        matches() {
+
+            try {
+                return kmangaOwnsHost() && /^\/viewer\//.test(location.pathname);
+            } catch (e) { return false; }
+        },
+        install() {
+
+            try {
+                if (!/(^|;\s*)isIPad=/.test(document.cookie)) document.cookie = 'isIPad=off; path=/';
+            } catch (e) {}
+        },
+
+        refresh() { return kmangaRefreshState(); },
+        getBook() {
+            const title = kmangaState.title || cleanTitle(kmangaState.rawTitle);
+            if (!title) return null;
+            const sv = splitSeriesVolume(title);
+            return {
+                rawTitle: kmangaState.rawTitle || title,
+                title: title,
+                series: sv.series,
+                volNum: sv.volNum,
+            };
+        },
+        getPreview() {
+            if (!kmangaState.ready) return null;
+            const title = kmangaState.title || ('k-manga ' + (kmangaState.bookId || ''));
+            return {
+                title: title,
+                pages: kmangaState.total || 0,
+                resolution: kmangaState.resolution || '',
+                type: 'k-manga Viewer',
+            };
+        },
+        getCid() { return kmangaState.bookId || ''; },
+        archiveDefault(rawTitle) { return archiveDefaultName(rawTitle) || fsSafePath(kmangaState.bookId || ''); },
+        run(ui, mode, options) { return kmangaRun(ui, mode, options); },
+        state: kmangaState,
+        debug: {
+            kmangaState: kmangaState,
+        },
+        debugGlobals: {
+            __bwddKmanga: kmangaState,
+
+            __bwddKmangaProtocol: {
+                parseFrame: kmangaParseFrame,
+                parseIndexJsonp: kmangaParseIndexJsonp,
+                parseViewerUrl: kmangaParseViewerUrl,
+                parseTitlePage: kmangaParseTitlePage,
+                parseLauncherUrl: kmangaParseLauncherUrl,
+                buildHeaderRequest: kmangaBuildHeaderRequest,
+                buildDataRequest: kmangaBuildDataRequest,
+                scrambleGeometry: kmangaScrambleGeometry,
+                scrambleOrder: kmangaScrambleOrder,
+                readJpegSize: kmangaReadJpegSize,
+                isScrambled: kmangaIsScrambled,
+                descrambleJpeg: kmangaDescrambleJpeg,
+                pageBlob: kmangaPageBlob,
+
+                drainPages: kmangaDrainPages,
+                connectSocket: kmangaConnectSocket,
+                greetSocket: kmangaGreetSocket,
+                readManifest: kmangaReadManifest,
+            },
+        },
+    });
+
+    const KINDLE_READER_HOST_RE = /^read\.amazon\./i;
+    const KINDLE_MANGA_PATH_RE = /\/manga\//i;
+
+    const kindleState = {
+        asin: '',
+        revision: '',
+        title: '',
+        seriesAsin: '',
+        token: '',
+        expiresAt: 0,
+        bookAccessMethod: '',
+        bookContentType: '',
+        isSample: false,
+        isFreeTrial: false,
+        isVerticalScroll: false,
+        expectedPages: 0,
+        lastPositionId: 0,
+        progression: 'rtl',
+        author: '',
+        imageResolution: null,
+
+        pages: new Map(),
+        resources: new Map(),
+        toc: [],
+        nextSkip: 0,
+        walkDone: false,
+
+        windowBatch: 0,
+
+        startPosition: 1,
+        startMode: 'explicit',
+
+        contentType: 'FullBook',
+        contentTypeFixed: false,
+        throttleUntil: 0,
+        throttleStrikes: 0,
+
+        probe: { status: 'idle', error: null },
+        running: false,
+    };
+
+    let kindleProbeInflight = null;
+
+    function kindleLog() {
+        if (!BWDD_DEBUG) return;
+        try { console.log.apply(console, ['[bwdd/kindle]'].concat([].slice.call(arguments))); } catch (e) {}
+    }
+
+    try {
+        document.documentElement.setAttribute('data-bwdd-kindle', 'evaluated');
+        console.log('[kindle] evaluated on ' + location.href);
+    } catch (e) {}
+
+    function kindleIsMangaPage(href) {
+        try {
+            const u = new URL(href || location.href, location.href);
+            return KINDLE_READER_HOST_RE.test(u.hostname) && KINDLE_MANGA_PATH_RE.test(u.pathname);
+        } catch (e) {
+            return KINDLE_READER_HOST_RE.test(String(href)) && KINDLE_MANGA_PATH_RE.test(String(href));
+        }
+    }
+
+    function kindleAsinFromUrl(href) {
+        const m = String(href || location.href).match(/\/manga\/([A-Z0-9]{10})(?:[/?#]|$)/i);
+        return m ? m[1].toUpperCase() : '';
+    }
+
+    function kindleReadBookInfo() {
+        let el = null;
+        try { el = document.getElementById('bookInfo'); } catch (e) { el = null; }
+        if (!el) return null;
+        const text = String(el.textContent || el.value || '');
+        if (!text.trim()) return null;
+        try { return JSON.parse(text); } catch (e) { return null; }
+    }
+
+    function kindleApplyBookInfo() {
+        const info = kindleReadBookInfo();
+        if (!info) return false;
+        const asin = String(info.asin || '') || kindleAsinFromUrl(location.href);
+        const revision = String(info.contentGuid || '');
+        const changed = asin !== kindleState.asin || revision !== kindleState.revision;
+
+        kindleState.asin = asin;
+        kindleState.revision = revision;
+        kindleState.title = String(info.title || '');
+        kindleState.seriesAsin = String(info.seriesAsin || '');
+        kindleState.bookAccessMethod = String(info.bookAccessMethod || '');
+        kindleState.bookContentType = String(info.bookContentType || '');
+        kindleState.isSample = info.isSample === true;
+
+        if (!kindleState.contentTypeFixed) {
+            kindleState.contentType = (kindleState.isSample ||
+                /^SAMPLE$/i.test(kindleState.bookAccessMethod)) ? 'Sample' : 'FullBook';
+        }
+        kindleState.isVerticalScroll = info.isVerticalScroll === true;
+        kindleState.isFreeTrial = /LIMITED_TIME_FREE|FREE_TRIAL/i.test(kindleState.bookAccessMethod);
+        const tok = info.karamelToken;
+        if (tok && typeof tok === 'object') {
+            kindleState.token = String(tok.token || '');
+            kindleState.expiresAt = Number(tok.expiresAt) || 0;
+        }
+
+        if (info.cdnPrefetchInfo) {
+            try {
+                const pf = JSON.parse(info.cdnPrefetchInfo);
+                const base = String((pf.cdn && pf.cdn.baseUrl) || '');
+                const enc = !!(pf.cdn && pf.cdn.isEncrypted);
+                for (const r of (pf.resources || [])) {
+                    if (!r || !r.url) continue;
+                    const auth = kindlePickAuth(r.authParameter, pf.cdn && pf.cdn.authParameter);
+                    if (!auth) continue;
+                    const variant = {
+                        url: String(r.url), authParameter: auth, authSource: 'prefetch',
+                        baseUrl: base, isEncrypted: enc,
+                    };
+                    const existing = kindleState.resources.get(variant.url);
+                    if (existing) {
+                        if (!existing.variants.some(v => v.baseUrl === variant.baseUrl)) {
+                            existing.variants.push(variant);
+                        }
+                        continue;
+                    }
+                    kindleState.resources.set(variant.url, Object.assign({
+                        url: variant.url, type: String(r.type || ''), variants: [variant],
+                    }, variant));
+                }
+            } catch (e) {
+
+                kindleLog('could not read cdnPrefetchInfo: ' + safeLogText(e && e.message));
+            }
+        }
+        if (changed) {
+
+            kindleState.pages.clear();
+            kindleState.resources.clear();
+            kindleState.toc = [];
+            kindleState.expectedPages = 0;
+            kindleState.lastPositionId = 0;
+            kindleState.imageResolution = null;
+            kindleState.nextSkip = 0;
+            kindleState.walkDone = false;
+            kindleState.windowBatch = 0;
+            kindleState.startPosition = 1;
+            kindleState.startMode = 'explicit';
+            kindleState.contentTypeFixed = false;
+            kindleState.probe = { status: 'idle', error: null };
+        }
+        return changed;
+    }
+
+    function kindleAtEnd() {
+        const last = kindleState.lastPositionId;
+        if (!last) return false;
+        for (const page of kindleState.pages.values()) {
+            if (Number(page.endPositionId) >= last) return true;
+        }
+        return false;
+    }
+
+    const KINDLE_TAR_BLOCK = 512;
+
+    function kindleTarString(bytes) {
+        let end = bytes.length;
+        for (let i = 0; i < bytes.length; i++) {
+            if (bytes[i] === 0) { end = i; break; }
+        }
+        let out = '';
+        for (let i = 0; i < end; i++) out += String.fromCharCode(bytes[i]);
+        return out.replace(/\0+$/, '').trim();
+    }
+
+    function kindleTarSize(bytes) {
+        const text = kindleTarString(bytes);
+        if (!text) return 0;
+        const n = parseInt(text, 8);
+        return Number.isFinite(n) && n >= 0 ? n : NaN;
+    }
+
+    function kindleReadTar(buffer) {
+        const all = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer || []);
+        const files = new Map();
+        let offset = 0;
+        let longName = null;
+
+        while (offset + KINDLE_TAR_BLOCK <= all.length) {
+            const header = all.subarray(offset, offset + KINDLE_TAR_BLOCK);
+
+            let blank = true;
+            for (let i = 0; i < KINDLE_TAR_BLOCK; i++) { if (header[i] !== 0) { blank = false; break; } }
+            if (blank) break;
+
+            const size = kindleTarSize(header.subarray(124, 136));
+            if (!Number.isFinite(size)) {
+                throw new Error('the render response is not a tar (bad size field at byte ' + offset + ')');
+            }
+
+            const raw = header[156];
+            const type = (raw === 0) ? '0' : String.fromCharCode(raw);
+            const bodyStart = offset + KINDLE_TAR_BLOCK;
+            const bodyEnd = bodyStart + size;
+            if (bodyEnd > all.length) break;
+
+            let name = kindleTarString(header.subarray(0, 100));
+
+            const prefix = kindleTarString(header.subarray(345, 500));
+            if (prefix) name = prefix + '/' + name;
+            if (longName !== null) { name = longName; longName = null; }
+
+            if (type === 'L') {
+                longName = kindleTarString(all.subarray(bodyStart, bodyEnd));
+            } else if (type === '0') {
+                files.set(String(name).replace(/^\.\//, ''), all.subarray(bodyStart, bodyEnd));
+            }
+
+            offset = bodyStart + Math.ceil(size / KINDLE_TAR_BLOCK) * KINDLE_TAR_BLOCK;
+        }
+
+        if (!files.size) throw new Error('the render response is not a tar (no members)');
+        return files;
+    }
+
+    function kindleTarText(files, name) {
+        const bytes = files.get(name);
+        if (!bytes) return null;
+        try { return new TextDecoder('utf-8').decode(bytes); } catch (e) {}
+        let out = '';
+        for (let i = 0; i < bytes.length; i++) out += String.fromCharCode(bytes[i]);
+        return out;
+    }
+
+    function kindleTarJson(files, name) {
+        const text = kindleTarText(files, name);
+        if (text == null) return null;
+        try { return JSON.parse(text); } catch (e) {
+            kindleLog('unreadable tar member', name, safeLogText(e && e.message));
+            return null;
+        }
+    }
+
+    function kindleTarMemberNames(files, prefix) {
+        const out = [];
+        for (const name of files.keys()) {
+            if (name.indexOf(prefix) === 0 && /\.json$/.test(name)) out.push(name);
+        }
+        return out.sort();
+    }
+
+    const KINDLE_KEY_LENGTH = 40;
+    const KINDLE_KEY_AAD_LENGTH = 9;
+    const KINDLE_SALT_CHARS = 24;
+    const KINDLE_IV_CHARS = KINDLE_SALT_CHARS;
+    const KINDLE_FRAME_CHARS = KINDLE_SALT_CHARS + KINDLE_IV_CHARS;
+
+    function kindleBase64ToBytes(text) {
+        const s = String(text || '');
+        let binary = null;
+        try { binary = atob(s); } catch (e) { binary = null; }
+        if (binary == null) {
+
+            const clean = s.replace(/[^A-Za-z0-9+/=]/g, '');
+            try { binary = atob(clean); } catch (e) { binary = null; }
+        }
+        if (binary == null) throw new Error('the page payload is not valid base64');
+        const out = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) out[i] = binary.charCodeAt(i);
+        return out;
+    }
+
+    function kindleBytesToText(bytes) {
+        try { return new TextDecoder('utf-8').decode(bytes); } catch (e) {}
+        let out = '';
+        for (let i = 0; i < bytes.length; i++) out += String.fromCharCode(bytes[i]);
+        return out;
+    }
+
+    function kindleLooksLikeJpeg(bytes) {
+        return !!bytes && bytes.length > 3 &&
+            bytes[0] === 0xFF && bytes[1] === 0xD8 && bytes[2] === 0xFF;
+    }
+
+    function kindleKeyMaterial() {
+        const token = kindleState.token;
+        if (!token) {
+            throw new Error('the Kindle reader has not published its karamel token yet — ' +
+                'open the volume in the reader and let a page render, then try again');
+        }
+        if (token.length < 100) {
+
+            throw new Error('the Kindle reader published a truncated karamel token (' +
+                token.length + ' characters)');
+        }
+        const offset = Math.abs(Math.trunc(kindleState.expiresAt)) % 60;
+        const key = token.substring(offset, offset + KINDLE_KEY_LENGTH);
+        if (key.length < KINDLE_KEY_LENGTH) {
+            throw new Error('the Kindle karamel token is too short to cut a ' +
+                KINDLE_KEY_LENGTH + '-character key from');
+        }
+        return key;
+    }
+
+    async function kindleAesGcmKey(keyMaterial, salt) {
+        const subtle = (typeof window !== 'undefined' && window.crypto && window.crypto.subtle) ||
+            (typeof crypto !== 'undefined' && crypto.subtle);
+        if (!subtle) {
+            throw new Error('WebCrypto is unavailable on this page, so an encrypted Kindle page cannot be read');
+        }
+        const enc = new TextEncoder();
+        const base = await subtle.importKey('raw', enc.encode(keyMaterial),
+            { name: 'PBKDF2' }, false, ['deriveBits', 'deriveKey']);
+        return subtle.deriveKey(
+            { name: 'PBKDF2', salt: salt, iterations: 1000, hash: 'SHA-256' },
+            base, { name: 'AES-GCM', length: 128 }, false, ['decrypt']);
+    }
+
+    async function kindleDecryptImage(bodyText, keyMaterial) {
+        const text = String(bodyText || '');
+        if (text.length <= KINDLE_FRAME_CHARS) {
+            throw new Error('the encrypted Kindle page is too short to carry salt, iv and payload');
+        }
+        const salt = kindleBase64ToBytes(text.slice(0, KINDLE_SALT_CHARS));
+        const iv = kindleBase64ToBytes(text.slice(KINDLE_SALT_CHARS, KINDLE_FRAME_CHARS));
+        const ciphertext = kindleBase64ToBytes(text.slice(KINDLE_FRAME_CHARS));
+        if (salt.length !== 16 || iv.length !== 16) {
+            throw new Error('the encrypted Kindle page has a malformed salt/iv header (' +
+                salt.length + '/' + iv.length + ' bytes)');
+        }
+        const subtle = (typeof window !== 'undefined' && window.crypto && window.crypto.subtle) ||
+            (typeof crypto !== 'undefined' && crypto.subtle);
+        const enc = new TextEncoder();
+        const key = await kindleAesGcmKey(keyMaterial, salt);
+        const plain = await subtle.decrypt({
+            name: 'AES-GCM',
+            iv: iv,
+            additionalData: enc.encode(keyMaterial.slice(0, KINDLE_KEY_AAD_LENGTH)),
+            tagLength: 128,
+        }, key, ciphertext);
+        return new Uint8Array(plain);
+    }
+
+    function kindleLooksSigned(value) {
+        const s = String(value == null ? '' : value).replace(/^\?/, '');
+        if (!s || s.slice(0, 4).toLowerCase() === 'null') return false;
+        return /(^|&)Signature=/.test(s) && /(^|&)(Policy|Key-Pair-Id)=/.test(s);
+    }
+
+    function kindlePickAuth(resourceAuth, cdnAuth) {
+        if (kindleLooksSigned(resourceAuth)) return String(resourceAuth).replace(/^\?/, '');
+        if (kindleLooksSigned(cdnAuth)) return String(cdnAuth).replace(/^\?/, '');
+        return null;
+    }
+
+    function kindleAuthPolicyResource(authParameter) {
+        const m = /[?&]Policy=([^&]+)/.exec('?' + String(authParameter || ''));
+        if (!m) return null;
+        try {
+            let b64 = decodeURIComponent(m[1]).replace(/-/g, '+').replace(/_/g, '/');
+            b64 += '='.repeat((4 - (b64.length % 4)) % 4);
+            const json = JSON.parse(kindleBytesToText(kindleBase64ToBytes(b64)));
+            const st = json && json.Statement && json.Statement[0];
+            return st && typeof st.Resource === 'string' ? st.Resource : null;
+        } catch (e) {
+            return null;
+        }
+    }
+    function kindleAuthPolicyIsPrefix(authParameter) {
+        const res = kindleAuthPolicyResource(authParameter);
+        return res === null ? null : /\*$/.test(res);
+    }
+
+    function kindleResourceUrl(resource, options) {
+        if (!resource || !resource.url) throw new Error('Kindle resource descriptor is incomplete');
+        const base = String(resource.baseUrl || '').replace(/\/+$/, '');
+        const path = String(resource.url).replace(/^\/+/, '');
+        if (!resource.authParameter) {
+
+            throw new Error('the Kindle manifest carried no CDN signature for ' + path);
+        }
+
+        let url = base + '/' + path + '?' + resource.authParameter;
+        const omitSession = options && 'omitSession' in options
+            ? !!options.omitSession
+            : kindleAuthPolicyIsPrefix(resource.authParameter) === false;
+        const sessionToken = kindleState.token;
+        const sessionExpiry = Number(kindleState.expiresAt) || 0;
+        if (!omitSession && sessionToken) url += '&token=' + encodeURIComponent(sessionToken);
+        if (!omitSession && sessionExpiry) url += '&expiration=' + sessionExpiry;
+        return url;
+    }
+
+    async function kindleDecodeResource(bytes, resource) {
+        const raw = bytes || new Uint8Array(0);
+        if (!raw.length) throw new Error('the Kindle CDN returned an empty page body');
+        if (kindleLooksLikeJpeg(raw)) return raw;
+
+        const text = kindleBytesToText(raw).replace(/\s+/g, '');
+        const claimsEncrypted = !!(resource && resource.isEncrypted);
+
+        const attempts = claimsEncrypted ? ['decrypt', 'base64'] : ['base64', 'decrypt'];
+        const failures = [];
+        for (const how of attempts) {
+            try {
+                const out = how === 'decrypt'
+                    ? await kindleDecryptImage(text, kindleKeyMaterial())
+                    : kindleBase64ToBytes(text);
+                if (kindleLooksLikeJpeg(out)) return out;
+                failures.push(how + ': decoded but not a JPEG');
+            } catch (e) {
+                failures.push(how + ': ' + safeLogText(e && e.message));
+            }
+        }
+        const head = kindleBytesToText(raw.subarray(0, 24)).replace(/[^\x20-\x7e]/g, '.');
+        throw new Error('the Kindle CDN returned something that is not a page image' +
+            ' (isEncrypted=' + claimsEncrypted + ', starts with "' + head + '"; ' +
+            failures.join('; ') + ')');
+    }
+
+    const KINDLE_RENDER_BATCH_MAX = 24;
+    const KINDLE_RENDER_BATCH_MIN = 2;
+
+    const KINDLE_MAX_WINDOWS = 400;
+
+    const KINDLE_FETCH_CONCURRENCY = 12;
+    const KINDLE_FETCH_TIMEOUT = 45000;
+
+    const KINDLE_RETRY_STATUS = [429, 500, 502, 503, 504];
+    const KINDLE_THROTTLE_STATUS = [429, 503];
+    const KINDLE_MAX_FETCH_ATTEMPTS = 5;
+    const KINDLE_BACKOFF_CAP_MS = 8000;
+    const KINDLE_RESTRICTED_STATUS = [401, 403];
+
+    const KINDLE_RENDER_SETTINGS = {
+        version: '3.0',
+        fontFamily: 'Bookerly',
+        fontSize: '4.95',
+        lineHeight: '1.4',
+        dpi: '160',
+        height: '1270',
+        width: '1333',
+        marginBottom: '0',
+        marginLeft: '9',
+        marginRight: '9',
+        marginTop: '0',
+        maxNumberColumns: '2',
+
+        theme: 'default',
+        locationMap: 'true',
+        packageType: 'TAR',
+        encryptionVersion: 'NONE',
+        rasterScale: '2',
+        bundleImages: 'false',
+    };
+
+    function kindleRenderUrl(skipPageCount, numPage) {
+        if (!kindleState.asin) throw new Error('the Kindle volume id is not known yet');
+        if (!kindleState.revision) throw new Error('the Kindle content revision is not known yet');
+        const params = new URLSearchParams();
+        params.set('version', KINDLE_RENDER_SETTINGS.version);
+        params.set('asin', kindleState.asin);
+
+        params.set('contentType', kindleState.contentType || 'FullBook');
+        params.set('revision', kindleState.revision);
+        for (const key of Object.keys(KINDLE_RENDER_SETTINGS)) {
+            if (key === 'version') continue;
+            params.set(key, KINDLE_RENDER_SETTINGS[key]);
+        }
+        params.set('numPage', String(Math.max(1, Number(numPage) || 1)));
+        params.set('skipPageCount', String(Math.max(0, Number(skipPageCount) || 0)));
+        if (kindleState.startMode !== 'default') {
+            params.set('startingPosition', String(kindleState.startPosition || 1));
+        }
+        return location.origin + '/renderer/render?' + params.toString();
+    }
+
+    async function kindleFetchWindow(skipPageCount, numPage) {
+        const url = kindleRenderUrl(skipPageCount, numPage);
+        const attempt = async () => {
+            const res = await fetchWithTimeout(url, {
+                credentials: 'same-origin',
+                headers: {
+                    'Accept': '*/*',
+                    'x-amz-rendering-token': kindleState.token || '',
+                },
+            }, KINDLE_FETCH_TIMEOUT);
+            if (res.ok) return new Uint8Array(await res.arrayBuffer());
+
+            const body = await res.text().catch(() => '');
+            const e = new Error('HTTP ' + res.status + (body ? ' — ' + body.slice(0, 200) : ''));
+            e.status = res.status;
+            e.body = body;
+            throw e;
+        };
+        let bytes;
+        try {
+            bytes = await attempt();
+        } catch (e) {
+
+            if (!e || KINDLE_RESTRICTED_STATUS.indexOf(e.status) === -1) throw e;
+            kindleLog('render refused (' + e.status + '), re-reading the page token');
+            kindleState.probe = { status: 'idle', error: null };
+            kindleApplyBookInfo();
+            if (!kindleState.token) throw e;
+            bytes = await attempt();
+        }
+        return kindleReadTar(bytes);
+    }
+
+    function kindleIngestWindow(files, opts) {
+        const o = opts || {};
+        const skip = Number(o.skipPageCount) || 0;
+        const manifest = kindleTarJson(files, 'manifest.json');
+        const metadata = kindleTarJson(files, 'metadata.json');
+        const locationMap = kindleTarJson(files, 'location_map.json');
+        const toc = kindleTarJson(files, 'toc.json');
+
+        let returned = 0;
+        let added = 0;
+        for (const name of kindleTarMemberNames(files, 'page_data_')) {
+            const list = kindleTarJson(files, name);
+            if (!Array.isArray(list)) continue;
+            for (const page of list) {
+                if (!page || page.sectionId == null) continue;
+                returned++;
+                const key = Number(page.sectionId);
+                page.__kindleSkip = skip;
+                if (!kindleState.pages.has(key)) {
+                    kindleState.pages.set(key, page);
+                    added++;
+                    if (!kindleState.imageResolution) {
+                        const res = kindlePageResolution(page);
+                        if (res) kindleState.imageResolution = res;
+                    }
+                }
+            }
+        }
+
+        if (metadata) {
+            if (Number(metadata.lastPositionId) > 0) {
+                kindleState.lastPositionId = Number(metadata.lastPositionId);
+            }
+            if (metadata.progressionDirection) kindleState.progression = String(metadata.progressionDirection);
+            if (Array.isArray(metadata.authors) && metadata.authors.length) {
+                kindleState.author = String(metadata.authors[0] || '');
+            }
+            if (!kindleState.title && metadata.bookTitle) kindleState.title = String(metadata.bookTitle);
+        }
+        if (locationMap && Array.isArray(locationMap.locations) && locationMap.locations.length) {
+
+            kindleState.expectedPages = locationMap.locations.length - 1;
+        }
+        if (Array.isArray(toc) && toc.length) kindleState.toc = toc;
+
+        if (manifest && manifest.cdn) {
+            const baseUrl = String(manifest.cdn.baseUrl || '');
+            const isEncrypted = manifest.cdn.isEncrypted === true;
+            const cdnAuth = manifest.cdn.authParameter;
+            const list = Array.isArray(manifest.cdnResources) ? manifest.cdnResources : [];
+            for (const resource of list) {
+                if (!resource || !resource.url) continue;
+
+                const auth = kindlePickAuth(resource.authParameter, cdnAuth);
+                const fromResource = kindleLooksSigned(resource.authParameter);
+                const variant = {
+
+                    url: String(resource.url),
+                    authParameter: auth || '',
+                    authSource: auth === null ? 'none' : (fromResource ? 'resource' : 'cdn'),
+                    baseUrl: baseUrl,
+                    isEncrypted: isEncrypted,
+                };
+                const existing = kindleState.resources.get(resource.url);
+                if (existing) {
+
+                    const known = existing.variants.some(v => v.baseUrl === variant.baseUrl);
+                    if (known) {
+                        if (!o.refreshAuth) continue;
+                        const at = existing.variants.findIndex(v => v.baseUrl === variant.baseUrl);
+                        existing.variants[at] = variant;
+                        if (at === 0) Object.assign(existing, variant);
+                        continue;
+                    }
+
+                    if (existing.variants.every(v => v.authSource === 'prefetch')) {
+                        existing.variants.unshift(variant);
+                    } else {
+                        existing.variants.push(variant);
+                    }
+                    continue;
+                }
+                kindleState.resources.set(resource.url, Object.assign({
+                    url: String(resource.url),
+                    type: String(resource.type || ''),
+                    variants: [variant],
+                }, variant));
+            }
+        }
+        return { returned, added };
+    }
+
+    function kindlePageResolution(page) {
+        for (const child of ((page && page.children) || [])) {
+            const rect = child && child.rect;
+            if (!rect) continue;
+            const w = Math.round(Number(rect.right) - Number(rect.left));
+            const h = Math.round(Number(rect.bottom) - Number(rect.top));
+            if (w > 0 && h > 0) return w + ' × ' + h;
+        }
+        return null;
+    }
+
+    function kindleNextBatch() {
+        const size = kindleState.windowBatch || KINDLE_RENDER_BATCH_MAX;
+        return Math.max(KINDLE_RENDER_BATCH_MIN, Math.min(KINDLE_RENDER_BATCH_MAX, size));
+    }
+
+    function kindleNoteWindowSize(requested, returned) {
+        if (returned > 0 && returned < requested) {
+            kindleState.windowBatch = Math.max(KINDLE_RENDER_BATCH_MIN, returned);
+        }
+    }
+
+    async function kindleFetchWindowOrShrink(skipPageCount, startBatch) {
+        let size = Math.max(KINDLE_RENDER_BATCH_MIN, Number(startBatch) || KINDLE_RENDER_BATCH_MIN);
+
+        let flipped = false;
+        for (;;) {
+            try {
+                const files = await kindleFetchWindow(skipPageCount, size);
+                kindleState.windowBatch = size;
+                return { files: files, batch: size };
+            } catch (e) {
+                if (e && e.status === 400 && !flipped &&
+                    /rendering token is not matching/i.test(e.body || '')) {
+                    flipped = true;
+                    kindleState.contentTypeFixed = true;
+                    kindleState.contentType = kindleState.contentType === 'Sample' ? 'FullBook' : 'Sample';
+                    kindleLog('the render token did not match; retrying as contentType=' +
+                        kindleState.contentType);
+                    continue;
+                }
+                if (e && e.status === 400 && size > KINDLE_RENDER_BATCH_MIN) {
+                    const next = Math.max(KINDLE_RENDER_BATCH_MIN, size >> 1);
+                    kindleLog('window of ' + size + ' pages refused (400) at skip=' +
+                        skipPageCount + '; retrying with ' + next);
+                    size = next;
+                    continue;
+                }
+                throw e;
+            }
+        }
+    }
+
+    async function kindleWalkWindows(onStatus) {
+        let batch = kindleNextBatch();
+        let windows = 0;
+        while (!kindleState.walkDone) {
+            if (windows >= KINDLE_MAX_WINDOWS) {
+                kindleLog('window walk hit the cap at skip=' + kindleState.nextSkip);
+                kindleState.walkDone = true;
+                break;
+            }
+            const skip = kindleState.nextSkip;
+            const got = await kindleFetchWindowOrShrink(skip, batch);
+            const { returned } = kindleIngestWindow(got.files, { skipPageCount: skip });
+            windows++;
+            if (!returned) { kindleState.walkDone = true; break; }
+            kindleState.nextSkip += returned;
+            batch = got.batch;
+            kindleNoteWindowSize(batch, returned);
+            batch = kindleNextBatch();
+            if (kindleAtEnd()) { kindleState.walkDone = true; break; }
+            if (onStatus) onStatus(kindleState.nextSkip);
+        }
+        return kindleState;
+    }
+
+    function kindleBuildPageList() {
+        const ordered = [];
+        for (const page of kindleState.pages.values()) ordered.push(page);
+        ordered.sort((a, b) => Number(a.sectionId) - Number(b.sectionId));
+
+        const out = [];
+        for (const page of ordered) {
+            for (const child of (page.children || [])) {
+                const ref = String((child && child.imageReference) || '');
+                if (!ref) continue;
+
+                if (child.type && child.type !== 'image') continue;
+                const resource = kindleState.resources.get(ref) || null;
+
+                let url = null;
+                if (resource) { try { url = kindleResourceUrl(resource); } catch (e) { url = null; } }
+                out.push({
+                    index: out.length + 1,
+                    ref: ref,
+                    resource: resource,
+                    sectionId: Number(page.sectionId),
+
+                    skip: page.__kindleSkip,
+                    url: url,
+                });
+            }
+        }
+        return out;
+    }
+
+    async function kindleDecodeBlob(blob) {
+        if (typeof createImageBitmap === 'function') {
+            try {
+                const bmp = await createImageBitmap(blob);
+                return {
+                    source: bmp, width: bmp.width, height: bmp.height,
+                    cleanup: () => { try { if (bmp.close) bmp.close(); } catch (e) {} },
+                };
+            } catch (e) { }
+        }
+        return new Promise((resolve, reject) => {
+            const objectUrl = URL.createObjectURL(blob);
+            const img = new Image();
+            img.decoding = 'async';
+            img.onload = () => resolve({
+                source: img,
+                width: img.naturalWidth || img.width,
+                height: img.naturalHeight || img.height,
+                cleanup: () => { try { URL.revokeObjectURL(objectUrl); img.src = ''; } catch (e) {} },
+            });
+            img.onerror = e => { try { URL.revokeObjectURL(objectUrl); } catch (_) {} reject(e || new Error('image decode failed')); };
+            img.src = objectUrl;
+        });
+    }
+
+    async function kindleProcessPage(blob) {
+        if (IMAGE_CODEC.ext === 'jpg') return { blob: blob, ext: 'jpg' };
+        let decoded = null;
+        try {
+            decoded = await kindleDecodeBlob(blob);
+            const canvas = document.createElement('canvas');
+            canvas.width = decoded.width;
+            canvas.height = decoded.height;
+            const ctx = canvas.getContext('2d');
+            if (!ctx) throw new Error('no 2D context');
+            ctx.drawImage(decoded.source, 0, 0);
+            const out = await new Promise(resolve => canvas.toBlob(resolve, IMAGE_CODEC.type, IMAGE_CODEC.quality));
+            if (!out) throw new Error('canvas encode produced nothing');
+            return { blob: out, ext: IMAGE_CODEC.ext };
+        } catch (e) {
+            kindleLog('re-encode failed, keeping the original JPEG', safeLogText(e && e.message));
+            return { blob: blob, ext: 'jpg' };
+        } finally {
+            if (decoded && decoded.cleanup) decoded.cleanup();
+        }
+    }
+
+    function kindleThrottleWait() {
+        const wait = (kindleState.throttleUntil || 0) - Date.now();
+        if (wait <= 0) return Promise.resolve();
+        return new Promise(resolve => setTimeout(resolve, wait));
+    }
+    function kindleNoteRefusal(status) {
+        if (KINDLE_THROTTLE_STATUS.indexOf(status) === -1) return;
+
+        kindleState.throttleStrikes = (kindleState.throttleStrikes || 0) + 1;
+        const backoff = Math.min(KINDLE_BACKOFF_CAP_MS, 500 * Math.pow(2, kindleState.throttleStrikes));
+        kindleState.throttleUntil = Date.now() + backoff;
+        kindleLog('the CDN answered ' + status + '; pausing every worker for ' +
+            Math.round(backoff / 100) / 10 + 's (strike ' + kindleState.throttleStrikes + ')');
+    }
+    function kindleNoteSuccess() {
+        if (kindleState.throttleStrikes) kindleState.throttleStrikes = 0;
+        kindleState.throttleUntil = 0;
+    }
+
+    async function kindleFetchBinary(url) {
+        let last = null;
+        for (let attempt = 0; attempt < KINDLE_MAX_FETCH_ATTEMPTS; attempt++) {
+            await waitOutCooldown();
+            await kindleThrottleWait();
+            try {
+                const bytes = await kindleFetchBinaryDirect(url);
+                kindleNoteSuccess();
+                return bytes;
+            } catch (e) {
+                last = e;
+                if (e && KINDLE_RETRY_STATUS.indexOf(e.status) !== -1) {
+
+                    kindleNoteRefusal(e.status);
+                    continue;
+                }
+                if (e && e.status) throw e;
+
+                kindleLog('direct fetch failed, trying the lane pool', safeLogText(e && e.message));
+                try {
+                    const res = await laneFetch(url, KINDLE_FETCH_TIMEOUT,
+                        { allowProxy: proxyCanServe(hostOf(url)) });
+                    if (res && res.ok) {
+                        const bytes = new Uint8Array(await res.arrayBuffer());
+                        recordLane(res._lane, 0, bytes.byteLength);
+                        kindleNoteSuccess();
+                        return bytes;
+                    }
+                    if (res && res.status) {
+                        const le = new Error('HTTP ' + res.status);
+                        le.status = res.status;
+                        last = le;
+                        if (KINDLE_RETRY_STATUS.indexOf(le.status) !== -1) { kindleNoteRefusal(le.status); continue; }
+                        throw le;
+                    }
+                } catch (le) {
+                    if (le && le.status) throw le;
+                }
+            }
+        }
+        throw last || new Error('the Kindle CDN could not be reached for ' + hostOf(url));
+    }
+
+    async function kindleFetchBinaryDirect(url) {
+        const res = await fetchWithTimeout(url, { credentials: 'omit' }, KINDLE_FETCH_TIMEOUT);
+        if (!res.ok) {
+            const e = new Error('HTTP ' + res.status);
+            e.status = res.status;
+            throw e;
+        }
+        const bytes = new Uint8Array(await res.arrayBuffer());
+        if (!bytes.length) {
+
+            throw new Error('the Kindle CDN returned an empty body for ' + hostOf(url));
+        }
+        return bytes;
+    }
+
+    const kindleRefreshInflight = new Map();
+    const kindleRefreshCounts = new Map();
+
+    const KINDLE_MAX_REFRESHES_PER_WINDOW = 2;
+    function kindleRefreshWindow(skipPageCount) {
+        const key = String(skipPageCount);
+        if (kindleRefreshInflight.has(key)) return kindleRefreshInflight.get(key);
+        const used = kindleRefreshCounts.get(key) || 0;
+        if (used >= KINDLE_MAX_REFRESHES_PER_WINDOW) {
+            return Promise.reject(new Error('window ' + key + ' has been re-rendered ' + used +
+                ' times and its pages are still refused — this is not an expired signature'));
+        }
+        kindleRefreshCounts.set(key, used + 1);
+        const run = (async () => {
+            kindleLog('refreshing the CDN signature via a fresh render of window skip=' + skipPageCount);
+            const got = await kindleFetchWindowOrShrink(skipPageCount, kindleNextBatch());
+            kindleIngestWindow(got.files, { skipPageCount: skipPageCount, refreshAuth: true });
+        })().finally(() => kindleRefreshInflight.delete(key));
+        kindleRefreshInflight.set(key, run);
+        return run;
+    }
+
+    function kindleResourceVariants(resource) {
+        if (!resource) return [];
+        const list = Array.isArray(resource.variants) && resource.variants.length
+            ? resource.variants.slice()
+            : [resource];
+        return list.filter(v => v && v.authParameter);
+    }
+
+    function kindleResourceVariants(resource) {
+        if (!resource) return [];
+        const list = Array.isArray(resource.variants) && resource.variants.length
+            ? resource.variants.slice()
+            : [resource];
+        return list.filter(v => v && v.authParameter);
+    }
+
+    async function kindleFetchPage(descriptor) {
+        if (!descriptor.resource) {
+            throw new Error('page ' + descriptor.index + ': the render manifest named no resource for ' + descriptor.ref);
+        }
+        const first = kindleResourceVariants(descriptor.resource);
+        if (!first.length) {
+            throw new Error('page ' + descriptor.index + ': no usable CDN signature for ' + descriptor.ref);
+        }
+
+        let resource = null;
+        let bytes = null;
+        let firstError = null;
+        const tried = new Set();
+
+        const attempt = async variant => {
+            const prefix = kindleAuthPolicyIsPrefix(variant.authParameter);
+            const forms = prefix === false ? [true, false] : [false, true];
+            for (const omitSession of forms) {
+                const url = kindleResourceUrl(variant, { omitSession: omitSession });
+                if (tried.has(url)) continue;
+                tried.add(url);
+                try {
+                    bytes = await kindleFetchBinary(url);
+                    resource = variant;
+                    return true;
+                } catch (e) {
+                    if (!firstError) firstError = e;
+
+                    if (!e || (e.status !== 403 && e.status !== 502)) throw e;
+                    kindleLog('page ' + descriptor.index + ': ' +
+                        (omitSession ? 'without' : 'with') + ' the session token, ' +
+                        hostOf(variant.baseUrl || '') + ' answered ' + e.status +
+                        '; trying the other form');
+                }
+            }
+            return false;
+        };
+
+        const sweep = async variants => {
+            for (const variant of variants) {
+                try {
+                    if (await attempt(variant)) return true;
+                } catch (e) {
+                    if (!firstError) firstError = e;
+                    kindleLog('page ' + descriptor.index + ': ' + hostOf(variant.baseUrl || '') +
+                        ' answered ' + ((e && e.status) || safeLogText(e && e.message)) + '; trying another host');
+                }
+            }
+            return false;
+        };
+
+        await sweep(first);
+
+        if (!bytes && descriptor.skip != null && firstError &&
+            KINDLE_RESTRICTED_STATUS.indexOf(firstError.status) !== -1) {
+            await kindleRefreshWindow(descriptor.skip);
+            await sweep(kindleResourceVariants(kindleState.resources.get(descriptor.ref)));
+        }
+
+        if (!bytes) throw firstError || new Error('page ' + descriptor.index + ': every host refused');
+
+        const entry = kindleState.resources.get(descriptor.ref);
+        if (entry && resource && entry.variants && entry.variants.indexOf(resource) > 0) {
+            entry.variants = entry.variants.filter(v => v !== resource);
+            entry.variants.unshift(resource);
+            Object.assign(entry, resource);
+        }
+
+        const jpeg = await kindleDecodeResource(bytes, resource);
+        return new Blob([jpeg], { type: 'image/jpeg' });
+    }
+
+    function kindleEnsureProbe(force) {
+        if (force && kindleState.probe.status === 'failed') {
+            kindleState.probe = { status: 'idle', error: null };
+        }
+        if (kindleState.probe.status === 'ready') return Promise.resolve(kindleState);
+        if (kindleProbeInflight) return kindleProbeInflight;
+        kindleState.probe.status = 'running';
+        kindleProbeInflight = kindleProbeOnce()
+            .catch(e => {
+                kindleState.probe.status = 'failed';
+                kindleState.probe.error = safeLogText((e && e.message) || e);
+                throw e;
+            })
+            .finally(() => { kindleProbeInflight = null; });
+        return kindleProbeInflight;
+    }
+
+    async function kindleProbeOnce() {
+        kindleApplyBookInfo();
+        if (!kindleState.asin) {
+            throw new Error('this is not a Kindle manga reader page (expected read.amazon.*/manga/<ASIN>)');
+        }
+        if (!kindleState.token) {
+            throw new Error('the Kindle reader has not published its karamel token yet — ' +
+                'open the volume in the reader and let a page render, then try again');
+        }
+        let got = await kindleFetchWindowOrShrink(0, KINDLE_RENDER_BATCH_MAX);
+        let ingested = kindleIngestWindow(got.files, { skipPageCount: 0 });
+        if (!ingested.returned) {
+
+            kindleLog('no pages at startingPosition=' + (kindleState.startPosition || 1) +
+                '; retrying and letting the service pick the book start');
+            kindleState.startMode = 'default';
+            got = await kindleFetchWindowOrShrink(0, KINDLE_RENDER_BATCH_MAX);
+            ingested = kindleIngestWindow(got.files, { skipPageCount: 0 });
+        }
+        const returned = ingested.returned;
+        if (!returned) {
+            throw new Error('the Kindle render service returned no pages for this volume' +
+                ' (try opening a page in the reader first)');
+        }
+        kindleNoteWindowSize(got.batch, returned);
+        kindleState.nextSkip = returned;
+        kindleState.walkDone = !returned || kindleAtEnd();
+        kindleState.probe.status = 'ready';
+        kindleLog('probe: ' + kindleState.pages.size + ' page windows, ' +
+            kindleState.expectedPages + ' page images, ' + kindleState.resources.size + ' resources' +
+            ', window size ' + kindleNextBatch());
+        return kindleState;
+    }
+
+    function kindleRunOutcome(saved, walked) {
+        if (saved > 0) return 'ok';
+        return walked > 0 ? 'all-failed' : 'nothing';
+    }
+
+    async function kindleRun(ui, mode, options) {
+        const runOptions = normalizeRunOptions(options, mode);
+        const runResult = runOptions.automation
+            ? (runOptions.result || newAutomationResult(mode, kindleState.asin || '', runOptions.deferFinalize))
+            : null;
+        if (runResult) {
+            runOptions.result = runResult;
+            runOptions.errors = runResult.errors;
+        }
+
+        let harness = null;
+        try {
+            reportRunProgress(runOptions, 'started', { mode: mode, cid: kindleState.asin || '' });
+            kindleState.running = true;
+            kindleRefreshCounts.clear();
+
+            kindleApplyBookInfo();
+            if (!kindleState.asin) {
+                throw new Error('this is not a Kindle manga reader page — open the volume at ' +
+                    'read.amazon.co.jp/manga/<ASIN> and try again');
+            }
+            reportRunProgress(runOptions, 'state-refresh-ready');
+
+            await kindleEnsureProbe(true);
+
+            const walkState = { status: 'running', error: null };
+            const walkPromise = kindleWalkWindows(skip => {
+                reportRunProgress(runOptions, 'render-window', {
+                    pageCount: kindleState.pages.size, total: kindleState.expectedPages, skip: skip
+                });
+            }).then(() => { walkState.status = 'done'; },
+                e => { walkState.status = 'failed'; walkState.error = e; });
+
+            const descriptors = kindleBuildPageList();
+            const total = kindleState.expectedPages || descriptors.length || kindleState.pages.size;
+            if (!total) {
+                throw new Error('the Kindle render service returned no pages for this volume' +
+                    (kindleState.bookContentType ? ' (content type "' + kindleState.bookContentType + '")' : '') +
+                    ' — this reader shape is not supported yet');
+            }
+
+            const authCounts = { resource: 0, cdn: 0, none: 0 };
+            const hosts = {};
+            for (const r of kindleState.resources.values()) {
+                authCounts[r.authSource || 'none'] = (authCounts[r.authSource || 'none'] || 0) + 1;
+                const h = hostOf(r.baseUrl || '');
+                hosts[h] = (hosts[h] || 0) + 1;
+            }
+            kindleLog('volume ' + kindleState.asin + ': ' + total + ' page images over ' +
+                kindleState.pages.size + ' views (location_map says ' + kindleState.expectedPages + ')' +
+                '; signatures: ' + JSON.stringify(authCounts) +
+                '; hosts: ' + JSON.stringify(hosts));
+
+            const rawTitle = kindleState.title || document.title || '';
+            const title = cleanTitle(rawTitle) || kindleState.asin || 'Kindle volume';
+            const sv = splitSeriesVolume(rawTitle || title);
+            const archiveName = ui.syncArchiveDefault(rawTitle) || zipBaseName(sv, title);
+            if (runResult) {
+                runResult.cid = kindleState.asin || '';
+                runResult.mode = mode;
+                runResult.title = title;
+                reportRunProgress(runOptions, 'book', { title: title, cid: kindleState.asin || '' });
+            }
+
+            harness = createRunHarness(ui, mode, runOptions, {
+                title, archiveName, sv, total, cid: kindleState.asin,
+            });
+            harness.setTotal(total);
+            if (runResult) {
+                runResult.total = total;
+                reportRunProgress(runOptions, 'manifest', { total: total, plaintext: true });
+            }
+
+            if (!runOptions.headless) {
+                renderBookCard(ui.statsEl, {
+                    title: title,
+                    pages: total,
+                    resolution: kindleState.imageResolution || '?',
+                    type: 'Kindle Manga (fixed layout)',
+                });
+                if (sv.series) fetchAndRenderStats(ui.statsEl, sv.series, sv.volNum);
+            }
+            harness.showBars();
+            if (harness.mokuro) await harness.mokuro.open();
+
+            let concurrency = Math.max(1, Math.min(KINDLE_FETCH_CONCURRENCY, total));
+            try {
+                if (typeof window !== 'undefined' && window.__bwddMaxInflight > 0) {
+                    concurrency = Math.max(1, Math.min(concurrency, window.__bwddMaxInflight | 0));
+                }
+            } catch (e) {}
+
+            let nextIndex = 0;
+            const worker = async () => {
+                while (true) {
+
+                    const list = kindleBuildPageList();
+                    if (nextIndex >= list.length) {
+                        if (walkState.status !== 'running') return;
+                        await sleepMs(40);
+                        continue;
+                    }
+                    const descriptor = list[nextIndex++];
+                    try {
+
+                        let cached = null;
+                        if (runOptions.usePageCache && kindleState.asin) {
+                            cached = await getCachedPage(kindleState.asin, descriptor.index);
+                        }
+                        if (cached) {
+                            harness.bumpCached(1);
+                            harness.noteCached(descriptor.index, cached, cachedPageCrc.get(cached));
+                            continue;
+                        }
+                        const blob = await kindleFetchPage(descriptor);
+                        const processed = await kindleProcessPage(blob);
+                        harness.bumpFetched(1);
+                        harness.notePage(descriptor.index, processed.blob, undefined, processed.ext);
+                    } catch (e) {
+                        harness.bumpFetched(1);
+                        harness.noteFailure(descriptor.index, safeLogText((e && e.message) || e));
+                    }
+                }
+            };
+            if (BWDD_DEBUG) {
+                kindleLog('pages=' + total + ' concurrency=' + concurrency +
+                    ' windows=' + kindleState.pages.size + ' resources=' + kindleState.resources.size);
+            }
+            const workers = [];
+            for (let w = 0; w < concurrency; w++) workers.push(worker());
+            await Promise.all(workers);
+
+            await walkPromise;
+            if (walkState.error) throw walkState.error;
+            const walkedPages = kindleBuildPageList().length;
+            if (!walkedPages) {
+                throw new Error('the Kindle render service returned no pages for this volume' +
+                    (kindleState.bookContentType ? ' (content type "' + kindleState.bookContentType + '")' : '') +
+                    ' — this reader shape is not supported yet');
+            }
+
+            if (harness.failedIdx.size && !runOptions.headless) {
+                kindleApplyBookInfo();
+
+                const retry = kindleBuildPageList().filter(d => harness.failedIdx.has(d.index));
+                for (const descriptor of retry) {
+                    try {
+                        const blob = await kindleFetchPage(descriptor);
+                        const processed = await kindleProcessPage(blob);
+                        harness.notePage(descriptor.index, processed.blob, undefined, processed.ext);
+                    } catch (e) { }
+                }
+            }
+
+            const walked = kindleBuildPageList().length;
+            const missing = walked - harness.okIdx.size;
+
+            if (mode === 'ocr' && harness.mokuro) {
+                await harness.mokuro.settle();
+                if (runOptions.deferFinalize) return harness.mokuro.deferred();
+                const fin = await harness.mokuro.finalize();
+                harness.markFinished();
+                return harness.outcome(fin.ok);
+            }
+            if (mode === 'ocr' && !harness.mokuro) {
+                throw new Error('Mokuro OCR is unavailable for this run');
+            }
+            if (kindleRunOutcome(harness.okIdx.size, walked) !== 'ok') {
+                kindleLog('every page failed (' + walked + ' attempted, 0 saved) — reporting a failed run');
+                setRunDetails(harness.details, msgAllFailedZip(), harness.errors);
+                return harness.outcome(false);
+            }
+            return await harness.finishZip();
+        } catch (e) {
+            const reported = harness ? harness.reportFailure(e) : null;
+            if (reported) throw reported;
+            throw e;
+        } finally {
+            kindleState.running = false;
+            if (harness) await harness.cleanup();
+        }
+    }
+
+    registerSite({
+        id: 'kindle',
+        label: 'Kindle',
+        panelTitle: 'Kindle Native Downloader',
+        ownsHost() {
+            try { return KINDLE_READER_HOST_RE.test(location.hostname); } catch (e) { return false; }
+        },
+        matches() {
+
+            try {
+                return kindleIsMangaPage(location.href);
+            } catch (e) { return false; }
+        },
+        install() {
+
+            if (!kindleState.asin) kindleState.asin = kindleAsinFromUrl(location.href);
+        },
+
+        refresh() {
+            const changed = kindleApplyBookInfo();
+            if (changed) kindleState.probe = { status: 'idle', error: null };
+            if (kindleState.probe.status === 'idle' && kindleState.asin && kindleState.token) {
+                kindleEnsureProbe(false).catch(e => {
+                    kindleLog('probe failed', safeLogText((e && e.message) || e));
+                });
+            }
+            return Promise.resolve();
+        },
+        getBook() {
+            if (!kindleState.title && !kindleState.asin) return null;
+            const rawTitle = kindleState.title || document.title || '';
+            const title = cleanTitle(rawTitle) || kindleState.asin || '';
+            const sv = splitSeriesVolume(rawTitle || title);
+            return { rawTitle: rawTitle, title: title, series: sv.series, volNum: sv.volNum };
+        },
+        getPreview() {
+            if (!kindleState.pages.size) return null;
+
+            const pages = kindleState.expectedPages || kindleBuildPageList().length;
+            if (!pages) return null;
+            return {
+                title: cleanTitle(kindleState.title) || kindleState.asin || 'Kindle volume',
+                pages: pages,
+                resolution: kindleState.imageResolution || '?',
+                type: 'Kindle Manga (fixed layout)',
+            };
+        },
+        getCid() { return kindleState.asin || ''; },
+        archiveDefault(rawTitle) {
+            return archiveDefaultName(rawTitle) || fsSafePath(kindleState.asin || '');
+        },
+        run(ui, mode, options) { return kindleRun(ui, mode, options); },
+        state: kindleState,
+        debug: {
+            kindleState,
+            kindleReadTar, kindleIngestWindow, kindleBuildPageList, kindleRenderUrl,
+            kindleFetchWindow, kindleWalkWindows, kindleProbeOnce, kindleEnsureProbe,
+            kindleFetchPage, kindleFetchBinary, kindleProcessPage,
+            kindleKeyMaterial, kindleDecryptImage, kindleDecodeResource, kindleResourceUrl,
+            kindlePickAuth, kindleLooksSigned, kindleRefreshWindow, kindleAtEnd,
+            kindleAuthPolicyResource, kindleAuthPolicyIsPrefix, kindleRunOutcome,
+        },
+        debugGlobals: { __bwddKindle: kindleState },
+    });
+
     const BWDD_SITE = detectSite();
     ACTIVE_SITE = BWDD_SITE;
-    if (BWDD_SITE && typeof BWDD_SITE.install === 'function') {
-        try { BWDD_SITE.install(); } catch (e) {}
+    if (BWDD_SITE) {
+        if (typeof BWDD_SITE.install === 'function') {
+            try { BWDD_SITE.install(); } catch (e) {}
+        }
+
+        installHeadlessAutomation();
+
+        try {
+            if (typeof probeFetchProxy === 'function' && !isHeadlessPage()) {
+                const refreshPorts = () => { try { probeFetchProxy().catch(() => {}); } catch (e) {} };
+                refreshPorts();
+                if (typeof setBackgroundInterval === 'function') setBackgroundInterval(refreshPorts, 30000);
+            }
+        } catch (e) {}
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', () => bootSharedPanel(BWDD_SITE));
+        } else {
+            bootSharedPanel(BWDD_SITE);
+        }
     }
 
-    // Install the page API before DOMContentLoaded so a CLI can call start()
-    // as soon as the userscript has been injected.
-    installHeadlessAutomation();
-    if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', () => bootSharedPanel(BWDD_SITE));
-    } else {
-        bootSharedPanel(BWDD_SITE);
-    }
-
-    if (BWDD_DEBUG && !isHeadlessPage()) {
+    if (BWDD_SITE && BWDD_DEBUG && !isHeadlessPage()) {
         try {
             const dbg = {
                 cleanTitle, splitSeriesVolume, fsSafePath, zipBaseName, crc32Bytes, buildStoreZip,
                 get imageCodec() { return IMAGE_CODEC; }, resolveImageCodec,
-                // transport lanes: exposed for the lane/burst test harness
-                allLanes, fetchSocketBudget, laneStats, laneSummary, recordLane, dedupeInflight,
+
+                allLanes, fetchSocketBudget, rawSocketBudget, laneStats, laneSummary, recordLane, dedupeInflight,
+                addProxyPorts, clearProxySource,
+                CHROMIUM_SOCKETS_PER_PROCESS, CONTROL_PLANE_SOCKET_RESERVE, MAX_DATA_PLANE_SOCKETS,
                 probeFetchProxy, probeDotLane, probeEdgeMirror, discoverProxyPorts,
                 setProxyUpstreams, proxyCanServe,
                 dottedUrl, edgeUrlFor, proxyPorts, laneFetch, capabilitySummary, workerPoolSize, workerBatchSize, makePool,
+                proxyLaneFetch, proxyLaneAvailable,
+                canSpawnBlobWorker, clearPageCache,
+
+                setBackgroundInterval, clearBackgroundInterval, backgroundDelay, yieldToTasks,
+
+                mokuroClient: {
+                    bridgeUrl: MOKURO_BRIDGE_URL,
+                    startSession: mokuroStartSession,
+                    streamPage: mokuroStreamPage,
+                    uploadCover: mokuroUploadCover,
+                    status: mokuroStatus,
+                    finalize: mokuroFinalize,
+                    uploadPlan: mokuroUploadPlan,
+                    readerJumpUrl,
+                    makeNdjsonSink,
+                    readNdjsonText,
+                    readNdjsonStream,
+                },
                 get gmUsable() { return gmUsable; },
+                get proxyRealmBlocked() { return proxyRealmBlocked; },
+                resetProxyRealmFlag,
             };
-            // Whatever the active store wants on the console, so this file never
-            // names one of them.
+
             Object.assign(dbg, (BWDD_SITE && BWDD_SITE.debug) || {});
-            window.__bwdd = dbg;
+            debugRealm().__bwdd = dbg;
         } catch (e) {}
-        try { window.__bwddUI = Object.assign(window.__bwddUI || {}, { renderStatsCards, renderBookCard, renderNativelyCard, renderMangaKotobaCard, setBar, showBars }); } catch (e) {}
-        // The active adapter, for the site-adapter tests.
-        try { window.__bwddSite = BWDD_SITE; } catch (e) {}
+        try {
+            debugRealm().__bwddUI = Object.assign(debugRealm().__bwddUI || {},
+                { renderStatsCards, renderBookCard, renderNativelyCard, renderMangaKotobaCard, setBar, showBars });
+        } catch (e) {}
+
+        try { debugRealm().__bwddSite = BWDD_SITE; } catch (e) {}
         for (const k in ((BWDD_SITE && BWDD_SITE.debugGlobals) || {})) {
-            try { window[k] = BWDD_SITE.debugGlobals[k]; } catch (e) {}
+            try { debugRealm()[k] = BWDD_SITE.debugGlobals[k]; } catch (e) {}
+
+            try { window[k] = debugRealm()[k]; } catch (e) {}
         }
     }
+
 })();

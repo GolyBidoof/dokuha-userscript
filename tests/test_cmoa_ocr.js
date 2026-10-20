@@ -36,7 +36,7 @@ const fs = require('fs');
 const path = require('path');
 
 const CHROME = process.env.PUPPETEER_EXECUTABLE_PATH || undefined;
-const US = path.resolve(__dirname, '..', process.env.BWDD_US || 'omnimanga-native-downloader.user.js');
+const US = path.resolve(__dirname, '..', process.env.BWDD_US || 'dokuha-userscript.user.js');
 
 const CID = '0000249510_jp_0001';
 // The viewer renames document.title to its own label once it boots, and the
@@ -45,8 +45,8 @@ const CID = '0000249510_jp_0001';
 // can be trusted. These two deliberately disagree: the test can then prove the
 // adapter used the API rather than the scraped DOM.
 const VIEWER_LABEL = 'BinB Speed Reader';
-const MESSY_TITLE = '無料・試し読みページ スーパーの裏でヤニ吸うふたり 2巻（ビッグガンガンコミックス） ｜ 地主 ｜ 漫画（マンガ）・電子書籍のコミックシーモア';
-const API_TITLE = 'スーパーの裏でヤニ吸うふたり 1巻';
+const MESSY_TITLE = '無料・試し読みページ サンプル店舗作品 2巻（サンプルコミックス） ｜ サンプル作者 ｜ 漫画（マンガ）・電子書籍のコミックシーモア';
+const API_TITLE = 'サンプル店舗作品 1巻';
 const ARCHIVE = API_TITLE;
 
 const SIZE = 240;
@@ -163,7 +163,6 @@ function startFakeProxy(scrambledBySrc) {
     });
 }
 
-// ---------------------------------------------------------------- stub bridge
 function startBridge(advertisePorts, advertiseUpstreams) {
     const log = { started: null, pages: [], cover: null, finalized: false, status: 0, health: 0 };
     const server = http.createServer((req, res) => {
@@ -255,7 +254,6 @@ function startBridge(advertisePorts, advertiseUpstreams) {
     });
 }
 
-// ------------------------------------------------------------- app server
 const VIEWER_SETUP = `
 window.__fakeReader = {
   cid: ${JSON.stringify(CID)},
@@ -444,7 +442,6 @@ function startApp(pageSrcs, scrambledBySrc, state) {
             finalized: bridge.log.finalized, status: bridge.log.status,
         }));
 
-        // ---- the bridge conversation ----
         check('the run opens a bridge session with the shared archive name',
             !!bridge.log.started && bridge.log.started.title === ARCHIVE,
             'session title=' + JSON.stringify(bridge.log.started && bridge.log.started.title));
@@ -474,7 +471,6 @@ function startApp(pageSrcs, scrambledBySrc, state) {
         check('the panel discovers the bridge before the run',
             bridge.log.health > 0, bridge.log.health + ' /health probes');
 
-        // ---- the bytes the bridge received are descrambled ----
         const first = bridge.log.pages[0];
         if (first && first.bytes) {
             const r = await checkTilePositions(first.bytes, 0);
@@ -496,7 +492,6 @@ function startApp(pageSrcs, scrambledBySrc, state) {
             check('the early cover is the reassembled first page', false, 'no cover bytes');
         }
 
-        // ---- transport lanes ----
         const lanes = await page.evaluate(() => {
             const L = window.__bwdd.allLanes();
             return { kinds: L.map(l => l.kind), names: L.map(l => l.name) };
@@ -528,7 +523,6 @@ function startApp(pageSrcs, scrambledBySrc, state) {
             'generic=' + hostRule.before + ' cmoa-on-bw-bridge=' + hostRule.cмоaAfter +
             ' bw-on-bw-bridge=' + hostRule.bwAfter);
 
-        // ---- and the result lands back in the panel ----
         check('the panel reports where the volume was stored',
             !!panel.details && /tmp\/out|stored|uploaded/i.test(panel.details),
             JSON.stringify((panel.details || '').slice(0, 120)));

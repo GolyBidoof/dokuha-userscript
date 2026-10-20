@@ -165,7 +165,11 @@
                     sessionId: mokuroSessionId || null, safeTitle: runSafeTitle, total: total
                 });
                 if (runOptions.pollBridgeStatus) {
-                    ocrPoll = setInterval(async () => {
+                    // setBackgroundInterval: the Mokuro bar is the one bar fed
+                    // only by a poll, so a hidden tab (timers clamped to 1/s,
+                    // and to ~1/min after five minutes) starves it while the
+                    // bridge keeps working at full speed.
+                    ocrPoll = setBackgroundInterval(async () => {
                         const st = await mokuroStatus(mokuroSessionId);
                         if (!st) return;
                         const done = st.pages_ocr_done ?? 0;
@@ -176,7 +180,7 @@
                         });
                     }, 700);
                     registerRunCleanup(() => {
-                        if (ocrPoll) { clearInterval(ocrPoll); ocrPoll = null; }
+                        if (ocrPoll) { clearBackgroundInterval(ocrPoll); ocrPoll = null; }
                     });
                 }
             }
@@ -206,7 +210,7 @@
             startAuthTimers();
             registerRunCleanup(() => {
                 stopAuthTimers();
-                if (ocrPoll) { clearInterval(ocrPoll); ocrPoll = null; }
+                if (ocrPoll) { clearBackgroundInterval(ocrPoll); ocrPoll = null; }
                 if (pool) pool.terminate();
             });
 
@@ -637,7 +641,7 @@
                     }
                     catch (e) { errors.push('Final OCR send page ' + i + ': ' + safeLogText((e && e.message) || e)); }
                 }
-                if (ocrPoll) { clearInterval(ocrPoll); ocrPoll = null; }
+                if (ocrPoll) { clearBackgroundInterval(ocrPoll); ocrPoll = null; }
                 const missingOcr = total - okIdx.size;
                 if (runOptions.deferFinalize) {
                     // Return only after every descrambled page POST has settled;
@@ -655,6 +659,11 @@
                 }
                 barMokuro.wrap.style.display = 'flex';
                 const { result, plan } = await finalizeOcrSession(mokuroSessionId, ui, barUpload, barMokuro, total, runUploadFeed, runOptions);
+                // done with status=partial_upload: the volume files are there but
+                // the series index is not, so this run is not a clean success.
+                const partialUpload = !!(result && result.partialUpload);
+                const partialMsg = partialUpload ? msgPartialUpload(result) : '';
+                if (partialUpload) errors.push(partialMsg);
                 const secs = ((performance.now() - t0) / 1000).toFixed(1);
                 if (failedIdx.size === 0 && errors.length === 0) finishedOk = true;
                 barMokuro.fill.style.width = '100%';
@@ -664,14 +673,16 @@
                         msgOcrPartial(missingOcr, total),
                         errors);
                 } else {
-                    if (!runOptions.headless && plan && plan.method === 'local') {
+                    if (!runOptions.headless && partialUpload) {
+                        setRunDetails(details, partialMsg, errors);
+                    } else if (!runOptions.headless && plan && plan.method === 'local') {
                         const localPath = storedPathOf(result) || plan.localDir;
                         if (localPath) details.textContent = msgStoredLocal(localPath);
                     } else if (!runOptions.headless && plan && plan.method) {
                         const rp = result && (result.remote_path || result.mega_path);
                         if (rp) details.textContent = msgUploadedTo(methodShortLabel(plan.method), rp);
                     }
-                    if (!runOptions.headless && errors.length) appendRunDetails(details, errors, 'Issues during the run');
+                    if (!runOptions.headless && !partialUpload && errors.length) appendRunDetails(details, errors, 'Issues during the run');
                 }
                 if (runResult) {
                     runResult.pageCount = okIdx.size;

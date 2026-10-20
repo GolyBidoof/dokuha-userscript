@@ -1,6 +1,3 @@
-    // =====================================================================
-    // CMOA site adapter — metadata
-    // =====================================================================
     // CMOA (コミックシーモア) serves its "speed reader" from a per-volume CDN
     // (binb-cmoa.akamaized.net) as individually scrambled JPEG tiles. The page
     // list lives on viewer.content.page, and the viewer's reader exposes
@@ -48,6 +45,20 @@
         reader: null,
         viewer: null,
         qualityBlacklist: new Set(),
+        // Quality rungs this run has actually seen answer with a 200. A 403 on
+        // one of these is evidence about the *token*; a 403 on a rung that has
+        // only ever been refused is evidence about the *rung*, and evicting a
+        // working token for it would push the rest of the volume onto the
+        // token-less path.
+        winningRungs: new Set(),
+        // The viewer-free path: the scramble tables bibGetCntntInfo ships, the
+        // `k` they were encoded with, and whether that path has been tried yet.
+        // A frame that never gets a viewer still knows exactly how to unshuffle
+        // the pages, which is how a series worker descrambles.
+        scrambleTables: null,
+        scrambleKey: null,
+        protocolTried: false,
+        protocolError: null,
     };
 
     // The viewer's globals (SpeedBinb, its reader) live on the page window. A
@@ -67,7 +78,6 @@
         try { console.log.apply(console, ['[bwdd/cmoa]'].concat([].slice.call(arguments))); } catch (e) {}
     }
 
-    // --- token pool -------------------------------------------------------
     // CMOA signs image requests with a short-lived `p` token that the viewer
     // mints as the reader pages through the volume. Keeping every token seen
     // and retrying the next on a 403 is what makes a long download survive a
@@ -95,17 +105,38 @@
         }
     }
 
-    // --- parameter ingestion ---------------------------------------------
     // Every URL the viewer touches (page URL, data-ptbinb, its API calls)
     // carries a slice of the session; merge them all in, first writer wins for
     // the identity fields.
+    // CMOA spells the same volume two ways: the speed reader uses
+    // `0000214822_jp_0001`, the browser-viewer link uses the numeric
+    // `100002148220001` (`1` + ten-digit title id + four-digit volume).
+    // bibGetCntntInfo accepts only the first - the numeric form answers
+    // `result: -100` with an empty item - so a numeric id is translated before
+    // it is ever used as a cid. A series row link carries exactly that numeric
+    // form, which is how a perfectly readable volume came back as an error page.
+    const CMOA_CID_RE = /^([0-9]{10})_jp_([0-9]{4})$/;
+    const CMOA_CONTENT_ID_RE = /^1([0-9]{10})([0-9]{4})$/;
+    function cmoaNormalizeCid(value) {
+        const raw = String(value == null ? '' : value).trim();
+        if (!raw) return '';
+        if (CMOA_CID_RE.test(raw)) return raw;
+        const m = CMOA_CONTENT_ID_RE.exec(raw);
+        if (m) return m[1] + '_jp_' + m[2];
+        return raw;
+    }
+
     function cmoaAssignParam(key, rawValue, force) {
         if (rawValue == null) return;
         const value = typeof rawValue === 'string' ? rawValue.trim() : String(rawValue);
         if (!value) return;
         const lower = key.toLowerCase();
         const shouldSet = current => force || current == null || current === '';
-        if (lower === 'cid') { if (shouldSet(cmoaState.cid)) cmoaState.cid = value; return; }
+        if (lower === 'cid' || lower === 'content_id') {
+            const cid = cmoaNormalizeCid(value);
+            if (shouldSet(cmoaState.cid)) cmoaState.cid = cid;
+            return;
+        }
         if (lower === 'contentsserver' || lower === 'sbcurl') {
             if (shouldSet(cmoaState.contentsServer)) cmoaState.contentsServer = value.replace(/\/$/, '');
             return;
@@ -133,7 +164,7 @@
             cmoaApplySearchParams(new URLSearchParams(location.search || ''));
             if (!cmoaState.cid) {
                 const m = location.href.match(/[?&]cid=([^&#]+)/);
-                if (m) cmoaState.cid = decodeURIComponent(m[1]);
+                if (m) cmoaState.cid = cmoaNormalizeCid(decodeURIComponent(m[1]));
             }
         } catch (e) {}
     }
@@ -152,7 +183,7 @@
             }
         }
         const cidAttr = node.getAttribute('data-ptbinb-cid');
-        if (cidAttr && !cmoaState.cid) cmoaState.cid = cidAttr;
+        if (cidAttr && !cmoaState.cid) cmoaState.cid = cmoaNormalizeCid(cidAttr);
     }
 
     // The viewer's performance timeline still holds the signed URLs it used,
@@ -187,7 +218,6 @@
         }
     }
 
-    // --- viewer access ----------------------------------------------------
     function cmoaGetViewer() {
         try {
             const w = cmoaPageWindow();
@@ -271,7 +301,49 @@
         return pages;
     }
 
-    // --- content info -----------------------------------------------------
+    // What the frame's viewer actually exposes, for the one failure that cannot
+    // be diagnosed from here: a viewer with a page list but no descrambler. The
+    // viewer runs in its own frame, and whether SpeedBinb exists, what
+    // `viewer.reader` is, and which reader-ish keys the viewer has is the
+    // difference between "the frame is on the wrong page" and "the viewer
+    // initialised without its scrambler".
+    function cmoaViewerCapabilities() {
+        const out = { href: '' };
+        try { out.href = location.pathname; } catch (e) {}
+        const w = cmoaPageWindow();
+        try { out.speedbinb = !!(w.SpeedBinb && typeof w.SpeedBinb.getInstance === 'function'); } catch (e) { out.speedbinb = 'throws'; }
+        const viewer = cmoaState.viewer || cmoaGetViewer();
+        out.viewer = !!viewer;
+        if (viewer) {
+            const direct = cmoaSafe(() => viewer.reader);
+            out.reader = (direct === null || direct === undefined) ? String(direct)
+                : (cmoaIsReader(direct) ? 'scrambler' : typeof direct);
+            try { out.pageCount = (viewer.content && viewer.content.page && viewer.content.page.length) || 0; } catch (e) {}
+            try {
+                out.keys = Object.keys(viewer).filter(k => /read|scram|binb|content/i.test(k)).slice(0, 10);
+            } catch (e) { out.keys = 'unreadable'; }
+        }
+        out.stateReader = !!cmoaState.reader;
+        out.frames = (function () {
+            try { return window.top === window.self ? 'top' : 'frame'; } catch (e) { return 'cross-origin'; }
+        })();
+        return out;
+    }
+
+    // The tables are encoded against `cid + ':' + k`, so both halves have to come
+    // from the request that produced the response. CMOA accepts two spellings of
+    // the same volume (`0000214822_jp_0001` and `100002148220001`), and a response
+    // fetched with one cannot be decoded with the other.
+    function cmoaScrambleParamsFromUrl(url) {
+        try {
+            const params = new URL(String(url), location.href).searchParams;
+            const k = params.get('k');
+            if (!k) return null;
+            const cid = params.get('cid') || params.get('content_id') || cmoaState.cid;
+            return cid ? { cid: cid, key: k } : null;
+        } catch (e) { return null; }
+    }
+
     // The viewer only keeps items[0].Title, the store's SEO page title
     // ("無料・試し読みページ … ｜ author ｜ 漫画…"). The API also returns a clean
     // SubTitle ("… 1巻"), so re-issuing the viewer's own request gives the
@@ -286,10 +358,20 @@
             encodeURIComponent(cmoaState.cid) + '&dmytime=' + Date.now() + '&u0=' + encodeURIComponent(u0);
     }
 
-    function cmoaIngestContentInfo(payload, sourceUrl) {
+    function cmoaIngestContentInfo(payload, sourceUrl, scrambleKey, scrambleCid) {
         let data = payload;
         if (typeof payload === 'string') {
             try { data = JSON.parse(payload); } catch (e) { data = null; }
+        }
+        if (data && typeof data === 'object' && data.result != null) {
+            // `result: -100` is the store refusing the request outright (an
+            // unknown cid spelling, or a missing token). Recorded so the failure
+            // can name it instead of reporting an empty volume.
+            cmoaState.contentResult = Number(data.result);
+            if (Number(data.result) !== 1) {
+                console.warn('[bwdd/cmoa] bibGetCntntInfo refused the request (result=' +
+                    data.result + (data.eurl ? ', ' + data.eurl : '') + ') for ' + sourceUrl);
+            }
         }
         if (data && typeof data === 'object' && Array.isArray(data.items) && data.items.length) {
             const item = data.items[0] || {};
@@ -297,6 +379,25 @@
                 cmoaState.contentsServer = String(item.ContentsServer).replace(/\/$/, '');
             }
             if (item.p) cmoaRememberToken(item.p, { force: !cmoaState.lastGoodToken });
+            // The scramble geometry travels with this same response. Decoding is
+            // keyed on the `k` the request was made with, so a response fetched
+            // without one (or with a key we did not keep) cannot be used.
+            // Only ever decode with the `cid` and `k` that produced *this*
+            // response. A content-info call made without one (or with a different
+            // one) returns tables encoded against that other pair, and decoding
+            // them with the protocol's yields plausible-looking garbage that then
+            // blocks the real decode.
+            const fromUrl = cmoaScrambleParamsFromUrl(sourceUrl);
+            const decodeCid = scrambleCid || (fromUrl && fromUrl.cid);
+            const key = scrambleKey || (fromUrl && fromUrl.key);
+            if (decodeCid && key && !cmoaState.scrambleTables) {
+                const tables = cmoaDecodeTables(decodeCid, key, item);
+                if (tables && (Array.isArray(tables.ctbl) || Array.isArray(tables.ptbl))) {
+                    cmoaState.scrambleTables = tables;
+                    cmoaState.scrambleKey = key;
+                    cmoaLog('scramble tables recovered', Object.keys(tables).join(','));
+                }
+            }
             if (item.ViewMode != null && cmoaState.viewMode == null) cmoaState.viewMode = String(item.ViewMode);
             if (item.ContentDate && !cmoaState.dmytime) cmoaState.dmytime = String(item.ContentDate);
             // Prefer the clean product title the store itself uses for the
@@ -339,7 +440,7 @@
         if (!s) return '';
         s = s.split('｜')[0].trim();
         s = s.replace(/^(?:無料[・･]?)?(?:試し読み|立ち読み)(?:ページ)?\s*/, '').trim();
-        // A trailing imprint group ("（ビッグガンガンコミックス）") belongs to the
+        // A trailing imprint group ("（サンプルコミックス）") belongs to the
         // publisher, not the series, and would derail the manga-kotoba search.
         const m = s.match(/^(.*?[0-9０-９]{1,3}\s*[巻話])\s*[（(][^）)]*[）)]\s*$/);
         if (m && m[1]) s = m[1].trim();
@@ -363,12 +464,138 @@
         return document.title || '';
     }
 
-    // --- readiness --------------------------------------------------------
+    function cmoaProtocolTarget() {
+        const candidates = [];
+        candidates.push(location.href);
+        for (const cand of candidates) {
+            if (!cand) continue;
+            try {
+                const u = new URL(String(cand), location.href);
+                const cid = u.searchParams.get('cid') || u.searchParams.get('content_id');
+                if (cid) return { cid: cmoaNormalizeCid(cid), params: u.searchParams };
+                // /reader/sample/... carries the volume in the path on some builds.
+                const m = /\/([0-9]{10}_jp_[0-9]{4})\b/.exec(u.pathname);
+                if (m) return { cid: cmoaNormalizeCid(m[1]), params: u.searchParams };
+            } catch (e) {}
+        }
+        return cmoaState.cid
+            ? { cid: cmoaNormalizeCid(cmoaState.cid), params: new URLSearchParams() }
+            : null;
+    }
+
+    // Fetch the volume the way the reader would, without the reader: a locally
+    // generated `k`, the content-info response (which carries the scramble
+    // tables), then the ttx page list. Anything the viewer would have supplied is
+    // supplied here instead, so a frame with no viewer is still a full downloader.
+    async function cmoaFetchProtocolState() {
+        if (cmoaState.protocolTried) return false;
+        cmoaState.protocolTried = true;
+        const target = cmoaProtocolTarget();
+        if (!target || !target.cid) {
+            cmoaState.protocolError = 'no content ID for the viewer-free path';
+            return false;
+        }
+        const cid = target.cid;
+        cmoaState.cid = cmoaState.cid || cid;
+        const k = cmoaGenerateK(cid);
+        cmoaState.scrambleKey = k;
+        // The API wants the same shape of request the viewer makes: the viewer
+        // always sends u0, and it forwards whatever else its own URL carried
+        // (u1, ...). A request without u0 is answered `result: -100`.
+        const forwarded = new URLSearchParams();
+        try {
+            target.params.forEach(function (value, key) {
+                const lower = String(key).toLowerCase();
+                // The identifiers are re-sent as `cid`, and the rest of a
+                // product-page link (title_id, content_id) means nothing to the
+                // API - and a stray content_id can only confuse it.
+                if (lower === 'cid' || lower === 'content_id' || lower === 'title_id' ||
+                    lower === 'k' || lower === 'dmytime' || lower === 'rurl') return;
+                forwarded.set(key, value);
+            });
+        } catch (e) {}
+        if (!forwarded.has('u0')) forwarded.set('u0', String(cmoaState.u0 || '1'));
+        const applyForwarded = url => {
+            forwarded.forEach(function (value, key) { url.searchParams.set(key, value); });
+            return url;
+        };
+        try {
+            const info = new URL('https://www.cmoa.jp/bib/sws/bibGetCntntInfo.php');
+            info.searchParams.set('cid', cid);
+            info.searchParams.set('dmytime', String(Date.now()));
+            info.searchParams.set('k', k);
+            applyForwarded(info);
+            const infoRes = await fetchWithTimeout(info.toString(), {
+                headers: { 'Accept': 'application/json, text/javascript, */*; q=0.01' },
+                credentials: 'include',
+            }, 15000);
+            if (!infoRes || !infoRes.ok) throw new Error('content info HTTP ' + (infoRes && infoRes.status));
+            const infoText = await infoRes.text();
+            cmoaIngestContentInfo(infoText, info.toString(), k, cid);
+            if (!cmoaState.contentsServer || cmoaState.contentResult === -100) {
+                throw new Error('bibGetCntntInfo refused this volume (result=' +
+                    (cmoaState.contentResult != null ? cmoaState.contentResult : 'none') + ') for ' + cid);
+            }
+            const token = cmoaState.token;
+            const viewMode = cmoaState.viewMode != null ? cmoaState.viewMode : '2';
+            const dmytime = cmoaState.dmytime || String(Date.now());
+            const list = new URL('sbcGetCntnt.php', cmoaState.contentsServer + '/');
+            list.searchParams.set('cid', cid);
+            if (token) list.searchParams.set('p', token);
+            list.searchParams.set('vm', viewMode);
+            list.searchParams.set('dmytime', dmytime);
+            applyForwarded(list);
+            // The page list comes from the CDN, which is a different origin: like
+            // every other CDN call here it is fetched without credentials, or the
+            // wildcard CORS header the CDN sends is refused outright.
+            const listRes = await fetchWithTimeout(list.toString(), { credentials: 'omit' }, 15000);
+            if (!listRes || !listRes.ok) throw new Error('page list HTTP ' + (listRes && listRes.status));
+            const payload = await listRes.text();
+            let doc = payload;
+            try {
+                const parsed = JSON.parse(payload);
+                // A refusal arrives as HTTP 200 with a result code; without this
+                // it reads as an empty volume rather than a rejected request.
+                if (parsed && parsed.result != null && Number(parsed.result) !== 1) {
+                    throw new Error('sbcGetCntnt returned result=' + parsed.result);
+                }
+                doc = parsed && parsed.ttx ? parsed.ttx : payload;
+            } catch (e) {
+                if (e && /sbcGetCntnt returned result/.test(e.message || '')) throw e;
+            }
+            const pages = cmoaParsePageList(doc);
+            if (!pages.length) throw new Error('the page list came back empty');
+            cmoaState.pages = pages.map(function (page, index) {
+                return {
+                    index: index,
+                    src: page.src,
+                    id: page.id || ('page_' + (index + 1)),
+                    width: page.width,
+                    height: page.height,
+                    spread: page.spread,
+                    image: { src: page.src, id: page.id || '', orgwidth: page.width, orgheight: page.height },
+                };
+            });
+            cmoaLog('viewer-free page list', cmoaState.pages.length, 'pages');
+            return true;
+        } catch (e) {
+            cmoaState.protocolError = safeLogText((e && e.message) || e);
+            cmoaLog('viewer-free state failed', cmoaState.protocolError);
+            return false;
+        }
+    }
+
     function cmoaComputeReadiness() {
         const missing = [];
         if (!cmoaState.cid) missing.push('content ID');
         if (!cmoaState.contentsServer) missing.push('contents server');
         if (!cmoaState.pages.length) missing.push('page list');
+        // Every CMOA page is served as scrambled tiles, so a run without the
+        // reader cannot produce a readable volume: it would write the CDN's own
+        // scrambled bytes out as if they were pages. A page list alone is not
+        // readiness - that is what let a half-initialised viewer "download" a
+        // whole volume of unreadable images.
+        if (!cmoaState.reader && !cmoaState.scrambleTables) missing.push('descramble reader');
         cmoaState.ready = missing.length === 0;
         return missing;
     }
@@ -423,6 +650,15 @@
                     quality: cmoaState.quality, pages: cmoaState.pages.length,
                 });
             }
+            // A frame whose viewer never produced a reader (or never produced
+            // pages at all) is not a dead end: the volume's own content info and
+            // ttx page list are enough, and the tables in that response are the
+            // descramble geometry. One attempt, then readiness decides.
+            if (!cmoaState.reader || !cmoaState.pages.length) {
+                if (!cmoaState.protocolTried || (!cmoaState.pages.length && !cmoaState.protocolError)) {
+                    await cmoaFetchProtocolState();
+                }
+            }
             cmoaComputeReadiness();
         } catch (e) {
             cmoaState.error = e;
@@ -432,7 +668,6 @@
         }
     }
 
-    // --- passive capture --------------------------------------------------
     // Everything above already works without this, so the fetch wrapper is a
     // best-effort bonus: it keeps the token pool and quality fresh while the
     // user pages, which is what lets a long download ride out a token rollover.

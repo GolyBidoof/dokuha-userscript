@@ -23,7 +23,7 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
-const ROOT = path.dirname(fileURLToPath(import.meta.url));
+const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const IDENTITY = path.join(ROOT, 'src', 'core', '00-identity.js');
 const README = path.join(ROOT, 'README.md');
 const PKG = path.join(ROOT, 'package.json');

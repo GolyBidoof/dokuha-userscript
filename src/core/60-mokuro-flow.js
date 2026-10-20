@@ -37,14 +37,20 @@
             setBar(barUpload, 0, '0%');
         }
         const result = await new Promise((resolve, reject) => {
-            const fp = mokuroFinalize(mokuroSessionId, { method: plan.method || null, localDir: plan.localDir }, (stage, msg) => {
+            const fp = mokuroFinalize(mokuroSessionId, {
+                method: plan.method || null,
+                localDir: plan.localDir,
+                // An automation caller may ask the bridge to replace a file a
+                // previous run left at the destination; the panel never does, so
+                // a normal run keeps the bridge's safe "fail" policy.
+                overwrite: options.overwrite || null,
+            }, (stage, msg) => {
                 if (stage === 'upload_progress' || stage === 'upload') barUpload.wrap.style.display = 'flex';
                 // The initial "upload" frame announces every file + size, so
                 // pre-size the bar before the first byte arrives.
                 if (stage === 'upload' && msg && Array.isArray(msg.files) && uploadFeed.seed) {
                     uploadFeed.seed(msg.files);
                 }
-                // Keep the file count + total size on the bar when done.
                 if (stage === 'done' && uploadFeed.summary) {
                     const s = uploadFeed.summary();
                     if (barUpload.wrap.style.display === 'flex' && s.total > 0) {
@@ -59,10 +65,14 @@
             // while the finalize stream is open; the bridge also publishes live
             // upload progress to the same /status endpoint, which keeps the bar
             // moving even with older bridges that buffer their NDJSON frames.
-            // Headless callers can opt out.
+            // Headless callers can opt out. The tick is scheduled in a worker
+            // (setBackgroundInterval) because a plain interval is clamped to one
+            // tick per second - and to one per minute once the tab has been
+            // hidden for five minutes - which is exactly when a long finalize is
+            // most likely to be left running in the background.
             let poll = null;
             if (options.pollBridgeStatus !== false) {
-                poll = setInterval(async () => {
+                poll = setBackgroundInterval(async () => {
                     try {
                         const st = await mokuroStatus(mokuroSessionId);
                         if (!st) return;
@@ -82,10 +92,10 @@
                 }, 400);
             }
             if (poll && options.registerRunCleanup) {
-                options.registerRunCleanup(() => { if (poll) { clearInterval(poll); poll = null; } });
+                options.registerRunCleanup(() => { if (poll) { clearBackgroundInterval(poll); poll = null; } });
             }
-            fp.then(r => { if (poll) { clearInterval(poll); poll = null; } resolve(r); },
-                   e => { if (poll) { clearInterval(poll); poll = null; } reject(e); });
+            fp.then(r => { if (poll) { clearBackgroundInterval(poll); poll = null; } resolve(r); },
+                   e => { if (poll) { clearBackgroundInterval(poll); poll = null; } reject(e); });
         });
         return { result, plan };
     }

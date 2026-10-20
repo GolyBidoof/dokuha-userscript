@@ -1,6 +1,3 @@
-    // =====================================================================
-    // Shared run harness
-    // =====================================================================
     // Driven by the CMOA and ebookjapan pipelines; BookWalker's full and trial
     // pipelines never call it and keep their own plumbing. It owns everything the
     // user can see and everything the Mokuro bridge is told - same bars, same
@@ -101,9 +98,6 @@
             refreshProgress();
         }
 
-        // ---------------------------------------------------------------
-        // Mokuro bridge conversation
-        // ---------------------------------------------------------------
         // Pages are streamed to the bridge in strict page order (buffered until
         // the gaps fill) rather than in completion order: BookWalker's lane engine
         // settles pages out of order and CMOA's retry loop skips forward, so
@@ -151,7 +145,11 @@
 
             function startPoll() {
                 if (!sessionId || poll) return;
-                poll = setInterval(async () => {
+                // setBackgroundInterval, not setInterval: a hidden tab clamps
+                // main-thread timers to one tick per second and, after five
+                // minutes, to about one per minute, which starves this bar while
+                // the bridge itself keeps working at full speed.
+                poll = setBackgroundInterval(async () => {
                     const st = await mokuroStatus(sessionId);
                     if (!st) return;
                     const done = st.pages_ocr_done ?? 0;
@@ -161,7 +159,7 @@
                         pageCount: got, ocrPageCount: done, total: total
                     });
                 }, 700);
-                registerCleanup(() => { if (poll) { clearInterval(poll); poll = null; } });
+                registerCleanup(() => { if (poll) { clearBackgroundInterval(poll); poll = null; } });
             }
 
             return {
@@ -237,33 +235,47 @@
                             errors.push('Final OCR send page ' + i + ': ' + safeLogText((e && e.message) || e));
                         }
                     }
-                    if (poll) { clearInterval(poll); poll = null; }
+                    // Deliberately NOT stopped here. Streaming every page is the
+                    // end of the download, not of the OCR: the bridge is still
+                    // working through its queue and then uploading, and the
+                    // /status poll is the only thing that can report that. The
+                    // run's own cleanup stops it when the volume is truly done.
                 },
 
                 async finalize() {
                     barMokuro.wrap.style.display = 'flex';
                     const { result, plan } = await finalizeOcrSession(
                         sessionId, ui, barUpload, barMokuro, total, uploadFeed, options);
+                    // A partial_upload terminal frame means the volume files are
+                    // there but the series index is not. Record it as an issue so
+                    // outcome() reports the run as not clean.
+                    const partial = !!(result && result.partialUpload);
+                    if (partial) errors.push(msgPartialUpload(result));
                     const missing = total - okIdx.size;
                     if (missing > 0) {
                         if (!options.headless) setRunDetails(details, msgOcrPartial(missing, total), errors);
                         return { result, plan, missing, ok: false };
                     }
                     if (!options.headless) {
-                        if (plan && plan.method === 'local') {
-                            const localPath = storedPathOf(result) || plan.localDir;
-                            if (localPath) details.textContent = msgStoredLocal(localPath);
-                        } else if (plan && plan.method) {
-                            const rp = result && (result.remote_path || result.mega_path);
-                            if (rp) details.textContent = msgUploadedTo(methodShortLabel(plan.method), rp);
+                        if (partial) {
+                            setRunDetails(details, msgPartialUpload(result), errors);
+                        } else {
+                            if (plan && plan.method === 'local') {
+                                const localPath = storedPathOf(result) || plan.localDir;
+                                if (localPath) details.textContent = msgStoredLocal(localPath);
+                            } else if (plan && plan.method) {
+                                const rp = result && (result.remote_path || result.mega_path);
+                                if (rp) details.textContent = msgUploadedTo(methodShortLabel(plan.method), rp);
+                            }
+                            if (errors.length) appendRunDetails(details, errors, 'Issues during the run');
                         }
-                        if (errors.length) appendRunDetails(details, errors, 'Issues during the run');
                     }
-                    if (!options.headless) {
-                        ui.showReaderButton(result);
-                        ui.showStoredButton(result);
-                    }
-                    return { result, plan, missing, ok: true };
+                    // Reported even on the headless path: a headless caller
+                    // supplies its own UI whose only job is to capture this
+                    // result, so it can link the stored file after the run.
+                    ui.showReaderButton(result);
+                    ui.showStoredButton(result);
+                    return { result, plan, missing, ok: !partial };
                 },
 
                 // Deferred mode is deliberately page-stream-only: the external
@@ -285,9 +297,6 @@
             };
         })();
 
-        // ---------------------------------------------------------------
-        // Page accounting
-        // ---------------------------------------------------------------
         // A successfully fetched+processed page: counted for both bars, added to
         // the archive, cached for a resume, and handed to OCR. Sites call this
         // exactly once per page that produced usable output. `ext` overrides the
@@ -326,9 +335,6 @@
             refreshProgress();
         }
 
-        // ---------------------------------------------------------------
-        // Finishing
-        // ---------------------------------------------------------------
         async function finishZip() {
             if (!zip || okIdx.size === 0) {
                 setRunDetails(details, msgAllFailedZip(), errors);
@@ -373,9 +379,6 @@
             return outcome(missing === 0);
         }
 
-        // ---------------------------------------------------------------
-        // Outcome + teardown
-        // ---------------------------------------------------------------
         // Normalize the result object for automated callers. Sites pass whether
         // the run was good; the page accounting is filled in here so every store
         // reports identically.
@@ -402,8 +405,6 @@
             if (typeof ui.setRunLock === 'function') ui.setRunLock(false);
         }
 
-        // Report a thrown run: automation callers get a structured result, the
-        // panel gets the one-line message.
         function reportFailure(e) {
             const message = (e && e.message) ? safeLogText(e.message)
                 : 'something went wrong — see the browser console for details.';

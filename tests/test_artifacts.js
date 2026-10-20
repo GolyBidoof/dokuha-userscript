@@ -32,7 +32,6 @@ function coreVersion() {
   return m ? m[1] : null;
 }
 
-// Turn a V8 compile error into "bookwalker-only.user.js:1234  <offending line>".
 function where(err, text, label) {
   const m = new RegExp(label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + ':(\\d+)').exec(err.stack || '');
   if (!m) return err.message;
@@ -42,6 +41,11 @@ function where(err, text, label) {
 }
 
 const fragmentBody = f => fs.readFileSync(path.join(ROOT, 'src', f), 'utf8');
+// The built bundles are comment-stripped, so "the fragment is present whole"
+// means its stripped form is present. Both this test and build.mjs call the
+// same lexer, so the expectation is byte-identical to what the build emits.
+const { stripSource } = require('../tools/strip-comments.js');
+const strippedFragmentBody = f => stripSource(fragmentBody(f));
 const VERSION = coreVersion();
 
 check('the core declares a version to compare against', !!VERSION, VERSION || 'not found in src/core/00-identity.js');
@@ -80,17 +84,18 @@ for (const [id, target] of Object.entries(TARGETS)) {
   check(label + ': @version is the core version', !!ver && ver[1] === VERSION,
     '@version ' + (ver ? ver[1] : 'missing') + ' vs core ' + VERSION);
 
-  // 4) nothing is truncated. The build is a plain join of fragment bodies, so
-  // every fragment this target includes must appear byte for byte.
+  // 4) nothing is truncated. Every fragment is emitted as its stripped body
+  // (or, for the metadata header, verbatim), so each one this target includes
+  // must appear whole. The header is checked separately below.
   const allow = new Set(target.modules);
   const included = MANIFEST.fragments.filter(f => allow.has(f.module));
-  const shortFrag = included.filter(f => f.file !== HEADER && !text.includes(fragmentBody(f.file)));
+  const shortFrag = included.filter(f => f.file !== HEADER && !text.includes(strippedFragmentBody(f.file)));
   check(label + ': all ' + included.length + ' fragments present whole', shortFrag.length === 0,
     shortFrag.length ? 'missing or truncated: ' + shortFrag.map(f => f.file).join(', ') : 'no truncation');
 
   // 5) and nothing leaked in from a module this target excludes. §4 catches a
   // partial leak only if it breaks the parse; this catches a clean one.
-  const leakedFrag = MANIFEST.fragments.filter(f => !allow.has(f.module) && text.includes(fragmentBody(f.file)));
+  const leakedFrag = MANIFEST.fragments.filter(f => !allow.has(f.module) && text.includes(strippedFragmentBody(f.file)));
   check(label + ': no fragment from an excluded module', leakedFrag.length === 0,
     leakedFrag.length ? 'leaked: ' + leakedFrag.map(f => f.file).join(', ') : 'clean');
 }
@@ -131,27 +136,31 @@ if (fs.existsSync(path.join(ROOT, UNIFIED_SRC))) {
 }
 
 // 9) the build's own guards must bite. A module a target names but no fragment
-// declares, and a store fragment placed above the registerSite() definition, are
-// both silent failures otherwise: the first ships an artifact missing a store,
-// the second throws a TDZ ReferenceError at boot. Build in a temp copy so the
-// real src/ is never touched.
-function buildInTemp(mutate) {
+// declares, and a store fragment ordered above the registerSite() definition,
+// are both silent failures otherwise: the first ships an artifact missing a
+// store, the second throws a TDZ ReferenceError at boot. Build in a temp copy so
+// the real src/ is never touched.
+function buildInTemp(mutate, keepTmp) {
   const os = require('os');
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'bwdd-guard-'));
+  let keep = false;
   try {
     fs.cpSync(path.join(ROOT, 'src'), path.join(tmp, 'src'), { recursive: true });
+    // build.mjs imports the stripper from tools/, so the temp copy needs it too.
+    fs.cpSync(path.join(ROOT, 'tools'), path.join(tmp, 'tools'), { recursive: true });
     for (const f of ['build.mjs', 'package.json']) fs.copyFileSync(path.join(ROOT, f), path.join(tmp, f));
     mutate(tmp);
     execFileSync(process.execPath, ['build.mjs', '--target', 'bookwalker'], { cwd: tmp, stdio: 'pipe' });
-    return { ok: true, err: '' };
+    if (keepTmp) keep = true;
+    return { ok: true, err: '', tmp };
   } catch (e) {
     const all = String((e.stdout || '') + (e.stderr || ''));
     // Node prints the throwing frame before the message; the message is the
     // useful evidence, so surface that line rather than the stack's first one.
     const fail = all.split('\n').map(l => l.trim()).find(l => l.startsWith('Error:'));
-    return { ok: false, err: fail || all.trim() };
+    return { ok: false, err: fail || all.trim(), tmp };
   } finally {
-    fs.rmSync(tmp, { recursive: true, force: true });
+    if (!keep) fs.rmSync(tmp, { recursive: true, force: true });
   }
 }
 
@@ -165,18 +174,43 @@ check('a target naming a module with no fragments fails the build',
   !phantom.ok && /no fragments/.test(phantom.err),
   phantom.err || 'build SUCCEEDED - guard missing');
 
+// The order comes from the `after` links now, so the guard is exercised by
+// splicing the store adapter's link in front of registerSite(), not by moving
+// its entry in the array: the array no longer decides the load order at all.
 const order = buildInTemp(tmp => {
   const p = path.join(tmp, 'src/manifest.json');
   const m = JSON.parse(fs.readFileSync(p, 'utf8'));
-  const a = m.fragments.findIndex(f => f.file === 'sites/bookwalker/30-adapter.js');
-  const site = m.fragments.findIndex(f => f.file === 'core/70-site.js');
-  const [frag] = m.fragments.splice(a, 1);
-  m.fragments.splice(site, 0, frag);   // put registerSite() above its definition
+  const adapter = m.fragments.find(f => f.file === 'sites/bookwalker/30-adapter.js');
+  const site = m.fragments.find(f => f.file === 'core/70-site.js');
+  const next = m.fragments.find(f => f.after === adapter.file);
+  if (next) next.after = adapter.after; else delete adapter.after;
+  adapter.after = site.after;
+  site.after = adapter.file;
   fs.writeFileSync(p, JSON.stringify(m, null, 2));
 });
-check('a store fragment placed above registerSite() fails the build',
+check('a store fragment ordered above registerSite() fails the build',
   !order.ok && /defines it/.test(order.err),
   order.err || 'build SUCCEEDED - guard missing');
+
+// 10) the derived order does not read the fragment array. Sorting the entries
+// leaves every `after` link intact, so the build must produce the identical
+// artifact; if it did not, the array would still be the real load order.
+const shuffled = buildInTemp(tmp => {
+  const p = path.join(tmp, 'src/manifest.json');
+  const m = JSON.parse(fs.readFileSync(p, 'utf8'));
+  m.fragments.sort((a, b) => (a.file < b.file ? -1 : a.file > b.file ? 1 : 0));
+  fs.writeFileSync(p, JSON.stringify(m, null, 2));
+}, true);
+let shuffleSame = false;
+let shuffleWhy = shuffled.err || 'build failed';
+if (shuffled.ok) {
+  const repoText = fs.readFileSync(path.join(ROOT, 'bookwalker-only.user.js'), 'utf8');
+  const tmpText = fs.readFileSync(path.join(shuffled.tmp, 'bookwalker-only.user.js'), 'utf8');
+  shuffleSame = repoText === tmpText;
+  shuffleWhy = shuffleSame ? 'byte-identical after reordering the array' : 'the array still decides the order';
+}
+fs.rmSync(shuffled.tmp, { recursive: true, force: true });
+check('the derived order ignores the fragment array order', shuffleSame, shuffleWhy);
 
 const failed = results.filter(r => !r.pass);
 console.log(failed.length ? '\n' + failed.length + ' FAILED' : '\nALL ' + results.length + ' CHECKS PASSED');

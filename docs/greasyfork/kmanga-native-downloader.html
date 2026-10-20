@@ -1,0 +1,9 @@
+<p><strong>Saves the book open in the <a href="https://comic.k-manga.jp">k-manga</a> viewer</strong> as a single ZIP of original-resolution page images, without turning a page. It reads the session out of the viewer URL, asks the viewer's own WebSocket for the page data, and unscrambles each page's block permutation on a canvas. Rename the ZIP to <code>.cbz</code> and any CBZ reader opens it.</p>
+<ul>
+<li><strong>Original-resolution pages</strong>, one file per page, rebuilt offline from the viewer's own data. The Mokuro hand-off files them as <code>Series/Volume/page-0001.jpg</code>. Free volumes need no account.</li>
+<li><strong>Reading stats before you commit</strong>: Natively level with JLPT band colours, ratings and reader counts, plus Manga Kotoba vocabulary totals.</li>
+<li><strong>Optional Mokuro OCR</strong> through the separate, locally running <a href="https://github.com/GolyBidoof/mokuro-bridge">mokuro-bridge</a> service. Pages stream across as they are rebuilt and come back as the <code>.cbz</code> / <code>.mokuro</code> / <code>.webp</code> trio that <a href="https://reader.mokuro.app/">reader.mokuro.app</a> reads, delivered to a local folder, MEGA, Google Drive, OneDrive, WebDAV or whichever other destination the bridge is configured for.</li>
+<li><strong>Resume, not restart</strong>: pages are cached as they arrive, an interrupted run continues where it stopped, and a partial failure names the pages that are missing.</li>
+<li>Want the other four stores too? The <a href="https://greasyfork.org/en/scripts/597313-dokuha-userscript">all-in-one build</a> adds BookWalker, CMOA, ebookjapan and Kindle.</li>
+</ul>
+<p>Needs a userscript manager (Tampermonkey or Violentmonkey). For personal, lawful use: download only what you are entitled to access. MIT licensed. Source, issues and releases on <a href="https://github.com/GolyBidoof/dokuha-userscript">GitHub</a>.</p>

@@ -15,8 +15,10 @@ const net = require('net');
 const { spawn } = require('child_process');
 
 const CHROME = process.env.PUPPETEER_EXECUTABLE_PATH || undefined;
-const US = path.resolve(__dirname, '..', process.env.BWDD_US || 'omnimanga-native-downloader.user.js');
-const BRIDGE = path.join(process.env.HOME, 'Projects', 'mokuro-bridge');
+const US = path.resolve(__dirname, '..', process.env.BWDD_US || 'dokuha-userscript.user.js');
+// MOKURO_BRIDGE_DIR lets a checkout elsewhere (this workspace keeps it under
+// ~/GitHub) run the benchmark without moving anything.
+const BRIDGE = process.env.MOKURO_BRIDGE_DIR || path.join(process.env.HOME, 'Projects', 'mokuro-bridge');
 const REAL_PORT = 62642;      // the bridge that is actually running
 const TEST_PORT = 63442;      // throwaway instance used for measurement
 const N_PORTS = parseInt(process.env.N_PORTS || '48', 10);
@@ -100,16 +102,33 @@ const portBusy = (p) => new Promise(r => {
     }, CDN);
 
     probe = await page.evaluate(() => window.__bwdd.probeFetchProxy()
-      .then(ports => ({ ports, lanes: window.__bwdd.allLanes().map(l => l.name), budget: window.__bwdd.fetchSocketBudget() })));
+      .then(ports => ({
+        ports,
+        lanes: window.__bwdd.allLanes().map(l => l.name),
+        budget: window.__bwdd.fetchSocketBudget(),
+        raw: window.__bwdd.rawSocketBudget(),
+        maxDataPlane: window.__bwdd.MAX_DATA_PLANE_SOCKETS,
+        profileCeiling: window.__bwdd.CHROMIUM_SOCKETS_PER_PROCESS,
+        reserve: window.__bwdd.CONTROL_PLANE_SOCKET_RESERVE,
+      })));
     check('userscript discovers all ' + N_PORTS + ' bridge ports via /health',
       probe.ports.length === N_PORTS, probe.ports.length + ' ports (' + probe.ports[0] + '-' + probe.ports[probe.ports.length - 1] + ')');
     check('every bridge port becomes its own browser origin lane',
       probe.lanes.filter(l => l.startsWith('px:')).length === N_PORTS,
       probe.lanes.length + ' lanes total');
-    check('socket budget = 6 per bridge port + the page lane',
-      probe.budget === 6 * (1 + N_PORTS), 'budget = ' + probe.budget + ' sockets');
+    // The per-origin sum (6 per port + the page lane) can exceed what one browser
+    // profile may open, so the budget is the smaller of the two. Every lane stays
+    // selectable either way; only the concurrency target is clamped.
+    check('socket budget is the per-origin sum, capped at the profile ceiling',
+      probe.budget === Math.min(probe.raw, probe.maxDataPlane),
+      'budget = ' + probe.budget + ' (raw ' + probe.raw + ', cap ' + probe.maxDataPlane + ')');
+    check('the cap leaves the control plane a reserved share',
+      probe.maxDataPlane === probe.profileCeiling - probe.reserve,
+      probe.maxDataPlane + ' = ' + probe.profileCeiling + ' - ' + probe.reserve);
+    check('a 48-port bridge is exactly the case the cap exists for',
+      N_PORTS !== 48 || probe.raw > probe.budget,
+      'raw ' + probe.raw + ' vs budget ' + probe.budget);
 
-    // ---- the actual measurement -------------------------------------
     cdn.cur = 0; cdn.max = 0; cdn.hits = 0;
     const t0 = Date.now();
     const ok = await page.evaluate(async (n) => {
@@ -146,7 +165,6 @@ const portBusy = (p) => new Promise(r => {
     cdnSrv.close(); appSrv.close();
   }
 
-  // ---- the product's real port: discovery must work against the live bridge
   const realHealth = await new Promise((resolve) => {
     http.get('http://127.0.0.1:' + REAL_PORT + '/health', (r) => {
       let b = ''; r.on('data', c => b += c); r.on('end', () => { try { resolve(JSON.parse(b)); } catch (e) { resolve(null); } });

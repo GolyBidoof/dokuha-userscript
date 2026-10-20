@@ -1,8 +1,3 @@
-    // =====================================================================
-    // 12. Stylesheet Injection
-    // =====================================================================
-    // 12a. Light/dark scheme detection (environment / browser / OS)
-    // =====================================================================
     // Real detection of the current color scheme, not a styling guess: we ask
     // the platform through prefers-color-scheme, which reflects the OS "dark
     // mode" toggle, the browser's own theme and any per-site override, and make
@@ -13,7 +8,7 @@
     // media query. A 'change' listener keeps it in sync while the viewer is
     // already open, no reload needed.
     const bwddTheme = (() => {
-        let scheme = 'light';          // resolved value: 'dark' | 'light'
+        let scheme = 'light';
         let started = false;
         let styleEl = null;            // dark-palette <style> gated by detection
         const subscribers = [];
@@ -184,6 +179,11 @@
   transition: height 0.2s ease, opacity 0.15s ease, width 0.25s ease, transform 0.25s ease;
 }
 #bwdd-root * { box-sizing: border-box; }
+/* A store page's own font rules land directly on the panel's divs, so a leaf
+   rule like .bwdd-btn { font-family: inherit } picks up the shop's font
+   (Meiryo on CMOA) instead of ours. Make the whole subtree inherit from
+   #bwdd-root; the only deliberate exception is monospace for code/pre. */
+#bwdd-root *:not(code):not(pre):not(kbd):not(samp) { font-family: inherit; }
 #bwdd-root.collapsed { height: auto !important; max-height: none !important; }
 #bwdd-root.collapsed .bwdd-body { display: none; }
 #bwdd-root.bwdd-stats-visible { width: 640px; }   /* two-column width, once there is a stats column to show */
@@ -248,6 +248,18 @@
 .bwdd-gh svg { width: 12px; height: 12px; fill: currentColor; display: block; }
 .bwdd-gh:hover { color: var(--bwdd-link); background: var(--bwdd-link-hover-bg); }
 .bwdd-gh:focus-visible { outline: 2px solid var(--bwdd-link); outline-offset: 1px; }
+/* The shared script mark: a small, quiet link home beside the version line. */
+.bwdd-mark {
+  flex-shrink: 0;
+  white-space: nowrap;
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--bwdd-text-muted);
+  text-decoration: none;
+  padding: 0 2px;
+}
+.bwdd-mark:hover { color: var(--bwdd-link); text-decoration: underline; }
+.bwdd-mark:focus-visible { outline: 2px solid var(--bwdd-link); outline-offset: 1px; }
 .bwdd-head-controls { display: flex; align-items: center; gap: 2px; flex-shrink: 0; }
 .bwdd-ctrl-btn {
   background: transparent;
@@ -713,16 +725,47 @@
 .bwdd-fmt-summary:focus-visible { outline: 2px solid var(--bwdd-link); outline-offset: 1px; }
 .bwdd-fmt[open] > .bwdd-fmt-summary { margin-bottom: 2px; }
 
-.bwdd-dest-select, .bwdd-dest-input {
-  font: 12px inherit;
+/* The panel's own form controls must look the same on every store. A shop's
+   stylesheet lands on bare input/select/textarea elements, and exactly which
+   properties it touches differs per store, so this is a scoped reset rather
+   than a list tuned to one leak: every property a host page realistically sets
+   is pinned once for the whole panel subtree. The #bwdd-root prefix outranks a
+   page selector that is an element, a class, or an element plus an attribute,
+   so a host rule only wins with !important, which no store stylesheet uses for
+   generic form controls. The prefix is also what keeps the reset off the host
+   page's own fields. */
+#bwdd-root input,
+#bwdd-root select,
+#bwdd-root textarea {
+  box-sizing: border-box;
+  height: auto;
+  min-height: 0;
+  max-height: none;
+  margin: 0;
   padding: 5px 7px;
   border: 1px solid var(--bwdd-border-strong);
   border-radius: 6px;
   background: var(--bwdd-bg);
   color: var(--bwdd-root-fg);
+  font-family: inherit;
+  font-size: 12px;
+  font-style: normal;
+  font-weight: 400;
+  line-height: 1.4;
+  letter-spacing: normal;
+  text-transform: none;
+  text-indent: 0;
+  vertical-align: middle;
   width: 100%;
+  appearance: none;
+  -webkit-appearance: none;
 }
-.bwdd-dest-select:focus-visible, .bwdd-dest-input:focus-visible { outline: 2px solid var(--bwdd-link); outline-offset: 1px; }
+/* appearance: none would take the native dropdown affordance with it, and the
+   panel draws no caret of its own, so a select keeps the platform control. */
+#bwdd-root select { appearance: auto; -webkit-appearance: auto; }
+#bwdd-root input:focus-visible,
+#bwdd-root select:focus-visible,
+#bwdd-root textarea:focus-visible { outline: 2px solid var(--bwdd-link); outline-offset: 1px; }
 .bwdd-dest-localdir { display: flex; flex-direction: column; gap: 3px; }
 .bwdd-dest-hint { font-size: 11px; color: var(--bwdd-warn-text); background: var(--bwdd-warn-bg); border: 1px solid var(--bwdd-warn-border); border-radius: 6px; padding: 5px 7px; line-height: 1.4; }
 .bwdd-dest-hint code { font-family: ui-monospace, monospace; font-size: 10px; background: var(--bwdd-warn-code-bg); border-radius: 3px; padding: 0 3px; }
@@ -735,7 +778,9 @@
   gap: 6px;
 }
 .bwdd-name .bwdd-dest-label { flex: 0 0 auto; }
-.bwdd-name .bwdd-dest-input { flex: 1 1 auto; width: auto; min-width: 0; padding-top: 4px; padding-bottom: 4px; }
+/* Higher specificity than the subtree reset above, so the name field keeps its
+   compact row sizing (natural width, tighter vertical padding). */
+#bwdd-root .bwdd-name .bwdd-dest-input { flex: 1 1 auto; width: auto; min-width: 0; padding-top: 4px; padding-bottom: 4px; }
 .bwdd-name .bwdd-info-dot {
   flex: 0 0 auto;
   width: 18px;
@@ -844,9 +889,9 @@
   gap: 6px;
   margin-top: 6px;
 }
-.bwdd-reader-row > .bwdd-ghost-btn {
-  min-width: 0;
-  width: 100%;
+/* The quiet outline button is a component, not a child of one row. Only the
+   row's own sizing stays scoped there. */
+.bwdd-ghost-btn {
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -867,12 +912,16 @@
   cursor: pointer;
   transition: background 0.15s, color 0.15s, border-color 0.15s;
 }
-.bwdd-reader-row > .bwdd-ghost-btn:hover {
+.bwdd-reader-row > .bwdd-ghost-btn {
+  min-width: 0;
+  width: 100%;
+}
+.bwdd-ghost-btn:hover {
   background: var(--bwdd-bg-sunken);
   color: var(--bwdd-link);
   border-color: var(--bwdd-link);
 }
-.bwdd-reader-row > .bwdd-ghost-btn:focus-visible {
+.bwdd-ghost-btn:focus-visible {
   outline: 2px solid var(--bwdd-link);
   outline-offset: 1px;
 }
@@ -1105,8 +1154,8 @@
 .bwdd-edge-tab:hover { background: #60a5fa; }
 .bwdd-edge-tab:focus-visible { outline-color: #60a5fa; }
 /* Quiet reader/stored row (dark), colors come from --bwdd-* tokens */
-.bwdd-reader-row > .bwdd-ghost-btn { background: var(--bwdd-bg); color: var(--bwdd-text-muted); border-color: var(--bwdd-border-strong); }
-.bwdd-reader-row > .bwdd-ghost-btn:hover { background: var(--bwdd-bg-sunken); color: var(--bwdd-link); border-color: var(--bwdd-link); }
+.bwdd-ghost-btn { background: var(--bwdd-bg); color: var(--bwdd-text-muted); border-color: var(--bwdd-border-strong); }
+.bwdd-ghost-btn:hover { background: var(--bwdd-bg-sunken); color: var(--bwdd-link); border-color: var(--bwdd-link); }
 
 `;
         (document.head || document.documentElement).appendChild(darkCss);

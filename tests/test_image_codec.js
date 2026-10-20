@@ -11,7 +11,7 @@ const path = require('path');
 const https = require('https');
 
 const CHROME = process.env.PUPPETEER_EXECUTABLE_PATH || undefined;
-const US = path.resolve(__dirname, '..', process.env.BWDD_US || 'omnimanga-native-downloader.user.js');
+const US = path.resolve(__dirname, '..', process.env.BWDD_US || 'dokuha-userscript.user.js');
 const W = 1200, H = 1800;
 
 const appSrv = https.createServer(
@@ -84,7 +84,6 @@ const CONFIGS = [
       const seeds = { b8A:256, b6V:256, B0J:1, B0K:2, B0n:3, B0A:4 };
       const src = await c.convertToBlob({ type: 'image/jpeg', quality: 0.92 });
 
-      // The DESCRAMBLED reference: apply the tile plan to the decoded source.
       const sb = await createImageBitmap(src);
       const rc = new OffscreenCanvas(W,H); const rx = rc.getContext('2d');
       rx.drawImage(sb,0,0); sb.close&&sb.close();

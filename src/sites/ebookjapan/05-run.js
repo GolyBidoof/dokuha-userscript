@@ -1,10 +1,3 @@
-    // =====================================================================
-    // ebookjapan — run pipeline and adapter registration
-    // =====================================================================
-    // The shape follows sites/cmoa/02-run.js: wait for the viewer, take the
-    // title, hand everything to the shared run harness, fetch and descramble
-    // pages across a worker pool, and let the harness own the bars, the Mokuro
-    // session, the ZIP and the reporting.
     function ebjSleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
     /**
@@ -22,9 +15,6 @@
         };
     }
 
-    // =====================================================================
-    // Per-page stage timing
-    // =====================================================================
     // "It starts off fast and then slows down to 1 page/s" has three candidate
     // owners: the network fetch, the main-thread decode+descramble+encode, and
     // handing the finished blob to the run harness (ZIP entry, page cache, OCR
@@ -39,6 +29,13 @@
     // representative without holding a million numbers for a long series.
     const EBJ_TIMING_SAMPLES = 512;
 
+    // The last finished run's timing, kept whole so the console can read the
+    // stage split and the lane mix after the fact.
+    let ebjLastTiming = null;
+    // The prep breakdown, published alongside the timing: it is a run-scoped
+    // local, and the timing object is assembled outside ebjRun's scope.
+    let ebjLastPrep = null;
+
     function ebjNow() {
         try { return performance.now(); } catch (e) { return Date.now(); }
     }
@@ -52,7 +49,7 @@
             failed: 0,  // pages whose stage threw; excluded from the min/median/max
             retried: 0,
             start: 0,   // set when the page phase begins, not at run entry
-            phaseMs: 0, // wall clock the page phase actually took
+            phaseMs: 0,
         };
     }
 
@@ -81,6 +78,50 @@
         return a.length % 2 ? a[mid] : (a[mid - 1] + a[mid]) / 2;
     }
 
+    // A page between decode and hand-off holds an <img> (or a bitmap) plus a
+    // full-intrinsic-size canvas - about 30 MB for a 1600x2400 page, and twice
+    // that while the crop copy exists. The socket budget says how many pages may
+    // be on the wire; it says nothing about how many may hold pixels, and those
+    // two numbers differ by an order of magnitude. CMOA gates the same thing for
+    // the same reason (cmoaAcquireSlot), and without it a wide fan-out trades a
+    // socket problem for a memory stall - which is what "starts fast, then
+    // stalls" is. The gate sits *before* the decode, so the pixels are never made.
+    let ebjSlotsBusy = 0;
+    let ebjSlotLimit = 16;
+    let ebjSlotQueue = [];
+    // High-water mark since the last arm: if this sits at the limit for the whole
+    // run the gate is the throughput limit, and if it never gets near it, it is
+    // not, and the network is.
+    let ebjSlotsPeak = 0;
+
+    function ebjSetSlotLimit(limit) {
+        const n = limit | 0;
+        ebjSlotLimit = (n > 0 && n <= 64) ? n : 16;
+        ebjSlotsBusy = 0;
+        ebjSlotQueue = [];
+        ebjSlotsPeak = 0;
+    }
+
+    function ebjAcquireSlot() {
+        if (ebjSlotsBusy < ebjSlotLimit) {
+            ebjSlotsBusy++;
+            if (ebjSlotsBusy > ebjSlotsPeak) ebjSlotsPeak = ebjSlotsBusy;
+            return Promise.resolve();
+        }
+        return new Promise(resolve => ebjSlotQueue.push(resolve));
+    }
+
+    function ebjReleaseSlot() {
+        const next = ebjSlotQueue.shift();
+        if (next) { next(); return; }   // the slot passes straight to the waiter
+        ebjSlotsBusy = Math.max(0, ebjSlotsBusy - 1);
+    }
+
+    function ebjProcessDepth() {
+        return { busy: ebjSlotsBusy, queued: ebjSlotQueue.length, limit: ebjSlotLimit,
+                 peak: ebjSlotsPeak };
+    }
+
     function ebjMs(v) {
         if (!isFinite(v) || v <= 0) return '0ms';
         return v >= 1000 ? (v / 1000).toFixed(1) + 's' : Math.round(v) + 'ms';
@@ -101,8 +142,15 @@
      * write is the harness hand-off. The stage that dominates is the one to fix.
      */
     function ebjTimingLine(t) {
+        // Stage totals are summed over concurrent workers, so fetch-total divided
+        // by the wall clock is how many pages were genuinely in flight. Near 1
+        // means the transport ran them one at a time however wide the fan-out was;
+        // a large number means the fan-out was real and something else is the
+        // limit. Without this, "249 workers, one page a second" is ambiguous.
+        const par = (t.phaseMs > 0 && t.fetch.total > 0)
+            ? (t.fetch.total / t.phaseMs) : 0;
         const parts = [
-            'fetch ' + ebjMs(t.fetch.total),
+            'fetch ' + ebjMs(t.fetch.total) + (par ? ' (~' + par.toFixed(1) + ' in flight)' : ''),
             'cpu ' + ebjMs(t.decode.total + t.descramble.total) +
                 ' (decode ' + ebjMs(t.decode.total) + ' + descramble ' + ebjMs(t.descramble.total) + ')',
             'write ' + ebjMs(t.write.total),
@@ -111,6 +159,8 @@
                 (t.retried ? ', ' + t.retried + ' retried' : '') +
                 (t.failed ? ', ' + t.failed + ' failed attempt(s)' : ''),
         ];
+        const depth = ebjProcessDepth();
+        parts.push('gate peak ' + depth.peak + '/' + depth.limit);
         const lanes = Object.keys(t.lanes).sort((a, b) => t.lanes[b] - t.lanes[a]);
         if (lanes.length) parts.push('lanes ' + lanes.map(k => k + ' ' + t.lanes[k]).join(' / '));
         return 'timing: ' + parts.join(' \u00b7 ');
@@ -150,6 +200,12 @@
     function ebjTimingPublish(ui, harness, t) {
         if (ebjTimingEmpty(t)) return;
         const line = ebjTimingLine(t);
+        // Kept for the console. A DevTools HAR cannot see this site's page
+        // traffic at all - it rides GM_xmlhttpRequest, which never appears there -
+        // so the stage split and the lane mix are the only window onto a run, and
+        // "which stage ate the wall clock" is the first question every time.
+        t.prep = ebjLastPrep;
+        ebjLastTiming = t;
         try { ebjLog('timing', line); } catch (e) {}
         // Automation callers read the result object, not the panel; put the same
         // numbers there so a headless run can be measured without scraping logs.
@@ -175,37 +231,36 @@
     }
 
     /**
-     * Fetch one page. GM first, the shared lanes as backup — and that order is
-     * deliberate, not inertia. It was re-derived from the transport code:
+     * Fetch one page, preferring the accelerator ports.
      *
-     * - `laneFetch()` is the only path that can pick a mokuro-bridge proxy lane
-     *   (the bridge's accelerator ports). Its eligibility opt is `allowProxy`:
-     *   a lane table with proxy entries is used unless the caller passes
-     *   `{allowProxy:false}`, so a bare `laneFetch(url, ms)` is nominally
-     *   eligible. But the ports have to be *discovered* first, and every
-     *   discovery and every proxy request is a page-realm fetch to
-     *   `http://127.0.0.1:<port>` (`probeBridgeFetchProxy` -> the bridge's
-     *   /health; `laneAttempt` -> `proxyUrlFor`). ebookjapan serves
-     *   `connect-src 'self' https: wss:` (see core/31-mokuro.js, which is why
-     *   the bridge client there goes through GM_xmlhttpRequest), so those plain
-     *   http:// loopback fetches are refused by this page's CSP. The proxy lane
-     *   therefore cannot carry a byte here, and `laneFetch` would burn a
-     *   refused request per page before falling through.
-     * - The remaining lanes cannot beat GM either: `page`/`dot` hit the CDN
-     *   cross-origin (no ACAO -> CORS refusal), and `gm` is GM_xmlhttpRequest —
-     *   the same transport this function already uses first. `edge` is an
-     *   opt-in mirror that is not configured by default.
+     * This page's CSP is `connect-src 'self' https: wss:`, so a page-realm fetch
+     * to `http://127.0.0.1:<port>` is refused before a socket opens. That is why
+     * discovery and the proxy lanes ride GM_xmlhttpRequest once the realm is shown
+     * to be sealed (see core/21-transport-pool.js) - GM runs in the extension's
+     * context and is not subject to it. The old conclusion here, that the
+     * accelerator was "genuinely unreachable" for this site, only ever held for a
+     * page-realm fetch.
      *
-     * So the accelerator is genuinely unreachable for prod-contents-br-page
-     * .akamaized.net on this site, and reordering cannot help; GM is the one
-     * lane that works and the lanes stay the fallback for managers without it.
-     * If ebookjapan's CSP ever gains a loopback connect-src, revisit this.
+     * It matters because a proxy lane is the only transport that gives this site
+     * more than one origin, and one origin is the whole problem: the page CDN
+     * sends no Access-Control-Allow-Origin, so `page`/`dot` are refused by CORS,
+     * and GM straight at the CDN is a single origin and therefore Chrome's
+     * 6-socket ceiling however wide the fan-out is. Each proxy port is its own
+     * origin, so 48 ports are 48 socket pools.
      */
     async function ebjFetchPage(url) {
-        // The page CDN sends no Access-Control-Allow-Origin, so a page-realm
-        // fetch is refused outright — one CORS error per lane attempt per page.
-        // GM_xmlhttpRequest is not subject to that and @connect already lists
-        // the host, so go through it first and keep the shared lanes as backup.
+        // The accelerator first, when one is online. proxyLaneFetch answers null
+        // rather than falling back to the page lane, so a miss cannot pass for a
+        // hit and quietly halve the fan-out.
+        if (typeof proxyLaneFetch === 'function' && proxyLaneAvailable()) {
+            const viaProxy = await proxyLaneFetch(url, 30000);
+            if (viaProxy && viaProxy.ok) {
+                const blob = await viaProxy.blob();
+                return { buf: await blob.arrayBuffer(), lane: 'px' };
+            }
+        }
+        // GM straight at the CDN. It is not subject to CORS and @connect already
+        // lists the host, so it always works - just on one origin.
         if (typeof GM_xmlhttpRequest === 'function') {
             try {
                 const r = await new Promise((ok, no) => {
@@ -219,8 +274,9 @@
                 }
             } catch (e) { /* fall through to the shared lanes */ }
         }
-        // laneFetch resolves rather than rejecting, and the gm lane answers with
-        // {ok,status,blob} only — no headers, no arrayBuffer. So: check res.ok,
+        // Last resort for a manager without GM: the shared lanes. laneFetch
+        // resolves rather than rejecting, and its gm lane answers with
+        // {ok,status,blob} only - no headers, no arrayBuffer. So: check res.ok,
         // then go through blob().
         const res = await laneFetch(url, 30000);
         if (!res || !res.ok) throw new Error('HTTP ' + ((res && res.status) || '?'));
@@ -253,6 +309,17 @@
             ebjState.running = true;
             ebjResetCore();
 
+            // Discovery is asked for once here and awaited just before the
+            // fan-out is sized. The run does need the port list - sizing the
+            // window against a lane table with no ports in it is how a run ends
+            // up at "concurrency 20 on 12 sockets" and never uses the bridge - but
+            // the *resolve* below does not depend on it, so putting the probe on
+            // the critical path only adds its latency to every start. Started
+            // here it overlaps the resolve and the viewer round trips.
+            const prep = { start: ebjNow(), resolveMs: 0 };
+            const discovery = (typeof probeFetchProxy === 'function')
+                ? Promise.resolve().then(probeFetchProxy).catch(() => null) : null;
+
             // The viewer learns the volume a beat after the page loads, and its
             // manifest needs a session the viewer has already negotiated.
             let book = null;
@@ -269,8 +336,16 @@
                     if (i === 0) ebjLog('resolve', 'attempt failed: ' + safeLogText((e && e.message) || e));
                 }
                 if (book && book.pages && book.pages.length) break;
+                // Attempts 1..29 used to be completely silent: a viewer that is
+                // slow to report its volume looked exactly like a hung run. The
+                // loop can spend 30 x ~1.1s, so say that it is waiting.
+                if (i === 0 || (i + 1) % 5 === 0) {
+                    ebjLog('resolve', 'the viewer has not reported the volume yet — retry ' +
+                        (i + 1) + '/30 after ' + ebjMs(ebjNow() - prep.start));
+                }
                 await ebjSleep(500);
             }
+            prep.resolveMs = ebjNow() - prep.start;
             if (!book || !book.pages || !book.pages.length) {
                 throw new Error('the ebookjapan viewer has not reported this volume yet — open ' +
                     'the book and let a page render, then try again.' +
@@ -319,6 +394,12 @@
             ebjShape.image = 'img';
             let glue = null;
             let gatePassed = false;
+            // Released the moment the first page paints (or fails, or takes too
+            // long). The fan-out waits on it so the first page is not queued
+            // behind every other page's fetch.
+            let releaseFirstPaint = () => {};
+            const firstPainted = new Promise(res => { releaseFirstPaint = res; });
+            const firstPaintTimer = setTimeout(() => releaseFirstPaint(), 20000);
 
             // One cursor drives both passes. During the main pass it walks every
             // row in order; the retry pass below re-points it at only the indexes
@@ -369,15 +450,24 @@
                             }
                         }
                         if (!out) {
-                            const bitmap = await decodeImage(got.buf);
-                            const tDecoded = ebjNow();
-                            ebjTimingAdd(ebjTiming, 'decode', tDecoded - tFetched);
-                            const aov = (book.autograph && book.autograph.page === row.page)
-                                ? await loadAutographImage(book.autograph) : undefined;
-                            out = await descramblePage(glue, bitmap, row, geo,
-                                { codec: codec, autographed: aov });
-                            tDone = ebjNow();
-                            ebjTimingAdd(ebjTiming, 'descramble', tDone - tDecoded);
+                            // Wait for a pixel slot before decoding, not after:
+                            // the whole point is that the canvases are never made
+                            // for the pages that are only queued. The network side
+                            // stays as wide as the socket budget allows; this is
+                            // the memory side, and it is a much smaller number.
+                            await ebjAcquireSlot();
+                            try {
+                                const tDecodeStart = ebjNow();
+                                const bitmap = await decodeImage(got.buf);
+                                const tDecoded = ebjNow();
+                                ebjTimingAdd(ebjTiming, 'decode', tDecoded - tDecodeStart);
+                                const aov = (book.autograph && book.autograph.page === row.page)
+                                    ? await loadAutographImage(book.autograph) : undefined;
+                                out = await descramblePage(glue, bitmap, row, geo,
+                                    { codec: codec, autographed: aov });
+                                tDone = ebjNow();
+                                ebjTimingAdd(ebjTiming, 'descramble', tDone - tDecoded);
+                            } finally { ebjReleaseSlot(); }
                         }
                         // The paint gate: "the shuffle ran" is not "the page
                         // painted". The first page decides whether this shape is
@@ -386,11 +476,15 @@
                             const st = out.stats || await canvasStats(null);
                             if (st && !st.error && st.mean < 6) {
                                 gatePassed = true;
+                                releaseFirstPaint();
                                 throw new Error('the descrambler painted an empty page (' + statsText(st) +
                                     ') — refusing to save a book of blank images');
                             }
                             gatePassed = true;
-                            ebjLog('canary', 'page 1 painted ' + statsText(st));
+                            prep.firstPageMs = ebjNow() - prep.start;
+                            releaseFirstPaint();
+                            ebjLog('canary', 'page 1 painted ' + statsText(st) +
+                                ' — ' + ebjMs(prep.firstPageMs) + ' after the run started');
                         }
                         harness.notePage(pageIdx, out.blob, out.crc, out.ext);
                         ebjTimingAdd(ebjTiming, 'write', ebjNow() - tDone);
@@ -409,11 +503,18 @@
             // descrambling on this thread and the cost is one log line.
             // The page phase is what the user experiences as "the download", so
             // its wall clock starts here, after the viewer resolve and the bars.
+            // One gate per run: 16 pages may hold a decoded frame or a canvas at
+            // once. That is the memory bound the pre-fan-out code had by accident
+            // (16 workers), kept deliberately now that the network side is wide.
+            ebjSetSlotLimit(16);
             ebjTiming.start = ebjNow();
             try {
                 if (typeof makePool === 'function' && typeof Worker !== 'undefined' &&
                     typeof OffscreenCanvas !== 'undefined' && rows[0] && rows[0].url) {
-                    if (!(await ebjWorkerAllowed())) {
+                    const tCanary = ebjNow();
+                    const allowed = await ebjWorkerAllowed();
+                    prep.canaryMs = ebjNow() - tCanary;
+                    if (!allowed) {
                         ebjLog('worker-canary', 'this page\u2019s CSP refuses a blob: worker — ' +
                             'descrambling on this thread');
                         throw { ebjSkipPool: true };
@@ -463,12 +564,67 @@
                 }
             }
 
+            // Discovery was started before the resolve; this is where its answer is
+            // needed, because the fan-out is sized from the port list. Awaiting it
+            // here costs only the part the resolve did not already cover.
+            // Only wait for discovery when the run has nothing to size against.
+            // The panel polls the same thing, so on a page that has been open more
+            // than a moment the port list is already known and this probe is a
+            // refresh: awaiting it put the bridge's whole /health round trip in
+            // front of the first page for no gain. When it is not known - a cold
+            // run - waiting is exactly right, and that is the only case that pays.
+            let probeMs = 0;
+            const knownPorts = (typeof proxyPorts !== 'undefined' && proxyPorts && proxyPorts.length) || 0;
+            if (discovery && !knownPorts) {
+                const tProbe = ebjNow();
+                try { await discovery; } catch (e) {}
+                probeMs = ebjNow() - tProbe;
+            } else if (discovery) {
+                // Let the refresh settle on its own; it is already cancelled-safe.
+                try { discovery.catch(() => {}); } catch (e) {}
+            }
+            prep.probeMs = probeMs;
+            prep.totalMs = ebjNow() - prep.start;
+            ebjLastPrep = prep;
             const budget = (typeof fetchSocketBudget === 'function' ? fetchSocketBudget(true) : 6) || 6;
-            const concurrency = Math.max(1, Math.min(total, Math.max(2, Math.min(16, budget))));
+            // The 16 that used to cap this expression was the whole fan-out: no
+            // matter what the transport could carry, this site fetched 16 pages at
+            // a time. That is the second half of why it felt unaccelerated. The cap
+            // is now the same 256-page memory bound CMOA uses - each page holds one
+            // blob while the pool descrambles it - and the window is sized from the
+            // real budget with headroom so the descramble pool stays fed. Lower it
+            // on a low-RAM machine with window.__bwddMaxInflight.
+            let inflightCap = 256;
+            try {
+                if (typeof window !== 'undefined' && window.__bwddMaxInflight > 0) {
+                    inflightCap = Math.max(4, Math.min(256, window.__bwddMaxInflight | 0));
+                }
+            } catch (e) {}
+            const concurrency = Math.max(2, Math.min(total, Math.min(inflightCap,
+                budget + Math.max(8, Math.round(budget * 0.2)))));
             ebjLog('run', 'concurrency ' + concurrency + ' on ' + budget + ' sockets');
+            // Prep is everything between the click and the first page fetch, and
+            // it is the phase that felt slow while the download itself got
+            // faster. Named per step so the next report says which one it is.
+            ebjLog('run', 'prep ' + ebjMs(prep.totalMs) + ' (resolve ' + ebjMs(prep.resolveMs) +
+                ' + canary ' + ebjMs(prep.canaryMs || 0) + ' + probe ' + ebjMs(probeMs) +
+                ') before the first page');
             glue = await ebjLoadGlue();
             const workers = [];
-            for (let w = 0; w < concurrency; w++) workers.push(worker());
+            // Launch a small first wave, then widen once the first page has
+            // painted. Starting all of them at once put the first page - the one
+            // that drives the paint gate, the progress bar and the "has it
+            // started" question - into the same queue as the other 248, which is
+            // why the script looked dead for seconds after the prep line and only
+            // then began. The transport does not need a ramp; the first page's
+            // latency does, because it is the only page anyone is waiting for.
+            const firstWave = Math.max(1, Math.min(concurrency, 12));
+            for (let w = 0; w < firstWave; w++) workers.push(worker());
+            await firstPainted;
+            clearTimeout(firstPaintTimer);
+            if (workers.length < concurrency) {
+                for (let w = firstWave; w < concurrency; w++) workers.push(worker());
+            }
             await Promise.all(workers);
 
             // One retry pass: a page that failed once is usually a transient lane
@@ -544,12 +700,27 @@
         }
     }
 
+    function ebjOwnsHost() {
+        try { return /(^|\.)ebookjapan\.yahoo\.co\.jp$/i.test(location.hostname); } catch (e) { return false; }
+    }
     registerSite({
         id: 'ebookjapan',
         label: 'ebookjapan',
         panelTitle: 'ebookjapan Native Downloader',
+        ownsHost() {
+            return ebjOwnsHost();
+        },
         matches() {
-            try { return /(^|\.)ebookjapan\.yahoo\.co\.jp$/i.test(location.hostname); } catch (e) { return false; }
+            // The viewer only. A /books/<id>/<code>/ page is the shop's detail
+            // page, not the reader: it carries no page list, and an ordinary
+            // page load there must do nothing.
+            try { return ebjOwnsHost() && /^\/viewer\//.test(location.pathname); } catch (e) { return false; }
+        },
+        headlessMatches() {
+            // A detail page resolves a volume through br_api for an explicitly
+            // injected headless run, so the whole store host stays claimable when
+            // that is how the script arrived. The header does not match it.
+            return ebjOwnsHost();
         },
         install() {
             // The viewer URL carries the volume code, so the adapter knows
@@ -613,6 +784,9 @@
         debug: {
             get state() { return ebjState; },
             get shape() { return ebjShape; },
+            // Pages holding pixels right now, against the gate's limit. This is
+            // the number that explains a run that starts fast and then stalls.
+            get processDepth() { return ebjProcessDepth(); },
             get lastDecodePath() { return ebjLastDecodePath; },
             get encodePath() { return ebjEncodePath; },
             get lastShuffleTrace() { return ebjLastShuffleTrace; },
@@ -633,6 +807,24 @@
                     pages: (ebjState.book && ebjState.book.pages) ? ebjState.book.pages.length : 0,
                     canvas: ebjState.book && ebjState.book.canvas ? ebjState.book.canvas : null,
                     shape: { canvas: ebjShape.canvas, image: ebjShape.image },
+                    // The stage split and the lane mix of the last run, so
+                    // "the download is slow" can be answered with numbers:
+                    // fetch/decode/descramble/write totals, the wall clock those
+                    // add up against, and which transport served each page.
+                    timing: ebjLastTiming ? {
+                        wallMs: Math.round(ebjLastTiming.phaseMs),
+                        pages: ebjLastTiming.pages, failed: ebjLastTiming.failed,
+                        retried: ebjLastTiming.retried,
+                        fetchMs: Math.round(ebjLastTiming.fetch.total),
+                        fetchMedianMs: Math.round(ebjMedian(ebjLastTiming.fetch.ring)),
+                        decodeMs: Math.round(ebjLastTiming.decode.total),
+                        descrambleMs: Math.round(ebjLastTiming.descramble.total),
+                        descrambleMedianMs: Math.round(ebjMedian(ebjLastTiming.descramble.ring)),
+                        writeMs: Math.round(ebjLastTiming.write.total),
+                        lanes: Object.assign({}, ebjLastTiming.lanes),
+                        pagesPerSecond: ebjLastTiming.phaseMs > 0
+                            ? +(ebjLastTiming.pages / (ebjLastTiming.phaseMs / 1000)).toFixed(2) : 0,
+                    } : null,
                     lastDecodePath: ebjLastDecodePath,
                     encodePath: ebjEncodePath,
                     lastShuffleTrace: ebjLastShuffleTrace,

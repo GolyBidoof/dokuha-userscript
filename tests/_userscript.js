@@ -15,7 +15,7 @@
 const fs = require('fs');
 const path = require('path');
 
-const US = path.resolve(__dirname, '..', process.env.BWDD_US || 'omnimanga-native-downloader.user.js');
+const US = path.resolve(__dirname, '..', process.env.BWDD_US || 'dokuha-userscript.user.js');
 const REAL_BRIDGE = "'http://127.0.0.1:62642'";
 const DEAD_BRIDGE = "'http://127.0.0.1:1'";
 

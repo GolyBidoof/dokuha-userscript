@@ -1,6 +1,3 @@
-    // =====================================================================
-    // 13. Orchestration & Token Lifecycle
-    // =====================================================================
     let authRefreshPromise = null;
     let pbCounter = 0;
     // Refresh the CloudFront auth policy, coalesced so concurrent callers share
@@ -200,6 +197,13 @@
         // viewer requests are still captured without wrapping bootstrap itself.
         if (shouldDeferNetworkCapture()) {
             try { installNetworkCapture(); } catch (_) {}
+        }
+        // A BookWalker volume's own store page (/de<uuid>/) has no viewer running
+        // and nothing to capture, so a free volume's licence is asked for directly
+        // instead (32-headless.js). This is the only route that fills auth before
+        // the capture checks below, so they then have nothing to do.
+        if (bwHeadlessWanted()) {
+            await bwHeadlessOpenFree(bwHeadlessCid());
         }
         snapshotViewerResources();
         const publicBootstrap = (() => {

@@ -86,7 +86,11 @@
             centralParts.push(centralEntry(nameB, crc, size, dos, offset));
             offset += 30 + nameB.length + size;
             if (onProgress) onProgress(i + 1, ordered.length);
-            if ((i & 15) === 15) await new Promise(r => setTimeout(r, 0));
+            // yieldToTasks, not setTimeout(0): a hidden tab clamps the timer to
+            // a whole second (a minute under intensive throttling), which turns
+            // this responsiveness yield into one second of dead time every 16
+            // pages of a backgrounded ZIP run.
+            if ((i & 15) === 15) await yieldToTasks();
         }
         const cd = new Blob(centralParts);
         const cdBytes = new Uint8Array(await cd.arrayBuffer());

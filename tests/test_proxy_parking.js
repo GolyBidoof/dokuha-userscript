@@ -13,7 +13,7 @@ const fs = require('fs');
 const path = require('path');
 
 const CHROME = process.env.PUPPETEER_EXECUTABLE_PATH || undefined;
-const US = path.resolve(__dirname, '..', process.env.BWDD_US || 'omnimanga-native-downloader.user.js');
+const US = path.resolve(__dirname, '..', process.env.BWDD_US || 'dokuha-userscript.user.js');
 const N_PORTS = 6;
 const DEAD_BRIDGE_PORT = 63999;
 const BUF = Buffer.alloc(1024, 5);
@@ -85,7 +85,6 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
   const probed = await page.evaluate(() => window.__bwdd.probeFetchProxy().then(p => p.length));
   check('proxy lanes are discovered', probed === N_PORTS, probed + ' ports');
 
-  // ---- burst while the proxy is failing ------------------------------
   mode = 'fail';
   await page.evaluate(async (n) => {
     const b = window.__bwdd;
@@ -108,11 +107,9 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
     after.lanesRemaining === 0 && after.parked === N_PORTS,
     after.parked + ' parked, ' + after.lanesRemaining + ' still selectable during the burst');
 
-  // ---- the page lane carried the load meanwhile ----------------------
   check('requests still succeeded via the page lane while parked',
     cdnHits > 0, cdnHits + ' pages fell through to the page lane (proxy was 502ing)');
 
-  // ---- once the burst passes, the ports must come back ---------------
   mode = 'ok';
   await sleep(4200);   // outlast PROXY_PARK_MS
   const recovered = await page.evaluate(() => window.__bwdd.allLanes().filter(l => l.name.startsWith('px:')).length);

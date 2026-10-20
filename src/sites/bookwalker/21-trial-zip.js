@@ -69,7 +69,10 @@
                 sessionId: mokuroSessionId || null, safeTitle: runSafeTitle, total: total
             });
             if (options.pollBridgeStatus !== false) {
-                ocrPoll = setInterval(async () => {
+                // setBackgroundInterval: this poll is the only writer of the
+                // Mokuro bar, and a hidden tab's timers are clamped hard enough
+                // to freeze it for a minute at a time (see core/14-ticker.js).
+                ocrPoll = setBackgroundInterval(async () => {
                     const st = await mokuroStatus(mokuroSessionId);
                     if (!st) return;
                     const done = (st.pages_ocr_done ?? 0);
@@ -80,7 +83,7 @@
                     });
                 }, 700);
                 if (options.registerRunCleanup) options.registerRunCleanup(() => {
-                    if (ocrPoll) { clearInterval(ocrPoll); ocrPoll = null; }
+                    if (ocrPoll) { clearBackgroundInterval(ocrPoll); ocrPoll = null; }
                 });
             }
         }
@@ -143,8 +146,6 @@
                     errors.push(j.fid + '#' + j.no + ': ' + safeLogText((e && e.message) || e));
                 }
                 const el = (performance.now() - t1) / 1000;
-                // Download bar tracks pages fetched from the CDN; Descramble
-                // bar tracks pages processed (zipped / sent to OCR).
                 setBar(barDownload, (fetched / total) * 100, fetched + '/' + total);
                 setBar(barDescramble, (okIdx.size / total) * 100, okIdx.size + '/' + total);
                 reportRunProgress(options, 'page', {
@@ -162,11 +163,11 @@
             setRunDetails(details,
                 msgAllFailedZip(),
                 errors);
-            if (ocrPoll) { clearInterval(ocrPoll); ocrPoll = null; }
+            if (ocrPoll) { clearBackgroundInterval(ocrPoll); ocrPoll = null; }
             return outcome(false);
         }
         if (mode === 'ocr' && mokuroSessionId) {
-            if (ocrPoll) { clearInterval(ocrPoll); ocrPoll = null; }
+            if (ocrPoll) { clearBackgroundInterval(ocrPoll); ocrPoll = null; }
             const missingOcr = total - okIdx.size;
             if (options.deferFinalize) {
                 // Deferred mode is deliberately page-stream-only.  The external
@@ -177,6 +178,11 @@
                 return outcome(missingOcr === 0);
             }
             const { result, plan } = await finalizeOcrSession(mokuroSessionId, ui, barUpload, barMokuro, total, trialUploadFeed, options);
+            // done with status=partial_upload: the volume files are there but
+            // the series index is not, so outcome() must not report success.
+            const partialUpload = !!(result && result.partialUpload);
+            const partialMsg = partialUpload ? msgPartialUpload(result) : '';
+            if (partialUpload) errors.push(partialMsg);
             barMokuro.fill.style.width = '100%';
             barMokuro.labRate.textContent = okIdx.size + '/' + okIdx.size;
             if (missingOcr > 0) {
@@ -184,14 +190,16 @@
                     msgOcrPartial(missingOcr, total),
                     errors);
             } else {
-                if (plan && plan.method === 'local') {
+                if (partialUpload) {
+                    setRunDetails(details, partialMsg, errors);
+                } else if (plan && plan.method === 'local') {
                     const localPath = storedPathOf(result) || plan.localDir;
                     if (localPath) details.textContent = msgStoredLocal(localPath);
                 } else if (plan && plan.method) {
                     const rp = result && (result.remote_path || result.mega_path);
                     if (rp) details.textContent = msgUploadedTo(methodShortLabel(plan.method), rp);
                 }
-                if (errors.length) appendRunDetails(details, errors, 'Issues during the run');
+                if (!partialUpload && errors.length) appendRunDetails(details, errors, 'Issues during the run');
             }
             ui.showReaderButton(result);
             ui.showStoredButton(result);

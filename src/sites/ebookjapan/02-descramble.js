@@ -1,6 +1,3 @@
-    // =====================================================================
-    // ebookjapan — canvas realms, the portable encoder, and the descrambler
-    // =====================================================================
     // Ported from the standalone script, where every part of this was forced by
     // a real failure rather than chosen:
     //
@@ -40,7 +37,6 @@
     let ebjSimulatedTraps = 0;
     let ebjFrameRealmSlot = null;
 
-    /** Debug-gated log, matching the core's quiet-by-default posture. */
     function ebjLog(kind, text) {
         try {
             if (typeof BWDD_DEBUG !== 'undefined' && BWDD_DEBUG) {
@@ -237,7 +233,7 @@
         const Off = (ebjPage && ebjPage.OffscreenCanvas) ||
             (typeof OffscreenCanvas === 'function' ? OffscreenCanvas : null);
         if (want !== 'html' && Off) {
-            try { return new Off(w, h); } catch (e) { /* fall back */ }
+            try { return new Off(w, h); } catch (e) {  }
         }
         const doc = (ebjPage && ebjPage.document) || document;
         const c = doc.createElement('canvas');
@@ -581,7 +577,7 @@
     async function asBytes(v) {
         const direct = asArrayBuffer(v);
         if (direct) return direct;
-        if (v && typeof v.arrayBuffer === 'function') {   // Blob-like
+        if (v && typeof v.arrayBuffer === 'function') {
             const ab = await v.arrayBuffer();
             return asArrayBuffer(ab) || ab;
         }

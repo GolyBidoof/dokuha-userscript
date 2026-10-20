@@ -57,7 +57,7 @@
                     errors: Array.isArray(event.errors) ? event.errors.slice() : undefined
                 }));
             }
-        } catch (e) { /* the page-level hook is best effort */ }
+        } catch (e) {  }
     }
     function newAutomationResult(mode, cid, deferredFinalize) {
         return {

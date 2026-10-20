@@ -1,7 +1,7 @@
     const PANEL_POS_KEY = 'bwdd-panel-pos';
     const PANEL_COLLAPSED_KEY = 'bwdd-panel-collapsed';
-    const PANEL_WIDTH_KEY = 'bwdd-panel-width';   // manual resize, if any
-    const PANEL_HEIGHT_KEY = 'bwdd-panel-height';   // manual vertical resize, if any
+    const PANEL_WIDTH_KEY = 'bwdd-panel-width';
+    const PANEL_HEIGHT_KEY = 'bwdd-panel-height';
 
     function buildUI() {
         injectStyles();
@@ -39,7 +39,15 @@
         ghLink.setAttribute('aria-label', 'Open the GitHub repository in a new tab');
         ghLink.title = 'GitHub repository: ' + BWDD_REPO_URL;
         ghLink.innerHTML = '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>';
-        titleSub.append(sub, ghLink);
+        const mark = document.createElement('a');
+        mark.className = 'bwdd-mark';
+        mark.href = BWDD_REPO_URL;
+        mark.target = '_blank';
+        mark.rel = 'noopener noreferrer';
+        mark.textContent = BWDD_SCRIPT_NAME;
+        mark.title = BWDD_SCRIPT_NAME + ' \u2014 the combined downloader: ' + BWDD_REPO_URL;
+        mark.setAttribute('aria-label', 'Open the ' + BWDD_SCRIPT_NAME + ' repository in a new tab');
+        titleSub.append(sub, mark, ghLink);
 
         // A single-store build also points at the combined script. The module
         // that defines this is not in every target, so check before calling.
@@ -88,8 +96,6 @@
             try { if (edgeTab) edgeTab.remove(); } catch (e) {}
         };
 
-        // "Flap" control: slides the whole panel off the right edge of the
-        // screen (a small tab on the right edge brings it back).
         const flapBtn = document.createElement('button');
         flapBtn.type = 'button';
         flapBtn.className = 'bwdd-ctrl-btn';
@@ -100,8 +106,6 @@
 
         ctrlGroup.append(flapBtn, minBtn, closeBtn);
 
-        // Visible drag grip at the left of the header (the whole header also
-        // drags, this just makes the affordance obvious).
         const dragGrip = document.createElement('span');
         dragGrip.className = 'bwdd-drag-grip';
         dragGrip.setAttribute('aria-hidden', 'true');
@@ -123,8 +127,6 @@
         bridgeRow.title = 'mokuro-bridge: a small local app (github.com/GolyBidoof/mokuro-bridge) that runs mokuro OCR on the downloaded pages and can upload the results.';
         bridgeRow.append(dot, bridgeText);
 
-        // Red alert shown below the bridge row when the bridge runs but mokuro
-        // itself is not installed, the OCR button is unusable in that state.
         const mokuroAlert = document.createElement('div');
         mokuroAlert.className = 'bwdd-mokuro-alert';
         mokuroAlert.style.display = 'none';
@@ -162,9 +164,6 @@
         infoTitle.className = 'bwdd-bridge-info-title';
         infoTitle.textContent = 'What is the Mokuro Bridge?';
 
-        // Section 1, the mokuro OCR engine installed on this machine
-        // (version + custom-fork marker), or a red note when it's missing.
-        // Updated from /health on each status tick.
         const mokuroSection = document.createElement('div');
         mokuroSection.className = 'bwdd-bridge-info-section';
         const mokuroSectionHeading = document.createElement('span');
@@ -196,7 +195,6 @@
         const divider3 = document.createElement('hr');
         divider3.className = 'bwdd-bridge-info-divider';
 
-        // Section 3, how many connections this run will actually get. Filled by
         // renderCapabilities() on every bridge poll, so it is accurate whether or
         // not the bridge is running.
         const connSection = document.createElement('div');
@@ -232,7 +230,6 @@
         bridgeAnchor.className = 'bwdd-bridge-anchor';
         bridgeAnchor.append(bridgeRow, bridgeInfoPop);
 
-        // Human-readable busy reason from the bridge's /health fields.
         function busyReason(info) {
             if (!info) return '';
             const stage = info.busy_stage;
@@ -244,7 +241,7 @@
             return '';
         }
         async function updateBridgeDot() {
-            if (!root.isConnected) return;   // panel closed, skip the tick entirely
+            if (!root.isConnected) return;
             const ok = await bridgeHealth();
             let mokuroMissing = false;
             let mokuroDetailText = '';
@@ -291,14 +288,12 @@
             infoMokuro.textContent = mokuroDetailText;
             bridgeOnline = ok && !mokuroMissing;
             if (ok && mokuroMissing) {
-                // Bridge up but no OCR engine: block OCR, show a red alert.
                 dot.className = 'bwdd-indicator-dot offline';
                 mokuroAlert.style.display = 'block';
                 mokuroAlert.textContent = 'Mokuro is not installed on this machine. ' +
                     'OCR cannot run until you install it — e.g. run “pip install mokuro” (or point ' +
                     'the bridge at your mokuro checkout) in the mokuro-bridge folder, then restart the bridge.';
             } else if (ok && bridgeBusy) {
-                // Bridge is working (OCR/upload), amber dot + reason.
                 dot.className = 'bwdd-indicator-dot busy';
                 mokuroAlert.style.display = 'none';
             } else {
@@ -312,8 +307,8 @@
                 // (the run reads it again at finalize time).
                 if (!runBusy) { try { populateDestMethods(); } catch (e) {} }
                 if (bridgeBusy) {
-                    // While the bridge is busy, say what it's doing instead of
-                    // re-asserting "online" (the dot is already amber).
+                    // Say what the bridge is doing rather than re-asserting
+                    // "online": the dot is already amber.
                     bridgeText.textContent = 'Mokuro Bridge busy — ' + (busyReason({ busy: true, busy_stage: bridgeBusyStage, busy_detail: bridgeBusyDetail }) || 'working');
                     bridgeRow.title = 'mokuro-bridge: ' + (bridgeBusyDetail ? bridgeBusyDetail + ' · ' : '') + 'github.com/GolyBidoof/mokuro-bridge';
                 } else {
@@ -413,8 +408,6 @@
         const barDescramble = mkBar('2. Tile Descramble', 'linear-gradient(90deg, #3b82f6, #1d4ed8)', 'Descramble Progress');
         const barMokuro = mkBar('3. Mokuro Bridge', 'linear-gradient(90deg, #f59e0b, #d97706)', 'OCR Pipeline Progress');
         const barUpload = mkBar('4. Upload', 'linear-gradient(90deg, #8b5cf6, #6d28d9)', 'Upload Progress');
-        // What each bar counts (hover/AT hint; the Mokuro rate reads done/received/total,
-        // and the faint amber underlay is pages the bridge received but hasn't OCR'd yet).
         barDownload.wrap.title = 'Pages fetched from ' + siteLabel() + '\u2019s CDN';
         barDescramble.wrap.title = 'Pages reassembled from their scrambled tiles';
         barMokuro.wrap.title = 'Pages OCR\u2019d / pages received by the bridge / total pages \u2014 faint amber = received but not yet OCR\u2019d';
@@ -443,13 +436,6 @@
 
         btnRow.append(btnZip, btnOcr);
 
-        // --- Archive name (above the download buttons) ---------------------
-        // One compact row (label + textbox + "?" tooltip button) that sets the
-        // name of the archive the buttons below generate: the .zip "Save as ZIP"
-        // downloads, or the volume the bridge stores/uploads (.cbz) when OCR
-        // runs. Auto-filled with this book's displayed title and refreshed when
-        // the reader moves to another book, but a name the user typed is never
-        // overwritten; empty = back to the default.
         const nameWrap = document.createElement('div');
         nameWrap.className = 'bwdd-name';
         const nameLabel = document.createElement('label');
@@ -486,7 +472,6 @@
         namePopP3.textContent = 'ZIP pages sit flat inside the archive; OCR uploads still land under the series folder. Invalid file-name characters are stripped.';
         namePop.append(namePopP1, namePopP2, namePopP3);
         nameWrap.append(nameLabel, nameInput, nameInfoDot, namePop);
-        // Click the "?" to toggle the popover; click elsewhere to dismiss it.
         function setArchivePop(open) {
             if (open) placePopover(namePop, nameWrap, 'right');
             else namePop.hidden = true;
@@ -530,12 +515,9 @@
             return dflt || fsSafePath(siteCid() || '') || 'book';
         }
 
-        // --- Upload destination picker (OCR mode) ---
-        // Lets the user choose where mokuro-bridge stores the finished volume, per
-        // request: any configured remote method, or 'local' + a directory.
         const destWrap = document.createElement('div');
         destWrap.className = 'bwdd-dest';
-        destWrap.style.display = 'none';   // shown only while the bridge is running
+        destWrap.style.display = 'none';
         const destLabel = document.createElement('label');
         destLabel.className = 'bwdd-dest-label';
         destLabel.textContent = 'Mokuro output destination';
@@ -593,7 +575,7 @@
             // A run may have started while this fetch was in flight: never
             // repopulate (and thereby change) the pick it will finalize with.
             if (runBusy) return;
-            const prevValue = destSelect.value;   // keep the user's visible pick
+            const prevValue = destSelect.value;
             destSelect.textContent = '';
             let def = 'local';
             if (methods && Array.isArray(methods.methods) && methods.methods.length) {
@@ -665,8 +647,6 @@
             updateDestHint();
             refreshOcrButton();
         }
-        // Whether the destination currently chosen in the dropdown is one the
-        // bridge hasn't been set up for yet.
         function selectedNeedsSetup() {
             const o = destSelect.selectedOptions && destSelect.selectedOptions[0];
             return !!(o && o.dataset && o.dataset.unconfigured);
@@ -682,10 +662,6 @@
                 ? 'This destination is not set up yet — run the command below once, then it will be usable here.'
                 : ((runBusy || bridgeOnline) ? btnOcrTip : 'Start the Mokuro Bridge to enable OCR');
         }
-        // The setup hint is tied to the selection: it appears only when the
-        // chosen destination isn't configured yet (and the OCR button stays
-        // disabled until it is). Once the provider is set up, the next health
-        // tick lists it as configured and the hint disappears.
         function updateDestHint() {
             const selOpt = destSelect.selectedOptions && destSelect.selectedOptions[0];
             if (!selOpt || !selOpt.dataset || !selOpt.dataset.unconfigured) {
@@ -704,19 +680,37 @@
         localDirInput.addEventListener('change', () => { try { localStorage.setItem('bwdd-local-dir', localDirInput.value); } catch (e) {} });
         try { const saved = localStorage.getItem('bwdd-local-dir'); if (saved) localDirInput.value = saved; } catch (e) {}
         populateDestMethods();
-        // --- Run-state lock --------------------------------------------------
         // While a run is in progress the action buttons and the destination
         // section are disabled: no second download, and no changing the
         // destination an OCR run re-reads at finalize time.
-        let bridgeOnline = false;   // last known bridge /health result
-        let runBusy = false;        // a download/OCR run is in progress
+        let bridgeOnline = false;
+        let runBusy = false;
 
+        // The run lives in this tab: every page already fetched and descrambled
+        // is in memory here, and the finalize stream is a request this page is
+        // reading. Closing the tab loses all of it, so hold the browser's own
+        // "leave site?" prompt for exactly as long as a run is in progress - a
+        // stale handler would nag on every later navigation instead.
+        let unloadGuardArmed = false;
+        function onBeforeUnload(e) {
+            e.preventDefault();
+            // Legacy Chromium reads returnValue; current Chrome shows its own text.
+            e.returnValue = '';
+            return '';
+        }
+        function setUnloadGuard(active) {
+            if (active === unloadGuardArmed) return;
+            unloadGuardArmed = active;
+            try {
+                if (active) window.addEventListener('beforeunload', onBeforeUnload);
+                else window.removeEventListener('beforeunload', onBeforeUnload);
+            } catch (e) {}
+        }
         function setRunLock(busy) {
             runBusy = busy;
+            setUnloadGuard(busy);
             btnZip.disabled = busy;
             btnZip.setAttribute('aria-disabled', String(busy));
-            // OCR availability folds in the destination-setup state too, see
-            // refreshOcrButton (kept in sync on every selection change).
             refreshOcrButton();
             const destLocked = busy || !bridgeOnline;
             destSelect.disabled = destLocked;
@@ -745,9 +739,6 @@
             }
         }
 
-        // Post-run actions, "Open Reader Mokuro" + "Open stored file / Copy path":
-        // one quiet row of secondary (ghost) buttons after a successful OCR run,
-        // each spanning the row when the other has nothing to offer (grid auto-fit).
         const postRunRow = document.createElement('div');
         postRunRow.className = 'bwdd-reader-row';
         postRunRow.style.display = 'none';
@@ -837,10 +828,6 @@
             syncPostRunRow();
         }
 
-        // Two-column layout: download & bridge controls on the left, reading stats
-        // on the right. The stats column mounts only once the first card lands in
-        // statsEl; until then the panel is a single controls column.
-        // ---- pre-flight readout ------------------------------------------
         // These numbers live in the bridge row's "?" popover, not the panel body:
         // they matter before a run, but not often enough to earn permanent space.
         function renderCapabilities() {
@@ -861,6 +848,14 @@
                     'this run has up to ' + c.sockets + ' network sockets instead of ' +
                     c.withoutBridge + '. Up to ' + c.decodePages + ' pages decode concurrently; ' +
                     'the fetch window is bounded separately to avoid retaining the whole volume.';
+                // The per-origin sum can exceed what one browser profile may
+                // open; say so rather than promising sockets that cannot exist.
+                if (c.socketsClamped) {
+                    explain += ' Those ports would add up to ' + c.rawSockets + ', but the browser ' +
+                        'caps a profile at ' + CHROMIUM_SOCKETS_PER_PROCESS + ' sockets in total, so ' +
+                        'the run uses ' + c.sockets + ' and keeps ' + CONTROL_PLANE_SOCKET_RESERVE +
+                        ' in reserve for the manifest, policy refresh and bridge checks.';
+                }
             } else if (c.ports) {
                 explain = 'mokuro-bridge answered earlier (' + c.ports + ' ports) but is not ' +
                     'reachable now, so this run would use ' + c.effectiveSockets + ' connections. ' +
@@ -876,7 +871,6 @@
                 workerBatchSize(IMAGE_CODEC.type) + ' page each concurrently as they arrive; that number follows your CPU, not the bridge.';
         }
 
-        // ---- page image format (advanced, collapsed) ----------------------
         const fmtDetails = document.createElement('details');
         fmtDetails.className = 'bwdd-fmt';
         const fmtSummary = document.createElement('summary');
@@ -940,7 +934,6 @@
             renderCapabilities();
         }
 
-        // Reflect whatever is already configured (console or a previous visit).
         {
             const wantedFmt = IMAGE_CODEC.fmt;
             if (![...fmtCtl.sel.options].some(o => o.value === wantedFmt)) {
@@ -976,8 +969,6 @@
         const colSep = document.createElement('div');
         colSep.className = 'bwdd-col-sep';
 
-        // Mount the stats column (+ separator) and widen the panel to its
-        // two-column size the moment the first card lands.
         function mountStatsColumn() {
             const manual = parseFloat(root.style.width);
             const manualWide = isFinite(manual) && manual >= 620;
@@ -995,7 +986,7 @@
             mountStatsColumn();
         });
         statsObs.observe(statsEl, { childList: true });
-        if (statsEl.childElementCount) { statsMounted = true; mountStatsColumn(); }   // safety net
+        if (statsEl.childElementCount) { statsMounted = true; mountStatsColumn(); }
 
         body.append(colMain);
         root.append(head, body);
@@ -1005,19 +996,17 @@
         // the first 10 s interval tick.
         try { updateBridgeDot(); } catch (e) {}
 
-        // "Flap": slide the whole panel off the right edge of the screen. A
-        // small tab stays docked on the right edge to bring it back.
         const edgeTab = document.createElement('button');
         edgeTab.type = 'button';
         edgeTab.className = 'bwdd-edge-tab';
         edgeTab.setAttribute('aria-label', 'Show the ' + sitePanelTitle() + ' panel');
         edgeTab.title = 'Show the ' + sitePanelTitle() + ' panel';
-        edgeTab.textContent = '\u00AB';   // fancy "<<", pull the panel back in from the right
+        edgeTab.textContent = '\u00AB';
         edgeTab.style.display = 'none';
         document.documentElement.appendChild(edgeTab);
 
         function flapOut() {
-            if (edgeTab.style.display === 'flex') return;   // already away
+            if (edgeTab.style.display === 'flex') return;
             const r = root.getBoundingClientRect();
             // Push the panel fully past the right edge. Its left/top position is
             // untouched, so clearing the transform returns it exactly where it was.
@@ -1045,7 +1034,7 @@
             root.classList.remove('bwdd-flapped');
             root.style.transform = '';
             root.removeAttribute('aria-hidden');
-            root.inert = false;   // restore tab order + focusability
+            root.inert = false;
             edgeTab.style.display = 'none';
             flapBtn.setAttribute('aria-expanded', 'true');
             flapBtn.setAttribute('aria-label', 'Hide the panel to the right edge');
@@ -1054,7 +1043,6 @@
         edgeTab.addEventListener('click', () => flapIn());
         flapBtn.onclick = () => flapOut();
 
-        // --- Manual resize (corner handle) + remembered width -------------
         const resizeHandle = document.createElement('div');
         resizeHandle.className = 'bwdd-resize';
         resizeHandle.setAttribute('aria-hidden', 'true');
@@ -1130,7 +1118,6 @@
         } catch (e) {}
         try { if (localStorage.getItem(PANEL_COLLAPSED_KEY) === '1') setCollapsed(true); } catch (e) {}
 
-        // Draggable Functionality (pointer + keyboard; Esc collapses)
         let dragging = false;
         let dragPointerId = null;
         let pos = { x: 0, y: 0 };
@@ -1205,7 +1192,6 @@
                     populateDestMethods, onDestChange,
                     renderCapabilities, capabilitySummary, workerPoolSize, discoverProxyPorts,
                     fmtSelect: fmtCtl.sel, qSelect: qCtl.sel,
-                    // programmatic control, for tests and console use
                     setImageFormat(fmt, quality) {
                         if (fmt) fmtCtl.sel.value = fmt;
                         if (quality != null) qCtl.sel.value = String(quality);
@@ -1215,7 +1201,7 @@
                 });
             } catch (e) { try { console.error('[bwdd] UI export failed:', safeLogText(e)); } catch (e2) {} }
         }
-        return { root, details, statsEl, barWrap, barDownload, barDescramble, barMokuro, barUpload, btnZip, btnOcr, destSelect, localDirInput, destHint, populateDestMethods, setRunLock, showReaderButton, hideReaderButton, showStoredButton, hideStoredButton, syncArchiveDefault };
+        return { root, details, statsEl, barWrap, barDownload, barDescramble, barMokuro, barUpload, btnZip, btnOcr, btnRow, nameWrap, destSelect, localDirInput, destHint, populateDestMethods, setRunLock, showReaderButton, hideReaderButton, showStoredButton, hideStoredButton, syncArchiveDefault };
     }
 
     // Three-value Mokuro progress: done / received / total.
@@ -1257,9 +1243,6 @@
         det.append(sum, pre);
         return det;
     }
-    // Show a run outcome in the status area: a plain summary plus (when the
-    // caller has raw per-page error lines) a collapsible "technical details"
-    // block so the raw internals never dominate the message.
     function setRunDetails(el, summary, rawLines) {
         if (!el) return;
         el.textContent = '';
@@ -1267,8 +1250,6 @@
         const det = makeTechDetails(rawLines);
         if (det) el.appendChild(det);
     }
-    // Append diagnostics to an already-set status line (used when a run fully
-    // succeeded but some pages needed retries, nothing silently swallowed).
     function appendRunDetails(el, rawLines, label) {
         if (!el) return;
         const det = makeTechDetails(rawLines, label);

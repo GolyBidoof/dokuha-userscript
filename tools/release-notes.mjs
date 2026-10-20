@@ -1,9 +1,5 @@
 #!/usr/bin/env node
 /*
- * Prints the CHANGELOG section for a tag, for use as GitHub release notes.
- *
- *   node tools/release-notes.mjs v1.9.0
- *
  * Exits non-zero when there is no section, so a release cannot quietly ship with
  * empty notes: the changelog is the release body, and a missing entry means the
  * bump was not finished.

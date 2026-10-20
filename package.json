@@ -1,18 +1,41 @@
 {
-  "name": "bookwalker-ebookjapan-cmoa-native-downloader",
-  "version": "2.0.0",
+  "name": "dokuha-userscript",
+  "version": "3.0.0",
   "private": true,
-  "repository": "https://github.com/GolyBidoof/bookwalker-ebookjapan-cmoa-native-downloader",
-  "description": "Browser userscript that downloads, descrambles and archives books from BookWalker, CMOA and ebookjapan.",
+  "description": "Browser userscript that downloads, descrambles and archives books from BookWalker, CMOA, ebookjapan, Kindle and k-manga.",
+  "keywords": [
+    "userscript",
+    "manga",
+    "download",
+    "bookwalker",
+    "cmoa",
+    "ebookjapan",
+    "kindle",
+    "k-manga",
+    "mokuro"
+  ],
+  "homepage": "https://github.com/GolyBidoof/dokuha-userscript#readme",
+  "bugs": {
+    "url": "https://github.com/GolyBidoof/dokuha-userscript/issues"
+  },
+  "repository": "https://github.com/GolyBidoof/dokuha-userscript",
   "license": "MIT",
+  "author": "GolyBidoof",
+  "contributors": [
+    "DeepSeek V4.1 Flash"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "build": "node build.mjs",
-    "bump": "node bump.mjs",
+    "bump": "node tools/bump.mjs",
     "notes": "node tools/release-notes.mjs",
     "sync-urls": "node tools/sync-urls.mjs",
     "check:build": "node build.mjs --check",
     "test": "node tests/run.js",
     "test:bridge": "BWDD_RUN_BRIDGE_E2E=1 node tests/test_bridge_e2e.js",
+    "test:acceptance": "node tests/acceptance/run.js",
     "browser": "puppeteer browsers install chrome"
   },
   "devDependencies": {

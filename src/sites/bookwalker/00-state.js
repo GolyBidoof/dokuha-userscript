@@ -1,7 +1,4 @@
 
-    // =====================================================================
-    // 1. Capture the viewer's own network responses (browser data reuse)
-    // =====================================================================
     const state = {
         cid: (new URLSearchParams(location.search)).get('cid') || '',
         fileBases: {},

@@ -1,6 +1,3 @@
-    // =====================================================================
-    // 7. Manga stats bridge (manga-kotoba + LearnNatively)
-    // =====================================================================
     // Cross-origin fetch for the stats bridges. Neither site is usable with a
     // plain page fetch: learnnatively.com sends no CORS headers, and
     // manga-kotoba.com stopped reflecting the Origin (a bare fetch now fails with
@@ -49,6 +46,19 @@
     }
     function extractVolumeNumber(title) {
         const t = String(title || '');
+        // A title may open with a number that is part of its name
+        // ("１００日後に夫を棄てる妻の話（１）", "123サンプル… 分冊版(1)"), so a volume
+        // number is looked for where a volume marker belongs first: at the end,
+        // optionally bracketed and optionally followed by 巻/話. Taking the
+        // first number read that 100 as the volume and no row ever matched
+        // volume 1, which left whole storefronts without a price.
+        const tail = t.match(/[（(]?\s*([0-9０-９]{1,4})\s*[）)]?\s*[巻話]?\s*$/);
+        if (tail) {
+            const digits = tail[1].replace(/[０-９]/g, c => String.fromCharCode(c.charCodeAt(0) - 0xFEE0));
+            return parseInt(digits, 10);
+        }
+        const kanjiTail = t.match(/([一二三四五六七八九十百]+)\s*[巻話]\s*$/);
+        if (kanjiTail) return kanjiNum(kanjiTail[1]);
         const full = t.match(/([0-9０-９]+)/);
         if (full) {
             const digits = full[1].replace(/[０-９]/g, c => String.fromCharCode(c.charCodeAt(0) - 0xFEE0));
@@ -167,7 +177,11 @@
             cur = cur
                 .replace(/[\s　]*(文庫版|新装版|完全版|愛蔵版|廉価版|普及版|電子版|特装版|限定版|豪華版|分冊版|合本版|オンデマンド版|デジタル版|単行本版|ノベルズ版|ペーパーバック版)[\s　]*$/u, '')
                 .replace(/[\s　]*[(（]*(文庫|新装|完全|愛蔵|廉価|普及)[)）]*[\s　]*$/u, '')
-                .replace(/[\s　]*第?[一二三四五六七八九十百0-9０-９]*[巻話版編]?[\s　]*$/u, '')
+                // A volume marker needs a number with it. A bare trailing 話 or
+                // 版 is usually part of the title ("…棄てる妻の話"), so stripping
+                // it produced "…棄てる妻の" and the real base title was never
+                // generated, which is how a 分冊版 lost every store.
+                .replace(/[\s　]*第?[0-9０-９一二三四五六七八九十百]+[巻話版編]?[\s　]*$/u, '')
                 .trim();
             push(cur);
             if (cur === before) break;
@@ -198,8 +212,8 @@
             const first = items[0];
             const sid = first.series_id.replace(/-/g, '').slice(0, 10);
             let volUrl = null, volTitle = null, level = null;
-            let matchedNo = null;      // which volume the resolved link actually is
-            let fallbackNearest = null; // nearest available volume when exact not found
+            let matchedNo = null;
+            let fallbackNearest = null;
             try {
                 const shtml = (await gmFetch('https://learnnatively.com/series/' + sid + '/')).text;
                 const sdoc = new DOMParser().parseFromString(shtml, 'text/html');
@@ -311,7 +325,6 @@
             .catch(e => { if (BWDD_DEBUG) console.warn('[bwdd] LearnNatively lookup error:', safeLogText(e && e.message)); });
     }
 
-    // Card helpers (accessible: real links, labelled pills, dl rows)
     function el(tag, cls, text) {
         const n = document.createElement(tag);
         if (cls) n.className = cls;
@@ -420,7 +433,6 @@
         if (head.childElementCount) card.appendChild(head);
         const bits = [];
         if (ln.avgRating != null) {
-            // Label the count: ratings when present, otherwise reviews.
             if (ln.ratings != null) {
                 bits.push(`★ ${Number(ln.avgRating).toFixed(1)} · ${Number(ln.ratings).toLocaleString()} ratings`);
             } else if (ln.reviews != null) {
