@@ -45,6 +45,12 @@ Tampermonkey asks for cross-origin access to the stats and store-search hosts. T
   </tr>
 </table>
 
+<table align="center">
+  <tr>
+    <td align="center"><img width="620" alt="The dokuha-userscript panel on the DMMブックス viewer after a finished free volume: 201 pages saved as a ZIP in 7.3 seconds, the page size and free edition in Book Details, and the also-available-on card with BookWalker, ebookjapan, Kindle and DMMブックス itself." src="docs/images/panel-dmm.png" /><br /><sub>DMMブックス: a finished 201 page free volume, with the six-shop availability card and the reading-stat card.</sub></td>
+  </tr>
+</table>
+
 ## Why people use it
 
 - **Full resolution, not screenshots.** The CDN page file is fetched and rebuilt offline, so the output is the page as published rather than a picture of the page as displayed. JPEG at q0.92 is the default, and WebP, lossless and PNG are also available.
