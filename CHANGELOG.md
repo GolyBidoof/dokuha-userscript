@@ -518,6 +518,7 @@ First round of fixes from testing against the live CMOA reader.
 
 ### Added
 
+- **BookWalker pages are named after the manifest source they came from.** A page rebuilt from `OEBPS/text/cover.xhtml` is now `0001 cover.jpg` instead of `page-0001.jpg`, in the ZIP, in the filename sent to mokuro-bridge and in the page cache, with the four-digit ordinal kept first so a plain name sort is still reading order. Merged from PR #1 by [@ChristopherFritz](https://github.com/ChristopherFritz); the trial ZIP keeps manifest-derived names for multiple images from one source file. Covered by `tests/test_bookwalker_naming.js`.
 - **CMOA support.** The script now also runs on `cmoa.jp/bib/speedreader/` pages
   and downloads the open volume as a ZIP, with the same panel, controls, ZIP
   naming, reading-stat cards and mokuro-bridge OCR/upload pipeline as

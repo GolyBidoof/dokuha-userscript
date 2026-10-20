@@ -2793,7 +2793,8 @@ let __crcTable = null;
     }
     const enc = new TextEncoder();
     function zipEntryNumber(path) {
-        const m = String(path || '').match(/page-(\d+)\./i);
+        const name = String(path || '').split('/').pop();
+        const m = name.match(/^(\d+)(?=[ .])/) || name.match(/page-(\d+)\./i);
         return m ? Number(m[1]) : Infinity;
     }
     async function buildStoreZip(entries, onProgress) {

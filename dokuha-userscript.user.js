@@ -102,6 +102,25 @@
         configBody: null,
         configFromUrl: null
     };
+    function bookWalkerPageName(index, source) {
+        const path = String(source || '').split(/[?#]/, 1)[0];
+        const base = path.slice(path.lastIndexOf('/') + 1);
+        const stem = fsSafePath(base.replace(/\.(?:x?html?)$/i, ''));
+
+        const prefix = String(index).padStart(4, '0');
+        const suffix = '.' + IMAGE_CODEC.ext;
+        const encoder = new TextEncoder();
+        const budget = 255 - encoder.encode(prefix + ' ' + suffix).length;
+        let name = '';
+        let bytes = 0;
+        for (const char of stem) {
+            const size = encoder.encode(char).length;
+            if (bytes + size > budget) break;
+            name += char;
+            bytes += size;
+        }
+        return prefix + (name ? ' ' + name : '') + suffix;
+    }
 
     let headlessBid = null;
 
@@ -4718,7 +4737,8 @@ let __crcTable = null;
     }
     const enc = new TextEncoder();
     function zipEntryNumber(path) {
-        const m = String(path || '').match(/page-(\d+)\./i);
+        const name = String(path || '').split('/').pop();
+        const m = name.match(/^(\d+)(?=[ .])/) || name.match(/page-(\d+)\./i);
         return m ? Number(m[1]) : Infinity;
     }
     async function buildStoreZip(entries, onProgress) {
@@ -8037,9 +8057,10 @@ async function downloadTrialZip(ui, config, contents, title, sv, mode, details, 
                     const S = (pl[j.no] && pl[j.no].Page && pl[j.no].Page.Size) ||
                              (pl[0] && pl[0].Page && pl[0].Page.Size);
                     blob = await cropToSize(blob, S);
+                    const pageName = bookWalkerPageName(pageIdx, j.fid);
                     okIdx.add(pageIdx);
                     fetched++;
-                    if (zip) zip.entries.push({ path: 'page-' + String(pageIdx).padStart(4, '0') + '.' + IMAGE_CODEC.ext, blob });
+                    if (zip) zip.entries.push({ path: pageName, blob });
                     if (mode === 'ocr' && mokuroSessionId) {
 
                         if (!options.skipCover && pageIdx === 1 && !trialCoverState.fired) {
@@ -8051,7 +8072,7 @@ async function downloadTrialZip(ui, config, contents, title, sv, mode, details, 
                             }).catch(() => {});
                         }
                         try {
-                            await mokuroStreamPage(mokuroSessionId, blob, 'page-' + String(pageIdx).padStart(4, '0') + '.' + IMAGE_CODEC.ext, pageIdx);
+                            await mokuroStreamPage(mokuroSessionId, blob, pageName, pageIdx);
                             reportRunProgress(options, 'page-stream', {
                                 page: pageIdx, pageCount: okIdx.size, total: total
                             });
@@ -8391,6 +8412,7 @@ async function run(ui, mode, options) {
             let totalJobsSubmitted = 0;
             const errors = runResult ? runResult.errors : [];
             const ocrBuffer = new Map();
+            const pageNames = new Map();
             let nextOcr = 1;
             let ocrSent = 0;
             let ocrSendChain = Promise.resolve();
@@ -8402,7 +8424,7 @@ async function run(ui, mode, options) {
                     if (!ocrBuffer.has(nextOcr)) break;
                     const blob = ocrBuffer.get(nextOcr);
                     ocrBuffer.delete(nextOcr);
-                    const fn = 'page-' + String(nextOcr).padStart(4, '0') + '.' + IMAGE_CODEC.ext;
+                    const fn = pageNames.get(nextOcr) || ('page-' + String(nextOcr).padStart(4, '0') + '.' + IMAGE_CODEC.ext);
                     try {
                         await mokuroStreamPage(mokuroSessionId, blob, fn, nextOcr);
                         ocrSent++;
@@ -8447,7 +8469,7 @@ async function run(ui, mode, options) {
                     okIdx.add(job.index);
                     failedIdx.delete(job.index);
                     if (zip) zip.entries.push({
-                        path: 'page-' + String(job.index).padStart(4, '0') + '.' + IMAGE_CODEC.ext,
+                        path: job.name || ('page-' + String(job.index).padStart(4, '0') + '.' + IMAGE_CODEC.ext),
                         blob,
                         crc: Number.isInteger(crc) ? crc : undefined,
                     });
@@ -8628,7 +8650,7 @@ async function run(ui, mode, options) {
                         consumed++;
                         const j = item.job;
                         const id = ++seq;
-                        const job = { id, index: j.index, fid: j.fid, relPath: j.rel, seeds: j.seeds, auth: state.auth, baseUrl: state.baseUrl, q: IMAGE_CODEC.quality, fmt: IMAGE_CODEC.type, needCrc: !!zip, retried: false };
+                        const job = { id, index: j.index, name: j.name, fid: j.fid, relPath: j.rel, seeds: j.seeds, auth: state.auth, baseUrl: state.baseUrl, q: IMAGE_CODEC.quality, fmt: IMAGE_CODEC.type, needCrc: !!zip, retried: false };
                         pending.set(id, job);
                         job._resolve = null;
                         const p = new Promise(res => { job._resolve = res; });
@@ -8702,9 +8724,11 @@ async function run(ui, mode, options) {
                     const idx = jobSeq;
                     const cached = (runOptions.usePageCache && state.cid) ? await getCachedPage(state.cid, cacheKey(idx)) : null;
                     if (cached) {
+                        const pageName = bookWalkerPageName(idx, fid);
+                        pageNames.set(idx, pageName);
                         okIdx.add(idx);
                         if (zip) zip.entries.push({
-                            path: 'page-' + String(idx).padStart(4, '0') + '.' + IMAGE_CODEC.ext,
+                            path: pageName,
                             blob: cached,
                             crc: cachedPageCrc.get(cached),
                         });
@@ -8714,7 +8738,9 @@ async function run(ui, mode, options) {
                     }
                     const seeds = pageSeedsNo(fid, pageCfg, keys[0], keys[1], keys[2], no);
                     const rel = b8gNo(fid, keys[0], keys[1], keys[2], no);
-                    allJobs.push({ index: idx, fid, rel, seeds, no });
+                    const pageName = bookWalkerPageName(idx, fid);
+                    pageNames.set(idx, pageName);
+                    allJobs.push({ index: idx, name: pageName, fid, rel, seeds, no });
                     jobMap.set(idx, { fid, no });
                 }
             }
@@ -8766,7 +8792,7 @@ async function run(ui, mode, options) {
                     if (!jm) return null;
                     const pageCfg = config[jm.fid];
                     return {
-                        index: ix, fid: jm.fid, no: jm.no,
+                        index: ix, name: pageNames.get(ix) || bookWalkerPageName(ix, jm.fid), fid: jm.fid, no: jm.no,
                         rel: b8gNo(jm.fid, keys[0], keys[1], keys[2], jm.no),
                         seeds: pageSeedsNo(jm.fid, pageCfg, keys[0], keys[1], keys[2], jm.no),
                     };
@@ -8782,7 +8808,7 @@ async function run(ui, mode, options) {
                     const blob = ocrBuffer.get(i);
                     if (!blob) continue;
                     ocrBuffer.delete(i);
-                    const fn = 'page-' + String(i).padStart(4, '0') + '.' + IMAGE_CODEC.ext;
+                    const fn = pageNames.get(i) || ('page-' + String(i).padStart(4, '0') + '.' + IMAGE_CODEC.ext);
                     try {
                         await mokuroStreamPage(mokuroSessionId, blob, fn, i);
                         ocrSent++;

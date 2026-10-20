@@ -124,6 +124,7 @@ Built by [GolyBidoof](https://github.com/GolyBidoof) together with **DeepSeek V4
 - [Brandon](https://learnnatively.com/user/brandon/), for the difficulty levels, JLPT-band colours, ratings and book metadata shown in the stats card, and [ChristopherFritz](https://community.wanikani.com/u/christopherfritz) for the Manga Kotoba vocabulary statistics.
 - [kha-white/mokuro](https://github.com/kha-white/mokuro) and [manga-ocr](https://github.com/kha-white/manga-ocr), the upstream OCR engine and model; detection uses [comic-text-detector](https://github.com/dmMaze/comic-text-detector).
 - [aaa4xu/bookworm](https://github.com/aaa4xu/bookworm), the offline BookWalker client whose algorithm the descramble implementation was validated against.
+- [ChristopherFritz](https://github.com/ChristopherFritz), for the BookWalker manifest page naming and the ZIP ordering that keeps it stable.
 
 "BookWalker", "CMOA", "ebookjapan", "Kindle" and "k-manga" are trademarks of their respective owners. This project is not affiliated with or endorsed by any of them.
 

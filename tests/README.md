@@ -31,6 +31,7 @@ Each script prints `ALL n CHECKS PASSED` on success and exits non-zero otherwise
 | `test_run_safety.js` | the shared run harness takes the panel run lock for the whole run, and ebookjapan resolves a volume once at a time |
 | `test_availability.js` | the cross-store "also available on" card; skipped for an artifact that does not carry the module |
 | `test_descramble_equivalence.js` | BookWalker worker output compared with reference pages, byte for byte |
+| `test_bookwalker_naming.js` | BookWalker page names derived from the manifest source, and ZIP entry order across double-digit pages |
 | `test_cmoa_adapter.js` | a full CMOA ZIP run against a synthetic speed reader: detection, title, naming, quality ladder and descramble |
 | `test_cmoa_ocr.js` | the CMOA OCR path: session, page order and naming, early cover, finalize, descrambled bytes and host-scoped proxy ports |
 | `test_cmoa_offline_descramble.js` | the viewer-free descramble engine |
