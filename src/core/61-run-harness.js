@@ -116,10 +116,11 @@
                 while (true) {
                     if (failedIdx.has(nextIdx)) { nextIdx++; continue; }
                     if (!buffer.has(nextIdx)) break;
-                    const blob = buffer.get(nextIdx);
+                    const entry = buffer.get(nextIdx);
                     buffer.delete(nextIdx);
+                    const blob = entry.blob;
                     const page = nextIdx;
-                    const fn = 'page-' + String(page).padStart(4, '0') + '.' + IMAGE_CODEC.ext;
+                    const fn = 'page-' + String(page).padStart(4, '0') + '.' + (entry.ext || IMAGE_CODEC.ext);
                     try {
                         await mokuroStreamPage(sessionId, blob, fn, page);
                         sent++;
@@ -199,8 +200,8 @@
                     return sessionId;
                 },
 
-                note(idx, blob) {
-                    buffer.set(idx, blob);
+                note(idx, blob, ext) {
+                    buffer.set(idx, { blob, ext: ext || '' });
                     if (idx === nextIdx) schedule();
                 },
 
@@ -221,12 +222,12 @@
                     if (options.headless) await chain;
                     for (let i = 1; i <= total; i++) {
                         if (failedIdx.has(i)) continue;
-                        const blob = buffer.get(i);
-                        if (!blob) continue;
+                        const entry = buffer.get(i);
+                        if (!entry) continue;
                         buffer.delete(i);
-                        const fn = 'page-' + String(i).padStart(4, '0') + '.' + IMAGE_CODEC.ext;
+                        const fn = 'page-' + String(i).padStart(4, '0') + '.' + (entry.ext || IMAGE_CODEC.ext);
                         try {
-                            await mokuroStreamPage(sessionId, blob, fn, i);
+                            await mokuroStreamPage(sessionId, entry.blob, fn, i);
                             sent++;
                             reportRunProgress(options, 'page-stream', {
                                 page: i, pageCount: okIdx.size, total: total
@@ -315,23 +316,27 @@
             }
             if (mokuro && blob) {
                 mokuro.cover(idx, blob);
-                mokuro.note(idx, blob);
+                mokuro.note(idx, blob, ext);
             }
             reportPage(idx);
             refreshProgress();
         }
 
         // A page served from the page cache: already correct, no fetch, no
-        // descramble, no re-upload of the source, so it counts as both.
+        // descramble, no re-upload of the source, so it counts as both. The
+        // cached blob's own type decides the extension: a page that fell back to
+        // its delivered JPEG was cached under the selected codec's key, and
+        // naming it after the setting would label JPEG bytes as WebP.
         function noteCached(idx, blob, crc) {
             okIdx.add(idx);
             failedIdx.delete(idx);
+            const ext = (blob && imageExtForMime(blob.type)) || IMAGE_CODEC.ext;
             if (zip && blob) zip.entries.push({
-                path: 'page-' + String(idx).padStart(4, '0') + '.' + IMAGE_CODEC.ext,
+                path: 'page-' + String(idx).padStart(4, '0') + '.' + ext,
                 blob,
                 crc: Number.isInteger(crc) ? crc : undefined,
             });
-            if (mokuro && blob) mokuro.note(idx, blob);
+            if (mokuro && blob) mokuro.note(idx, blob, ext);
             refreshProgress();
         }
 

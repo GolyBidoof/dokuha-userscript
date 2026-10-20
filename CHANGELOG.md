@@ -1,5 +1,10 @@
 # Changelog
 
+## v3.0.1
+
+### Fixed
+- **The image format picker now reaches the bytes on every download path.** Two paths kept shipping the store's JPEG whatever was selected. BookWalker trial and plaintext volumes passed the CDN's JPEG straight through whenever the page was already at its declared size, and then named the entry after the selected codec, so choosing WebP produced files called `.webp` that were really JPEG; the same applied to the k-manga pages the viewer serves whole at key 0. Both now re-encode to the chosen codec and keep the bit-exact passthrough only for JPEG. A page restored from the page cache and a page sent to mokuro-bridge are named after their actual bytes, so a fallback that could not be re-encoded is no longer labelled WebP. `tests/test_format_selection.js` pins the trial path and `tests/test_kmanga_descramble.js` the whole-page path.
+
 ## v3.0.0
 
 **The combined script is now dokuha-userscript, and series downloads live in dokuha-cli.** The combined artifact is `dokuha-userscript.user.js` (`@name dokuha-userscript`), its home is github.com/GolyBidoof/dokuha-userscript, and the panel header carries a small `dokuha-userscript` mark linking there. The per-store artifacts keep their names and banners because they already have users. GreasyFork entry 597313 still serves the earlier Omnimanga Native Downloader 2.0.0 (BookWalker, CMOA, ebookjapan) until this release is published and the listing is repointed; `docs/greasyfork/dokuha-userscript.html` is the paste-ready description for that update.

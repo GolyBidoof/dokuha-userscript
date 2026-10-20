@@ -1,6 +1,6 @@
 {
   "name": "dokuha-userscript",
-  "version": "3.0.0",
+  "version": "3.0.1",
   "private": true,
   "description": "Browser userscript that downloads, descrambles and archives books from BookWalker, CMOA, ebookjapan, Kindle and k-manga.",
   "keywords": [

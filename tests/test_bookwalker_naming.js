@@ -16,7 +16,13 @@ const context = vm.createContext({
   localStorage: { getItem() { storageReads++; return JSON.stringify({ page: 0, url: "changed.xhtml" }); } },
   location: { search: '?cid=book-1' },
   isHeadlessPage: () => false,
-  IMAGE_CODEC: { ext: 'jpg' },
+  // The shape resolveImageCodec() returns; the trial path reads .type/.quality
+  // as well as .ext, and its fallback names a blob by its own mime type.
+  IMAGE_CODEC: { fmt: 'jpeg', type: 'image/jpeg', quality: 0.92, ext: 'jpg', lossless: false },
+  imageExtForMime(t) {
+    const mime = String(t || '').split(';')[0].trim().toLowerCase();
+    return { 'image/png': 'png', 'image/webp': 'webp', 'image/jpeg': 'jpg', 'image/jpg': 'jpg' }[mime] || '';
+  },
 });
 vm.runInContext(
   fragment('sites/bookwalker/00-state.js') +

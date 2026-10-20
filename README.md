@@ -1,6 +1,6 @@
 <p align="center"><img src="docs/images/banner-dokuha-userscript.jpg" alt="The dokuha-userscript banner: 読破 in orange brushstrokes inside a purple circle over a blurred shelf of manga covers, with DOKUHA (userscript) underneath." width="720"></p>
 
-# 読破 (dokuha-userscript) · v3.0.0
+# 読破 (dokuha-userscript) · v3.0.1
 
 <p align="center"><strong>Archive the volume you already have open, at full resolution.</strong></p>
 

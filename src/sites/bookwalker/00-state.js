@@ -8,14 +8,16 @@
         configBody: null,  // encrypted configuration_pack.json text
         configFromUrl: null
     };
-    function bookWalkerPageName(index, source) {
+    function bookWalkerPageName(index, source, ext) {
         const path = String(source || '').split(/[?#]/, 1)[0];
         const base = path.slice(path.lastIndexOf('/') + 1);
         const stem = fsSafePath(base.replace(/\.(?:x?html?)$/i, ''));
         // Manifest-only naming stays independent of the viewer's reading position.
         // The ordinal distinguishes multiple images from the same source file.
         const prefix = String(index).padStart(4, '0');
-        const suffix = '.' + IMAGE_CODEC.ext;
+        // A caller that encoded the page itself passes the extension the blob
+        // actually has; everyone else follows the selected codec.
+        const suffix = '.' + (ext || IMAGE_CODEC.ext);
         const encoder = new TextEncoder();
         const budget = 255 - encoder.encode(prefix + ' ' + suffix).length;
         let name = '';

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         dokuha-userscript
 // @namespace    http://tampermonkey.net/
-// @version      3.0.0
+// @version      3.0.1
 // @description  Saves a book from the BookWalker viewer, the CMOA speed reader, the ebookjapan reader, the Kindle web manga reader or the k-manga viewer as a ZIP or CBZ of full-resolution page images, fetched from the store and unscrambled offline. Optional Japanese OCR through mokuro-bridge, with upload to MEGA, Google Drive or OneDrive.
 // @author       GolyBidoof
 // @homepageURL  https://github.com/GolyBidoof/dokuha-userscript
@@ -83,7 +83,7 @@
             const v = (typeof GM_info !== 'undefined') && GM_info.script && GM_info.script.version;
             if (v) return v;
         } catch (e) { }
-        return '3.0.0';
+        return '3.0.1';
     })();
 
     const BWDD_DEBUG = (() => {
@@ -102,13 +102,14 @@
         configBody: null,
         configFromUrl: null
     };
-    function bookWalkerPageName(index, source) {
+    function bookWalkerPageName(index, source, ext) {
         const path = String(source || '').split(/[?#]/, 1)[0];
         const base = path.slice(path.lastIndexOf('/') + 1);
         const stem = fsSafePath(base.replace(/\.(?:x?html?)$/i, ''));
 
         const prefix = String(index).padStart(4, '0');
-        const suffix = '.' + IMAGE_CODEC.ext;
+
+        const suffix = '.' + (ext || IMAGE_CODEC.ext);
         const encoder = new TextEncoder();
         const budget = 255 - encoder.encode(prefix + ' ' + suffix).length;
         let name = '';
@@ -371,6 +372,14 @@ const automationMemory = {
         if (fmt === 'webp') return { fmt, type: 'image/webp', quality, ext: 'webp', lossless: false };
         if (fmt === 'png') return { fmt, type: 'image/png', quality, ext: 'png', lossless: true };
         return { fmt: 'jpeg', type: 'image/jpeg', quality, ext: 'jpg', lossless: false };
+    }
+
+    function imageExtForMime(type) {
+        const t = typeof type === 'string' ? type.split(';')[0].trim().toLowerCase() : '';
+        if (t === 'image/png') return 'png';
+        if (t === 'image/webp') return 'webp';
+        if (t === 'image/jpeg' || t === 'image/jpg') return 'jpg';
+        return '';
     }
 
     let IMAGE_CODEC = resolveImageCodec();
@@ -7527,10 +7536,11 @@ async function uploadCoverEarly(opts) {
                 while (true) {
                     if (failedIdx.has(nextIdx)) { nextIdx++; continue; }
                     if (!buffer.has(nextIdx)) break;
-                    const blob = buffer.get(nextIdx);
+                    const entry = buffer.get(nextIdx);
                     buffer.delete(nextIdx);
+                    const blob = entry.blob;
                     const page = nextIdx;
-                    const fn = 'page-' + String(page).padStart(4, '0') + '.' + IMAGE_CODEC.ext;
+                    const fn = 'page-' + String(page).padStart(4, '0') + '.' + (entry.ext || IMAGE_CODEC.ext);
                     try {
                         await mokuroStreamPage(sessionId, blob, fn, page);
                         sent++;
@@ -7601,8 +7611,8 @@ async function uploadCoverEarly(opts) {
                     return sessionId;
                 },
 
-                note(idx, blob) {
-                    buffer.set(idx, blob);
+                note(idx, blob, ext) {
+                    buffer.set(idx, { blob, ext: ext || '' });
                     if (idx === nextIdx) schedule();
                 },
 
@@ -7619,12 +7629,12 @@ async function uploadCoverEarly(opts) {
                     if (options.headless) await chain;
                     for (let i = 1; i <= total; i++) {
                         if (failedIdx.has(i)) continue;
-                        const blob = buffer.get(i);
-                        if (!blob) continue;
+                        const entry = buffer.get(i);
+                        if (!entry) continue;
                         buffer.delete(i);
-                        const fn = 'page-' + String(i).padStart(4, '0') + '.' + IMAGE_CODEC.ext;
+                        const fn = 'page-' + String(i).padStart(4, '0') + '.' + (entry.ext || IMAGE_CODEC.ext);
                         try {
-                            await mokuroStreamPage(sessionId, blob, fn, i);
+                            await mokuroStreamPage(sessionId, entry.blob, fn, i);
                             sent++;
                             reportRunProgress(options, 'page-stream', {
                                 page: i, pageCount: okIdx.size, total: total
@@ -7698,7 +7708,7 @@ async function uploadCoverEarly(opts) {
             }
             if (mokuro && blob) {
                 mokuro.cover(idx, blob);
-                mokuro.note(idx, blob);
+                mokuro.note(idx, blob, ext);
             }
             reportPage(idx);
             refreshProgress();
@@ -7707,12 +7717,13 @@ async function uploadCoverEarly(opts) {
         function noteCached(idx, blob, crc) {
             okIdx.add(idx);
             failedIdx.delete(idx);
+            const ext = (blob && imageExtForMime(blob.type)) || IMAGE_CODEC.ext;
             if (zip && blob) zip.entries.push({
-                path: 'page-' + String(idx).padStart(4, '0') + '.' + IMAGE_CODEC.ext,
+                path: 'page-' + String(idx).padStart(4, '0') + '.' + ext,
                 blob,
                 crc: Number.isInteger(crc) ? crc : undefined,
             });
-            if (mokuro && blob) mokuro.note(idx, blob);
+            if (mokuro && blob) mokuro.note(idx, blob, ext);
             refreshProgress();
         }
 
@@ -7970,17 +7981,32 @@ async function downloadTrialZip(ui, config, contents, title, sv, mode, details, 
             return runResult;
         };
 
-        async function cropToSize(blob, S) {
-            if (!S || !S.Width || !S.Height) return blob;
+        async function applyCodec(blob, S) {
+            const wantsCrop = !!(S && S.Width > 0 && S.Height > 0);
+            const codec = IMAGE_CODEC;
             try {
+
+                if (!wantsCrop && codec.type === 'image/jpeg' && imageExtForMime(blob.type) === 'jpg') {
+                    return { blob, ext: 'jpg' };
+                }
                 const bmp = await createImageBitmap(blob);
-                if (bmp.width === S.Width && bmp.height === S.Height) { if (bmp.close) bmp.close(); return blob; }
+                const resize = wantsCrop && (bmp.width !== S.Width || bmp.height !== S.Height);
+
+                if (!resize && codec.type === 'image/jpeg') {
+                    if (bmp.close) bmp.close();
+                    return { blob, ext: 'jpg' };
+                }
                 const c = document.createElement('canvas');
-                c.width = S.Width; c.height = S.Height;
+                c.width = resize ? S.Width : bmp.width;
+                c.height = resize ? S.Height : bmp.height;
                 c.getContext('2d').drawImage(bmp, 0, 0);
                 if (bmp.close) bmp.close();
-                return await new Promise((res2, rej) => c.toBlob(b => b ? res2(b) : rej(new Error('toBlob')), IMAGE_CODEC.type, IMAGE_CODEC.quality));
-            } catch (e) { return blob; }
+                const out = await new Promise((res2, rej) => c.toBlob(b => b ? res2(b) : rej(new Error('toBlob')), codec.type, codec.quality));
+                return { blob: out, ext: imageExtForMime(out.type) || codec.ext };
+            } catch (e) {
+
+                return { blob, ext: imageExtForMime(blob.type) || 'jpg' };
+            }
         }
 
         let mokuroSessionId = null;
@@ -8056,8 +8082,9 @@ async function downloadTrialZip(ui, config, contents, title, sv, mode, details, 
                     const pl = (cfg.FileLinkInfo && cfg.FileLinkInfo.PageLinkInfoList) || [];
                     const S = (pl[j.no] && pl[j.no].Page && pl[j.no].Page.Size) ||
                              (pl[0] && pl[0].Page && pl[0].Page.Size);
-                    blob = await cropToSize(blob, S);
-                    const pageName = bookWalkerPageName(pageIdx, j.fid);
+                    const prepared = await applyCodec(blob, S);
+                    blob = prepared.blob;
+                    const pageName = bookWalkerPageName(pageIdx, j.fid, prepared.ext);
                     okIdx.add(pageIdx);
                     fetched++;
                     if (zip) zip.entries.push({ path: pageName, blob });
@@ -13287,6 +13314,23 @@ function ebjSleep(ms) { return new Promise(r => setTimeout(r, ms)); }
         }
     }
 
+    async function kmangaReencode(jpeg) {
+        const decoded = await kmangaDecodeImage(jpeg, 'image/jpeg');
+        try {
+            const canvas = document.createElement('canvas');
+            canvas.width = decoded.width;
+            canvas.height = decoded.height;
+            const ctx = canvas.getContext('2d');
+            if (!ctx) throw new Error('k-manga re-encode needs a 2D canvas context');
+            ctx.drawImage(decoded.element, 0, 0);
+            const blob = await kmangaCanvasToBlob(canvas, IMAGE_CODEC.type, IMAGE_CODEC.quality);
+            if (!blob) throw new Error('k-manga re-encode produced no image');
+            return { blob: blob, ext: kmangaExtFor(blob.type) || IMAGE_CODEC.ext };
+        } finally {
+            try { decoded.cleanup(); } catch (e) {}
+        }
+    }
+
     async function kmangaPageBlob(frame, entry) {
         const scenes = frame.body && frame.body.scenes;
         if (!Array.isArray(scenes) || !scenes.length) {
@@ -13309,7 +13353,10 @@ function ebjSleep(ms) { return new Promise(r => setTimeout(r, ms)); }
         if (!kmangaReadJpegSize(jpeg)) throw new Error('k-manga page ' + entry.name + ' is not a readable JPEG');
 
         if (!kmangaIsScrambled(image)) {
-            return { blob: new Blob([jpeg], { type: 'image/jpeg' }), ext: 'jpg' };
+            if (IMAGE_CODEC.type === 'image/jpeg') {
+                return { blob: new Blob([jpeg], { type: 'image/jpeg' }), ext: 'jpg' };
+            }
+            return kmangaReencode(jpeg);
         }
         return kmangaDescrambleJpeg(jpeg, {
             key: Number(image.key),

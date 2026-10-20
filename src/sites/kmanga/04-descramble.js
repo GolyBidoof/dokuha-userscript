@@ -112,6 +112,27 @@
         }
     }
 
+    // Re-encode a page that needs no unshuffling, in the selected codec. The
+    // passthrough below is only free while JPEG is selected; with WebP or PNG
+    // chosen the bytes have to go through a canvas or the picker is a no-op for
+    // every key-0 page.
+    async function kmangaReencode(jpeg) {
+        const decoded = await kmangaDecodeImage(jpeg, 'image/jpeg');
+        try {
+            const canvas = document.createElement('canvas');
+            canvas.width = decoded.width;
+            canvas.height = decoded.height;
+            const ctx = canvas.getContext('2d');
+            if (!ctx) throw new Error('k-manga re-encode needs a 2D canvas context');
+            ctx.drawImage(decoded.element, 0, 0);
+            const blob = await kmangaCanvasToBlob(canvas, IMAGE_CODEC.type, IMAGE_CODEC.quality);
+            if (!blob) throw new Error('k-manga re-encode produced no image');
+            return { blob: blob, ext: kmangaExtFor(blob.type) || IMAGE_CODEC.ext };
+        } finally {
+            try { decoded.cleanup(); } catch (e) {}
+        }
+    }
+
     async function kmangaPageBlob(frame, entry) {
         const scenes = frame.body && frame.body.scenes;
         if (!Array.isArray(scenes) || !scenes.length) {
@@ -132,10 +153,14 @@
         }
         const jpeg = frame.chunks[0];
         if (!kmangaReadJpegSize(jpeg)) throw new Error('k-manga page ' + entry.name + ' is not a readable JPEG');
-        // The viewer skips the whole shuffle at key 0, and re-encoding a page it
-        // already serves whole would only add a generation of loss.
+        // The viewer skips the whole shuffle at key 0, so the page is already
+        // whole. Keep the delivered bytes only when the user did not ask for a
+        // different format: a JPEG rewrite would just add a generation of loss.
         if (!kmangaIsScrambled(image)) {
-            return { blob: new Blob([jpeg], { type: 'image/jpeg' }), ext: 'jpg' };
+            if (IMAGE_CODEC.type === 'image/jpeg') {
+                return { blob: new Blob([jpeg], { type: 'image/jpeg' }), ext: 'jpg' };
+            }
+            return kmangaReencode(jpeg);
         }
         return kmangaDescrambleJpeg(jpeg, {
             key: Number(image.key),

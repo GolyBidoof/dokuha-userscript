@@ -26,17 +26,40 @@
             return runResult;
         };
 
-        async function cropToSize(blob, S) {
-            if (!S || !S.Width || !S.Height) return blob;
+        // The trial CDN only serves JPEG, so the selected output format has to be
+        // applied on this path rather than inherited. It used to hand the
+        // delivered bytes straight to the archive whenever the page was already
+        // at its declared size, which made the format picker a no-op for every
+        // trial volume and named the JPEG after whatever codec was selected.
+        async function applyCodec(blob, S) {
+            const wantsCrop = !!(S && S.Width > 0 && S.Height > 0);
+            const codec = IMAGE_CODEC;
             try {
+                // No declared box to check and JPEG already selected: the page is
+                // the final file, so skip the decode entirely.
+                if (!wantsCrop && codec.type === 'image/jpeg' && imageExtForMime(blob.type) === 'jpg') {
+                    return { blob, ext: 'jpg' };
+                }
                 const bmp = await createImageBitmap(blob);
-                if (bmp.width === S.Width && bmp.height === S.Height) { if (bmp.close) bmp.close(); return blob; }
+                const resize = wantsCrop && (bmp.width !== S.Width || bmp.height !== S.Height);
+                // JPEG was selected and nothing has to move: keep the delivered
+                // bytes bit-exact, exactly like the full-size pipeline does.
+                if (!resize && codec.type === 'image/jpeg') {
+                    if (bmp.close) bmp.close();
+                    return { blob, ext: 'jpg' };
+                }
                 const c = document.createElement('canvas');
-                c.width = S.Width; c.height = S.Height;
+                c.width = resize ? S.Width : bmp.width;
+                c.height = resize ? S.Height : bmp.height;
                 c.getContext('2d').drawImage(bmp, 0, 0);
                 if (bmp.close) bmp.close();
-                return await new Promise((res2, rej) => c.toBlob(b => b ? res2(b) : rej(new Error('toBlob')), IMAGE_CODEC.type, IMAGE_CODEC.quality));
-            } catch (e) { return blob; }
+                const out = await new Promise((res2, rej) => c.toBlob(b => b ? res2(b) : rej(new Error('toBlob')), codec.type, codec.quality));
+                return { blob: out, ext: imageExtForMime(out.type) || codec.ext };
+            } catch (e) {
+                // The page is still usable as delivered; name it for its bytes
+                // rather than for the setting that could not be applied.
+                return { blob, ext: imageExtForMime(blob.type) || 'jpg' };
+            }
         }
 
         let mokuroSessionId = null;
@@ -117,8 +140,9 @@
                     const pl = (cfg.FileLinkInfo && cfg.FileLinkInfo.PageLinkInfoList) || [];
                     const S = (pl[j.no] && pl[j.no].Page && pl[j.no].Page.Size) ||
                              (pl[0] && pl[0].Page && pl[0].Page.Size);
-                    blob = await cropToSize(blob, S);
-                    const pageName = bookWalkerPageName(pageIdx, j.fid);
+                    const prepared = await applyCodec(blob, S);
+                    blob = prepared.blob;
+                    const pageName = bookWalkerPageName(pageIdx, j.fid, prepared.ext);
                     okIdx.add(pageIdx);
                     fetched++;
                     if (zip) zip.entries.push({ path: pageName, blob });

@@ -74,7 +74,7 @@ The old `bookwalker-native-downloader.user.js` name no longer exists in any rele
 
 The Kindle and k-manga single-store builds ship as artifacts but have no GreasyFork entry yet; `npm run sync-urls` prints their raw URLs the moment one is created.
 
-Entry 597313 still carries the **Omnimanga Native Downloader 2.0.0** title, code and listing (BookWalker, CMOA and ebookjapan). Until v3.0.0 is released and that entry is repointed, the v3 script is installable from this repository only (`dokuha-userscript.user.js`, or a manual install from GreasyFork once the listing is pasted). Publishing means: release v3.0.0, switch the entry's sync source to `dokuha-userscript.user.js`, and paste `docs/greasyfork/dokuha-userscript.html` as its description.
+Entry 597313 was repointed when v3.0.0 shipped and now serves the combined script: its title, code and listing are the v3 ones, and its version follows `dokuha-userscript.user.js` on the `release` branch. Later releases need nothing beyond the tag; GreasyFork pulls the new `@version` on its next poll, or immediately from the entry's **sync now** button.
 
 All six artifacts are committed on `main` as of v3.0.0, so their raw `main` URLs resolve. GreasyFork should still sync from the `release` branch, which only ever carries published versions.
 
@@ -95,7 +95,7 @@ The combined build and the single-store builds advertise different things: the "
 
 ### Size
 
-GreasyFork's limit is 2 MB. The combined artifact is the largest at ~869 KB and the splits run 291-527 KB, so all six fit.
+GreasyFork's limit is 2 MB. The combined artifact is the largest at ~872 KB and the splits run 291-527 KB, so all six fit.
 
 ### The changelog
 

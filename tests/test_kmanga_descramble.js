@@ -103,6 +103,27 @@ const pageB64 = bytesToBase64(fs.readFileSync(path.join(__dirname, 'fixtures', '
             out.plainExt = plain.ext;
             const plainBytes = new Uint8Array(await plain.blob.arrayBuffer());
             out.plainUntouched = plainBytes.length === jpeg.length && plainBytes[0] === jpeg[0] && plainBytes[1] === jpeg[1];
+            const wire = await createImageBitmap(new Blob([jpeg], { type: 'image/jpeg' }));
+            out.wireSize = [wire.width, wire.height];
+            wire.close();
+
+            // The same key-0 page with WebP selected: the passthrough is only
+            // free while JPEG is chosen, so the selected codec has to be applied
+            // here too or the picker is a no-op for every whole page.
+            window.__bwddUI.setImageFormat('webp');
+            const plainWebp = await P.pageBlob({
+                body: { scenes: [{ sceneNo: 1, sceneImagePartition: 1, images: [{ format: 'jpeg', key: 0, width: image.width, height: image.height }] }] },
+                chunks: [jpeg],
+            }, { name: 'plain-webp' });
+            out.plainWebpType = plainWebp.blob.type;
+            out.plainWebpExt = plainWebp.ext;
+            const plainWebpBitmap = await createImageBitmap(plainWebp.blob);
+            out.plainWebpSize = [plainWebpBitmap.width, plainWebpBitmap.height];
+            plainWebpBitmap.close();
+            const plainWebpBytes = new Uint8Array(await plainWebp.blob.arrayBuffer());
+            out.plainWebpUntouched = plainWebpBytes.length === jpeg.length
+                && plainWebpBytes[0] === jpeg[0] && plainWebpBytes[1] === jpeg[1];
+            window.__bwddUI.setImageFormat('jpeg');
 
             return out;
         }, pageB64);
@@ -127,6 +148,14 @@ const pageB64 = bytesToBase64(fs.readFileSync(path.join(__dirname, 'fixtures', '
         check('an unscrambled page is passed through untouched', got.plainUntouched === true,
             got.plainType + '/' + got.plainExt);
         check('and keeps the jpg extension', got.plainExt === 'jpg', String(got.plainExt));
+        check('with WebP selected a whole page is re-encoded to WebP',
+            got.plainWebpType === 'image/webp' && got.plainWebpExt === 'webp',
+            got.plainWebpType + '/' + got.plainWebpExt);
+        check('and it is no longer the delivered JPEG', got.plainWebpUntouched === false,
+            'bytes differ from the wire image');
+        check('the re-encoded whole page keeps the wire page box',
+            JSON.stringify(got.plainWebpSize) === JSON.stringify(got.wireSize),
+            JSON.stringify(got.plainWebpSize) + ' vs wire ' + JSON.stringify(got.wireSize));
     } finally {
         await browser.close().catch(() => {});
     }

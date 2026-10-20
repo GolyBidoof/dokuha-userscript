@@ -33,6 +33,16 @@
         if (fmt === 'png') return { fmt, type: 'image/png', quality, ext: 'png', lossless: true };
         return { fmt: 'jpeg', type: 'image/jpeg', quality, ext: 'jpg', lossless: false };
     }
+    // The extension the encoded blob itself declares. A canvas may quietly hand
+    // back PNG when asked for a type it cannot produce, so naming an archive
+    // entry after the selected codec alone would label those bytes as WebP.
+    function imageExtForMime(type) {
+        const t = typeof type === 'string' ? type.split(';')[0].trim().toLowerCase() : '';
+        if (t === 'image/png') return 'png';
+        if (t === 'image/webp') return 'webp';
+        if (t === 'image/jpeg' || t === 'image/jpg') return 'jpg';
+        return '';
+    }
     // Mutable: the panel changes it, and the next download must pick it up without
     // a page reload, so nothing may cache this at load time.
     let IMAGE_CODEC = resolveImageCodec();

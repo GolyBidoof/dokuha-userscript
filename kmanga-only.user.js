@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         k-manga Native Downloader
 // @namespace    http://tampermonkey.net/
-// @version      3.0.0
+// @version      3.0.1
 // @description  Saves a book from the k-manga viewer as a ZIP or CBZ of full-resolution page images, fetched over the viewer's own WebSocket and unscrambled in the browser. Optional Japanese OCR through mokuro-bridge, with upload to MEGA, Google Drive or OneDrive.
 // @author       GolyBidoof
 // @homepageURL  https://github.com/GolyBidoof/dokuha-userscript
@@ -63,7 +63,7 @@
             const v = (typeof GM_info !== 'undefined') && GM_info.script && GM_info.script.version;
             if (v) return v;
         } catch (e) { }
-        return '3.0.0';
+        return '3.0.1';
     })();
 
     const BWDD_DEBUG = (() => {
@@ -318,6 +318,14 @@ const automationMemory = {
         if (fmt === 'webp') return { fmt, type: 'image/webp', quality, ext: 'webp', lossless: false };
         if (fmt === 'png') return { fmt, type: 'image/png', quality, ext: 'png', lossless: true };
         return { fmt: 'jpeg', type: 'image/jpeg', quality, ext: 'jpg', lossless: false };
+    }
+
+    function imageExtForMime(type) {
+        const t = typeof type === 'string' ? type.split(';')[0].trim().toLowerCase() : '';
+        if (t === 'image/png') return 'png';
+        if (t === 'image/webp') return 'webp';
+        if (t === 'image/jpeg' || t === 'image/jpg') return 'jpg';
+        return '';
     }
 
     let IMAGE_CODEC = resolveImageCodec();
@@ -5308,10 +5316,11 @@ async function uploadCoverEarly(opts) {
                 while (true) {
                     if (failedIdx.has(nextIdx)) { nextIdx++; continue; }
                     if (!buffer.has(nextIdx)) break;
-                    const blob = buffer.get(nextIdx);
+                    const entry = buffer.get(nextIdx);
                     buffer.delete(nextIdx);
+                    const blob = entry.blob;
                     const page = nextIdx;
-                    const fn = 'page-' + String(page).padStart(4, '0') + '.' + IMAGE_CODEC.ext;
+                    const fn = 'page-' + String(page).padStart(4, '0') + '.' + (entry.ext || IMAGE_CODEC.ext);
                     try {
                         await mokuroStreamPage(sessionId, blob, fn, page);
                         sent++;
@@ -5382,8 +5391,8 @@ async function uploadCoverEarly(opts) {
                     return sessionId;
                 },
 
-                note(idx, blob) {
-                    buffer.set(idx, blob);
+                note(idx, blob, ext) {
+                    buffer.set(idx, { blob, ext: ext || '' });
                     if (idx === nextIdx) schedule();
                 },
 
@@ -5400,12 +5409,12 @@ async function uploadCoverEarly(opts) {
                     if (options.headless) await chain;
                     for (let i = 1; i <= total; i++) {
                         if (failedIdx.has(i)) continue;
-                        const blob = buffer.get(i);
-                        if (!blob) continue;
+                        const entry = buffer.get(i);
+                        if (!entry) continue;
                         buffer.delete(i);
-                        const fn = 'page-' + String(i).padStart(4, '0') + '.' + IMAGE_CODEC.ext;
+                        const fn = 'page-' + String(i).padStart(4, '0') + '.' + (entry.ext || IMAGE_CODEC.ext);
                         try {
-                            await mokuroStreamPage(sessionId, blob, fn, i);
+                            await mokuroStreamPage(sessionId, entry.blob, fn, i);
                             sent++;
                             reportRunProgress(options, 'page-stream', {
                                 page: i, pageCount: okIdx.size, total: total
@@ -5479,7 +5488,7 @@ async function uploadCoverEarly(opts) {
             }
             if (mokuro && blob) {
                 mokuro.cover(idx, blob);
-                mokuro.note(idx, blob);
+                mokuro.note(idx, blob, ext);
             }
             reportPage(idx);
             refreshProgress();
@@ -5488,12 +5497,13 @@ async function uploadCoverEarly(opts) {
         function noteCached(idx, blob, crc) {
             okIdx.add(idx);
             failedIdx.delete(idx);
+            const ext = (blob && imageExtForMime(blob.type)) || IMAGE_CODEC.ext;
             if (zip && blob) zip.entries.push({
-                path: 'page-' + String(idx).padStart(4, '0') + '.' + IMAGE_CODEC.ext,
+                path: 'page-' + String(idx).padStart(4, '0') + '.' + ext,
                 blob,
                 crc: Number.isInteger(crc) ? crc : undefined,
             });
-            if (mokuro && blob) mokuro.note(idx, blob);
+            if (mokuro && blob) mokuro.note(idx, blob, ext);
             refreshProgress();
         }
 
@@ -6254,6 +6264,23 @@ async function uploadCoverEarly(opts) {
         }
     }
 
+    async function kmangaReencode(jpeg) {
+        const decoded = await kmangaDecodeImage(jpeg, 'image/jpeg');
+        try {
+            const canvas = document.createElement('canvas');
+            canvas.width = decoded.width;
+            canvas.height = decoded.height;
+            const ctx = canvas.getContext('2d');
+            if (!ctx) throw new Error('k-manga re-encode needs a 2D canvas context');
+            ctx.drawImage(decoded.element, 0, 0);
+            const blob = await kmangaCanvasToBlob(canvas, IMAGE_CODEC.type, IMAGE_CODEC.quality);
+            if (!blob) throw new Error('k-manga re-encode produced no image');
+            return { blob: blob, ext: kmangaExtFor(blob.type) || IMAGE_CODEC.ext };
+        } finally {
+            try { decoded.cleanup(); } catch (e) {}
+        }
+    }
+
     async function kmangaPageBlob(frame, entry) {
         const scenes = frame.body && frame.body.scenes;
         if (!Array.isArray(scenes) || !scenes.length) {
@@ -6276,7 +6303,10 @@ async function uploadCoverEarly(opts) {
         if (!kmangaReadJpegSize(jpeg)) throw new Error('k-manga page ' + entry.name + ' is not a readable JPEG');
 
         if (!kmangaIsScrambled(image)) {
-            return { blob: new Blob([jpeg], { type: 'image/jpeg' }), ext: 'jpg' };
+            if (IMAGE_CODEC.type === 'image/jpeg') {
+                return { blob: new Blob([jpeg], { type: 'image/jpeg' }), ext: 'jpg' };
+            }
+            return kmangaReencode(jpeg);
         }
         return kmangaDescrambleJpeg(jpeg, {
             key: Number(image.key),
