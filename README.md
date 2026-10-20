@@ -1,12 +1,12 @@
 <p align="center"><img src="docs/images/banner-dokuha-userscript.jpg" alt="The dokuha-userscript banner: 読破 in orange brushstrokes inside a purple circle over a blurred shelf of manga covers, with DOKUHA (userscript) underneath." width="720"></p>
 
-# dokuha-userscript · v3.0.0
+# 読破 (dokuha-userscript) · v3.0.0
 
-<kbd>MIT</kbd> · <kbd>Tampermonkey or Violentmonkey</kbd> · <kbd>five stores</kbd>
+<p align="center"><strong>Archive the volume you already have open, at full resolution.</strong></p>
 
-**One volume, five stores, archived at full resolution.**
+<p align="center">MIT · Tampermonkey or Violentmonkey</p>
 
-[Quick start](#quick-start) · [Install](#install) · [Screenshots](#screenshots) · [Why people use it](#why-people-use-it) · [How it works](#how-it-works) · [Optional companions](#optional-companions) · [Documentation](#documentation)
+[Quick start](#quick-start) · [Install](#install) · [Screenshots](#screenshots) · [Why people use it](#why-people-use-it) · [Supported stores](#supported-stores) · [How it works](#how-it-works) · [Related tools](#related-tools) · [Documentation](#documentation)
 
 dokuha-userscript is a browser userscript that saves the volume you already have open in BookWalker, CMOA, ebookjapan, the Kindle web manga reader or k-manga. It reads the viewer's own signed CDN URLs, fetches every page file directly, rebuilds each page offline, and gives you a ZIP or a finished Mokuro volume. You never turn a page to capture it.
 
@@ -15,8 +15,8 @@ The name comes from the Japanese word 読破, to read a work through to the end,
 ## Quick start
 
 1. Install a userscript manager: [Tampermonkey](https://www.tampermonkey.net/) (Chrome, Firefox, Edge) or [Violentmonkey](https://violentmonkey.github.io/).
-2. Install the script (see [Install](#install)), then open a volume in any of the five readers. The panel appears once the viewer is ready.
-3. Choose **Save as ZIP** for a plain archive, or **Save and run through Mokuro** if a local mokuro-bridge is running, then watch both bars finish.
+2. Install the script (see [Install](#install)), then open a volume in any supported reader. The panel appears once the viewer is ready.
+3. Choose **Save as ZIP** for a plain archive, or **Save and run through Mokuro** if a local [mokuro-bridge](https://github.com/GolyBidoof/mokuro-bridge) is running, then watch both bars finish.
 
 ## Install
 
@@ -47,14 +47,12 @@ Tampermonkey asks for cross-origin access to the stats and store-search hosts. T
 
 ## Why people use it
 
-- **Full resolution, not screenshots.** The CDN page file is fetched and rebuilt offline, so the output is the page as published rather than a picture of the page as displayed.
-- **One volume, five stores.** The same panel, controls and output work on BookWalker, CMOA, ebookjapan, Kindle and k-manga, and the combined script picks the store from the page you are on.
+- **Full resolution, not screenshots.** The CDN page file is fetched and rebuilt offline, so the output is the page as published rather than a picture of the page as displayed. JPEG at q0.92 is the default, and WebP, lossless and PNG are also available.
+- **One panel, every supported store.** The same controls and output work on BookWalker, CMOA, ebookjapan, Kindle and k-manga, and the combined script picks the store from the page you are on.
 - **Only on reader pages.** The scripts match the viewers and nowhere else, so series, title, product and search pages never load the panel, the bridge probe or the traffic capture.
 - **Resume, not restart.** Pages are cached as they arrive; an interrupted run continues where it stopped, and the retry only fetches what is missing.
 - **Fast on a normal browser profile.** Fetches are spread across every origin a page can open, and rebuilds run across a worker pool, so a browser's six-connections-per-origin limit is not the ceiling.
-- **A local mokuro-bridge is a download accelerator too.** A browser gives six connections per origin, so each of the bridge's 48 default ports is six more sockets, up to 288 extra lanes against the 12 the script's own two lanes give it in the hermetic lane test. The gain is largest where a store serves one file per page and smaller on Kindle, which hands pages over in render windows.
-- **Recommended for full volumes, even without OCR.** If you download whole books, run mokuro-bridge locally even when you never want OCR or cloud delivery: the extra fetch lanes are the practical reason, and the OCR button comes with the same install.
-- **A choice of image formats.** JPEG at q0.92 by default, plus WebP, lossless and PNG.
+- **A local mokuro-bridge is a download accelerator too.** A browser gives six connections per origin, so each of the bridge's 48 default ports is six more sockets, up to 288 extra lanes against the 12 the script's own two lanes give it in the hermetic lane test. The gain is largest where a store serves one file per page and smaller on Kindle, which hands pages over in render windows. Run the bridge locally even when you never want OCR or cloud delivery, since the extra fetch lanes are the practical reason and the OCR button comes with the same install.
 - **A panel that stays out of the way.** Draggable, resizable and minimisable, it remembers where you put it and does not claim the arrow keys, so the viewer still turns pages normally.
 - **Reading stats before you commit.** Natively levels, ratings and reader counts, plus Manga Kotoba vocabulary totals, appear in the panel while you decide.
 
@@ -80,16 +78,16 @@ A run moves through five stages:
 2. **Plan** the page list, so the page count and order are known before a single CDN request.
 3. **Fetch** every page at full resolution, across the page itself, the userscript manager's background context, a dotted host and an HTTP/2 mirror, with retry ladders for expiring signatures and throttling.
 4. **Rebuild** each page offline. Depending on the store that means decrypting an envelope, unshuffling tiles on a canvas, running the viewer's own wasm, or decrypting a page cipher.
-5. **Deliver** the pages as a flat ZIP of `page-0001.jpg` and so on, or stream them to a running mokuro-bridge while capture is still going.
+5. **Deliver** the pages as a flat ZIP of `page-0001.jpg` and so on, or stream them to a running [mokuro-bridge](https://github.com/GolyBidoof/mokuro-bridge) while capture is still going.
 
 The full design, including the build model, the lane budget, the page cache and the bridge protocol, is in [docs/architecture.md](docs/architecture.md).
 
-## Optional companions
+## Related tools
 
-Neither of these is needed for a download, and this userscript is useful without either of them.
+Both are optional: this userscript works without either of them.
 
-- **dokuha-cli** is the sister tool in the same dokuha family: a batch downloader for the same five stores that runs in Node with no browser. Reach for it when you want a whole series rather than the volume you have open, or when there is no browser session to capture.
-- **mokuro-bridge** is the one companion worth installing even for downloads alone: it is a separate service in the mokuro ecosystem, not part of the dokuha tools, and its local ports are what give this script the extra fetch lanes described above. It also runs mokuro OCR on finished pages and delivers the `.cbz`, `.mokuro`, cover `.webp` and per-series `series.json` that reader.mokuro.app reads, to a local folder, MEGA, Google Drive, OneDrive, WebDAV or whichever other destination the bridge is configured for. It interoperates with mokuro-bunko, which compiles its own library metadata.
+- **[dokuha-cli](https://github.com/GolyBidoof/dokuha-cli)** is the sister tool in the same dokuha family: a batch downloader for the same stores that runs in Node with no browser. Reach for it when you want a whole series rather than the volume you have open, or when there is no browser session to capture.
+- **[mokuro-bridge](https://github.com/GolyBidoof/mokuro-bridge)** is the one companion worth installing even for downloads alone: it is a separate service in the mokuro ecosystem, not part of the dokuha tools, and its local ports are what give this script the extra fetch lanes described above. It also runs mokuro OCR on finished pages and delivers the `.cbz`, `.mokuro`, cover `.webp` and per-series `series.json` that [reader.mokuro.app](https://reader.mokuro.app) reads, to a local folder, MEGA, Google Drive, OneDrive, WebDAV or whichever other destination the bridge is configured for. It interoperates with [mokuro-bunko](https://github.com/Gnathonic/mokuro-bunko), which compiles its own library metadata.
 
 ## Documentation
 
@@ -111,18 +109,18 @@ Neither of these is needed for a download, and this userscript is useful without
 npm install
 npm run build        # assemble every artifact from src/
 npm run check:build  # fail when a committed artifact no longer matches src/
-npm test             # the hermetic suite, 31 files
+npm test             # the hermetic suite, 32 files
 ```
 
 The shipped `.user.js` files are built, never edited by hand: each is the concatenation of the `src/` fragments in manifest order, so a change to the source is what changes the script. The suite runs the artifacts in headless Chrome against local stub servers, plus artifact and protocol checks that need no browser. `npm run test:acceptance` runs the opt-in live-store comparison and `npm run test:bridge` measures the fetch lanes against a throwaway bridge instance.
 
 ## Credits and licence
 
-Built by [GolyBidoof](https://github.com/GolyBidoof) together with **DeepSeek V4.1 Flash**, which reverse engineered the stores' protocols, ported the crypto and descramble logic, and iterated against live captures until every step matched.
+Built by [GolyBidoof](https://github.com/GolyBidoof) with **DeepSeek V4.1 Flash**, an AI coding agent. The agent reverse engineered the stores' protocols, ported the crypto and descramble logic, and iterated against live captures until every step matched.
 
 - [BookWalker](https://bookwalker.jp), [CMOA](https://www.cmoa.jp), [ebookjapan](https://ebookjapan.yahoo.co.jp), [Amazon Kindle](https://read.amazon.co.jp) and [k-manga](https://comic.k-manga.jp), for the services this tool works with. All downloaded content remains subject to their terms of service.
 - [Brandon](https://learnnatively.com/user/brandon/), for the difficulty levels, JLPT-band colours, ratings and book metadata shown in the stats card, and [ChristopherFritz](https://community.wanikani.com/u/christopherfritz) for the Manga Kotoba vocabulary statistics.
-- [kha-white/mokuro](https://github.com/kha-white/mokuro) and [manga-ocr](https://github.com/kha-white/manga-ocr), the upstream OCR engine and model; detection uses [comic-text-detector](https://github.com/dmMaze/comic-text-detector).
+- [kha-white/mokuro](https://github.com/kha-white/mokuro) and [manga-ocr](https://github.com/kha-white/manga-ocr), the upstream OCR engine and model, with [GolyBidoof/mokuro](https://github.com/GolyBidoof/mokuro) as the batched fork that mokuro-bridge recommends; detection uses [comic-text-detector](https://github.com/dmMaze/comic-text-detector).
 - [aaa4xu/bookworm](https://github.com/aaa4xu/bookworm), the offline BookWalker client whose algorithm the descramble implementation was validated against.
 - [ChristopherFritz](https://github.com/ChristopherFritz), for the BookWalker manifest page naming and the ZIP ordering that keeps it stable.
 
