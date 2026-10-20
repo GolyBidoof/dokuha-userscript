@@ -10,7 +10,7 @@ The adapter described in §4 now exists in this directory (`00-state.js`, `01-ta
 
 The web manga reader at `https://read.amazon.co.jp/manga/<ASIN>`. It is a React-ish SPA that renders **fixed-layout** manga: `manifest.bookFormat = YJBINARY_HD_MONOLITHIC`, `bookType = FixedFormat`, `contentType = FullBook`. The reader asks a first-party "karamel" render service for a *window* of pages, and that window's manifest tells it which signed CloudFront URLs hold the page images.
 
-## 2. The three facts that make this the easiest of the five stores
+## 2. The three facts that make this the easiest of the six stores
 
 1. **No descrambling.** A CDN resource *is* the finished page JPEG, natively 1350×1920. There are no tiles, no geometry plan, no canvas reassembly.
 2. **No URL signing code.** The render manifest hands back each resource's `authParameter` (`Policy=…&Signature=…&Key-Pair-Id=…`) already computed. The adapter concatenates and fetches.

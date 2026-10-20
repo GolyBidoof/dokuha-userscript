@@ -1,5 +1,28 @@
 # Changelog
 
+## v3.1.0
+
+**DMMブックス is the sixth store, and the "also available on" card now asks all six shops.** `dmm-only.user.js` joins the release as the seventh artifact. DMM's free volumes and 試し読み samplers download through the viewer's own auth and a CloudFront-signed manifest, and each page is unshuffled from a 64×64 tile grid in a worker pool. The card reads DMM's product page and its BFF volume list for the whole run's prices and free counts, and a trailing imprint label in a shop's title no longer hides a match.
+
+### Added
+- **DMMブックス is the sixth store.** The adapter matches the two real readers, `/product/<series>/<content>/free_streaming/` for a volume that is free in full for a limited window and `/product/<series>/<content>/tachiyomi/` for a 試し読み sampler, and it calls `GET /viewerapi/auth/` for the viewer session. The free route answers with CloudFront cookies, which are appended to each CDN URL as signed query parameters with the cookie names changed to `Policy`, `Signature` and `Key-Pair-Id` and the signature decoded once, while the sampler route answers with an `auth_info` object. The page list is a plain `configuration_pack.json`, so no pack decryption is involved, and the CDN JPEG is a shuffled grid of 64×64 tiles whose pattern comes from the page path, with the four-pixel remainder column taking part in the permutation. Pages are unshuffled in a pool of `OffscreenCanvas` workers sized from the shared worker pool, with a main-thread fallback when a CSP refuses blob workers. A 403 re-runs the auth call once, single-flight across the page workers, and retries the request; 429 and 5xx responses retry with bounded backoff. Fan-out is sized from `fetchSocketBudget(true)`, so the bridge's fetch-proxy ports are used and there is no fixed worker cap, with `dmmConcurrency` and `window.__bwddMaxInflight` available to clamp it. Free full volumes and 試し読み samplers are supported; paid and library volumes have no session import path yet.
+- **DMMブックス joins the "also available on" card.** Its search page is server-rendered, and one result card stands for the whole series, so the adapter reads the per-volume rows from the product page's Next.js flight payload: each volume's title, number, price, `free_streaming` URL and limited-free end. A series whose pager says there are more volumes than the first page carries is filled from the store's own BFF endpoint, in pages of 100 volumes each, instead of clicking through a rendered list. A volume is free only when it has a `free_streaming` URL, because a `tachiyomi` sampler is not a free edition. The search is region gated like the viewer, so from outside Japan it reports no match rather than a false one.
+
+### Changed
+- **The availability card asks six shops and lays them out in two rows of three.** BookWalker, CMOA, ebookjapan, Kindle, k-manga and DMMブックス are all queried for the book on screen, and the card keeps its existing behaviour: it appears as soon as the first shop confirms the series, replaces a placeholder as each answer lands, and shows no pill for a shop that does not carry it. The layout stayed count-driven: six pills are three cells a row, the compact metrics apply to a three-pill row, and no store name is ellipsized, while five pills keep their two wide cells over three narrow ones. `tests/test_availability.js` now pins the six-pill row alongside the five-pill one.
+- **The documentation and listing copy describe six stores.** `README.md`, `docs/architecture.md`, `src/README.md`, `tests/README.md`, `RELEASING.md`, `package.json` and the paste-ready files under `docs/greasyfork/` now name DMMブックス, the seventh artifact and the six-shop card, and the DMM protocol record sits beside its code.
+- **`dmm-only.user.js` is committed beside the other six artifacts.** `src/targets.json` gives it the reader-only `@match` list, the DMM storefront hosts and its own banner, and `src/manifest.json` links the DMM fragments after k-manga so the store stays one block.
+- **DMM and Kindle now size their fan-out for the transport they actually use.** DMM's CDN is CloudFront over HTTP/2, so its plan opens four streams per socket-budget slot instead of the 20% headroom written for a six-connection HTTP/1.1 origin: 48 fetchers on a no-bridge profile, still clamped by `dmmConcurrency` and `window.__bwddMaxInflight`. Kindle's fixed 12 fetchers become 24, because at a 300 ms round trip the page stage is mostly waiting and 24 streams reach about 82% of the link where 12 reaches about 70%. Decode concurrency is unchanged, so the extra in-flight requests hold compressed bytes rather than extra canvases.
+
+### Fixed
+- **A trailing parenthetical imprint no longer hides a title match.** The shared search-candidate builder behind the manga-kotoba and LearnNatively cards and the cross-store availability search now appends label-free variants for a trailing group such as `(サンプルコミックスDIGITAL)` or `(サンプルレーベルコミックス)`, and handles the label on either side of a volume marker. The original title stays first and is never discarded, so an existing match that relied on it cannot regress. Only groups that read like an imprint, edition or label are stripped: `(上)`, `(下)`, `(前編)` and a bare volume number such as `（１）` stay part of the title. The old parenthetical-edition rule also ate the opening of a longer label and left a mangled `… (サンプル` candidate behind; the replacement matches the whole bracket group. Titles that kept the imprint, like a Kindle listing for `サンプル作品 モノクロ版 1 (サンプルコミックスDIGITAL)` or `サンプル作品 20 (サンプルレーベルコミックス)`, used to search for the whole string and miss every other store's row for the same book.
+
+### Tests
+- `tests/test_dmm_adapter.js` runs the adapter end to end against a local HTTPS stand-in for the viewer and its CDN: adapter selection, the cookie-to-signed-query manifest fetch, the page count and resolution, a full ZIP run whose pages land where the 64×64 geometry says, the shared 403 refresh, page-cache resume and the tachiyomi sampler.
+- `tests/test_dmm_protocol.js` pins the DMM URL and auth paths, the CloudFront cookie-to-query names and the decoded signature, the 64×64 geometry, the fan-out sizing and the worker job envelope. `tests/test_dmm_worker.js` runs the real worker source against a fake `OffscreenCanvas` and checks the tile count, orientation, message ids and decode errors.
+- `tests/test_availability.js` covers the DMM adapter against stubbed search, product and BFF payloads: the series-level search card, the per-volume price, the limited-free end, the free-streaming link as the only free signal, the BFF pages for a truncated run, and the six-pill layout.
+- `tests/test_search_candidates.js` pins the parenthetical-label variants, including the original candidate staying first, a bare volume number not being mistaken for a label, and the existing `【...】` handling.
+
 ## v3.0.1
 
 ### Fixed
@@ -145,8 +168,8 @@ The availability card says less, but it says it about *your* volume.
 - **An unnumbered volume is matched by its exact title.** A one-shot, or a first
   volume whose title carries no number, could not be found by volume number, so
   its pill fell back to a bare "available" with no price. It now matches the
-  series row whose title equals the book's - BookWalker's row for
-  `小春と湊 わたしのパートナーは女の子【イラスト特典付】` - and
+  series row whose title equals the book's - an unnumbered, bonus-included
+  edition of the same kind - and
   reports that row's price.
 - **No filler word.** A pill with nothing to say about the volume now shows just
   the shop's name instead of the word "available".

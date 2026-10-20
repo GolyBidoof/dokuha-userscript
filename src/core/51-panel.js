@@ -262,7 +262,8 @@
                     if (info && (Array.isArray(info.fetchUpstreams) || info.upstream)) {
                         setProxyUpstreams(info.fetchUpstreams, info.upstream);
                     }
-                    addProxyPorts(info && info.fetchProxyPorts, 'bridge');
+                    addProxyPorts(info && info.fetchProxyPorts, 'bridge',
+                        { pathUpstream: !!(info && info.fetchPathUpstream) });
                 } catch (e) {}
                 mokuroMissing = !!(info && info.mokuro_installed === false);
                 bridgeBusy = !!(info && info.busy);

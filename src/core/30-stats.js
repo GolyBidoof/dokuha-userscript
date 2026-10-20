@@ -104,19 +104,7 @@
     }
     async function lookupMangaKotoba(seriesTitle, volumeNum) {
         try {
-            let links = null;
-            let search = '';
-            let usedTitle = seriesTitle;
-            for (const cand of searchTitleCandidates(seriesTitle)) {
-                const q = encodeURIComponent(cand);
-                const text = (await gmFetch('https://manga-kotoba.com/search/series/?q=' + q)).text;
-                const doc = new DOMParser().parseFromString(text, 'text/html');
-                const l = [...doc.querySelectorAll('a[href*="/series/"]')];
-                if (l.length) { links = l; search = text; usedTitle = cand; break; }
-            }
-            if (!links) return null;
             const norm = (x) => String(x || '').replace(/[\s　\u30fb・:：()（）]/g, '').toLowerCase();
-            const target = norm(usedTitle);
             // manga-kotoba's /series/ results wrap an entire card in the anchor,
             // so anchor.textContent is far broader than the series name: scoring
             // the whole anchor made a spin-off listed before the base series win
@@ -129,19 +117,35 @@
                 const line = String(a.textContent || '').split(/\n/).map(x => x.trim()).find(Boolean);
                 return line || '';
             };
-            let best = null, bestScore = 0, bestExtra = Infinity;
-            for (const a of links) {
-                const t = norm(titleOf(a));
-                if (!t || !target) continue;
-                let score = 0;
-                if (t === target) score = 1000;
-                else if (t.indexOf(target) !== -1) score = target.length;
-                else if (target.indexOf(t) !== -1) score = t.length;
-                if (!score) continue;
-                const extra = t.length - target.length;
-                if (score > bestScore || (score === bestScore && extra < bestExtra)) {
-                    bestScore = score; bestExtra = extra; best = a;
+            let best = null;
+            let usedTitle = seriesTitle;
+            for (const cand of searchTitleCandidates(seriesTitle)) {
+                const q = encodeURIComponent(cand);
+                const text = (await gmFetch('https://manga-kotoba.com/search/series/?q=' + q)).text;
+                const doc = new DOMParser().parseFromString(text, 'text/html');
+                const links = [...doc.querySelectorAll('a[href*="/series/"]')];
+                if (!links.length) continue;
+                const target = norm(cand);
+                let bestScore = 0, bestExtra = Infinity;
+                for (const a of links) {
+                    const t = norm(titleOf(a));
+                    if (!t || !target) continue;
+                    let score = 0;
+                    if (t === target) score = 1000;
+                    else if (t.indexOf(target) !== -1) score = target.length;
+                    else if (target.indexOf(t) !== -1) score = t.length;
+                    if (!score) continue;
+                    const extra = t.length - target.length;
+                    if (score > bestScore || (score === bestScore && extra < bestExtra)) {
+                        bestScore = score; bestExtra = extra; best = a;
+                    }
                 }
+                // The fuzzy search can return an unrelated series for the raw
+                // title ("サンプル作品 20 (サンプルコミックス)" came back as
+                // 魔法使いの心友). Breaking on the first non-empty result set
+                // left every label-free candidate unreachable, so only a result
+                // that actually names the book ends the walk.
+                if (best) { usedTitle = cand; break; }
             }
             if (!best) return null;
             const slug = best.getAttribute('href');
@@ -169,24 +173,64 @@
         const out = [t];
         const seen = new Set([t]);
         const push = (s) => { s = String(s || '').trim(); if (s && !seen.has(s)) { seen.add(s); out.push(s); } };
-        let s = t.replace(/【[^】]*】/g, ' ').replace(/[\s　]+/g, ' ').trim();
-        push(s);
-        let cur = s;
-        for (let i = 0; i < 6; i++) {
-            const before = cur;
-            cur = cur
-                .replace(/[\s　]*(文庫版|新装版|完全版|愛蔵版|廉価版|普及版|電子版|特装版|限定版|豪華版|分冊版|合本版|オンデマンド版|デジタル版|単行本版|ノベルズ版|ペーパーバック版)[\s　]*$/u, '')
-                .replace(/[\s　]*[(（]*(文庫|新装|完全|愛蔵|廉価|普及)[)）]*[\s　]*$/u, '')
-                // A volume marker needs a number with it. A bare trailing 話 or
-                // 版 is usually part of the title ("…棄てる妻の話"), so stripping
-                // it produced "…棄てる妻の" and the real base title was never
-                // generated, which is how a 分冊版 lost every store.
-                .replace(/[\s　]*第?[0-9０-９一二三四五六七八九十百]+[巻話版編]?[\s　]*$/u, '')
-                .trim();
-            push(cur);
-            if (cur === before) break;
+        const VOL = '[0-9０-９一二三四五六七八九十百]+';
+        // A volume marker, optionally bracketed: "3", "3巻", "（３）", "第3話".
+        const VOL_TOKEN = '(?:[（(]?第?' + VOL + '[巻話]?[）)]?)';
+        // A trailing parenthetical is imprint/edition metadata only when it
+        // reads like a label ("(サンプルコミックスDIGITAL)", "(サンプル文庫)").
+        // (上)/(下)/(前編) and a bare volume number such as （１） are part of
+        // the title; stripping them searches for a different book.
+        const labelLike = (g) => /コミックス|コミック|レーベル|文庫|ノベルズ|デジタル|デラックス|電子|雑誌|単行本|ブックス|BOOKS|Books|出版|社|DIGITAL|digital|新装|完全|愛蔵|廉価|普及/.test(g);
+        // The title in front of a trailing label, with a volume marker on
+        // either side of the label dropped too: "… 1 (LABEL)" and
+        // "… (LABEL) 1" both yield "…".
+        const stripLabel = (s) => {
+            for (const re of [
+                new RegExp('^(.*?)[\\s　]*[（(]([^()（）]*)[）)][\\s　]*' + VOL_TOKEN + '[\\s　]*$', 'u'),
+                new RegExp('^(.*?)[\\s　]*' + VOL_TOKEN + '[\\s　]*[（(]([^()（）]*)[）)][\\s　]*$', 'u'),
+                /^(.*?)[\s　]*[（(]([^()（）]*)[）)][\s　]*$/u,
+            ]) {
+                const m = s.match(re);
+                if (m && labelLike(m[2]) && m[1].trim()) return m[1].trim();
+            }
+            return null;
+        };
+        // `bareEdition` is the last-ditch "…版" fallback for the raw title. It
+        // must not run on a label-free base: chopping 版 off "… モノクロ版"
+        // would search for "… モノクロ".
+        const normalize = (seed, bareEdition) => {
+            const s = String(seed || '').replace(/【[^】]*】/g, ' ').replace(/[\s　]+/g, ' ').trim();
+            push(s);
+            let cur = s;
+            for (let i = 0; i < 6; i++) {
+                const before = cur;
+                cur = cur
+                    .replace(/[\s　]*(文庫版|新装版|完全版|愛蔵版|廉価版|普及版|電子版|特装版|限定版|豪華版|分冊版|合本版|オンデマンド版|デジタル版|モノクロ版|カラー版|単行本版|ノベルズ版|ペーパーバック版)[\s　]*$/u, '')
+                    // The token has to be the whole parenthetical group: the old
+                    // `[(（]*` also ate the opening paren of "… (サンプル文庫)" and
+                    // left the mangled "… (電撃".
+                    .replace(/[\s　]*(?:[(（](?:文庫|新装|完全|愛蔵|廉価|普及)(?:版)?[)）]|(?:文庫|新装|完全|愛蔵|廉価|普及)(?:版)?)[\s　]*$/u, '')
+                    // A volume marker needs a number with it. A bare trailing 話 or
+                    // 版 is usually part of the title ("…棄てる妻の話"), so stripping
+                    // it produced "…棄てる妻の" and the real base title was never
+                    // generated, which is how a 分冊版 lost every store.
+                    .replace(new RegExp('[\\s　]*第?' + VOL + '[巻話版編]?[\\s　]*$', 'u'), '')
+                    .trim();
+                push(cur);
+                if (cur === before) break;
+            }
+            if (bareEdition) push(s.replace(/[\s　]*版$/u, '').trim());
+        };
+        // The raw title stays first so an existing match cannot regress; the
+        // label-free variants are appended after it.
+        normalize(t, true);
+        let base = t.replace(/【[^】]*】/g, ' ').replace(/[\s　]+/g, ' ').trim();
+        for (let i = 0; i < 3; i++) {
+            const next = stripLabel(base);
+            if (!next) break;
+            base = next;
+            normalize(base, false);
         }
-        push(s.replace(/[\s　]*版$/u, '').trim());
         return out.filter(Boolean);
     }
     async function lnSearchBook(candidates) {

@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         dokuha-userscript
 // @namespace    http://tampermonkey.net/
-// @version      3.0.1
-// @description  Saves a book from the BookWalker viewer, the CMOA speed reader, the ebookjapan reader, the Kindle web manga reader or the k-manga viewer as a ZIP or CBZ of full-resolution page images, fetched from the store and unscrambled offline. Optional Japanese OCR through mokuro-bridge, with upload to MEGA, Google Drive or OneDrive.
+// @version      3.1.0
+// @description  Saves a book from the BookWalker viewer, the CMOA speed reader, the ebookjapan reader, the Kindle web manga reader, the k-manga viewer or the DMMブックス viewer as a ZIP or CBZ of full-resolution page images, fetched from the store and unscrambled offline. Optional Japanese OCR through mokuro-bridge, with upload to MEGA, Google Drive or OneDrive.
 // @author       GolyBidoof
 // @homepageURL  https://github.com/GolyBidoof/dokuha-userscript
 // @supportURL   https://github.com/GolyBidoof/dokuha-userscript/issues
@@ -17,6 +17,8 @@
 // @match        https://ebookjapan.yahoo.co.jp/viewer/*
 // @match        https://read.amazon.co.jp/manga/*
 // @match        https://comic.k-manga.jp/viewer/*
+// @match        https://book.dmm.com/product/*/*/free_streaming/*
+// @match        https://book.dmm.com/product/*/*/tachiyomi/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=bookwalker.jp
 // @grant        GM_xmlhttpRequest
 // @grant        unsafeWindow
@@ -36,12 +38,15 @@
 // @connect      comic.k-manga.jp
 // @connect      bv.k-manga.jp
 // @connect      ws.viewer.k-manga.jp
+// @connect      book.dmm.com
+// @connect      *.dmm.com
+// @connect      *.dmm.co.jp
 // @connect      127.0.0.1
 // @connect      localhost
 // @run-at       document-end
 // @license      MIT
 //
-// One script, five stores. The panel, its controls, the Mokuro bridge, the
+// One script, six stores. The panel, its controls, the Mokuro bridge, the
 // reading-stat cards, the ZIP naming and the headless automation API are shared
 // verbatim; only the store-specific protocol lives in its own module under
 // src/sites/. Only the readers are matched; BookWalker stays the fallback for a
@@ -83,7 +88,7 @@
             const v = (typeof GM_info !== 'undefined') && GM_info.script && GM_info.script.version;
             if (v) return v;
         } catch (e) { }
-        return '3.0.1';
+        return '3.1.0';
     })();
 
     const BWDD_DEBUG = (() => {
@@ -2702,19 +2707,7 @@ function authPolicySig() {
     }
     async function lookupMangaKotoba(seriesTitle, volumeNum) {
         try {
-            let links = null;
-            let search = '';
-            let usedTitle = seriesTitle;
-            for (const cand of searchTitleCandidates(seriesTitle)) {
-                const q = encodeURIComponent(cand);
-                const text = (await gmFetch('https://manga-kotoba.com/search/series/?q=' + q)).text;
-                const doc = new DOMParser().parseFromString(text, 'text/html');
-                const l = [...doc.querySelectorAll('a[href*="/series/"]')];
-                if (l.length) { links = l; search = text; usedTitle = cand; break; }
-            }
-            if (!links) return null;
             const norm = (x) => String(x || '').replace(/[\s　\u30fb・:：()（）]/g, '').toLowerCase();
-            const target = norm(usedTitle);
 
             const titleOf = (a) => {
                 const h = a.querySelector('.japanese-title, .series-title, h3');
@@ -2722,19 +2715,31 @@ function authPolicySig() {
                 const line = String(a.textContent || '').split(/\n/).map(x => x.trim()).find(Boolean);
                 return line || '';
             };
-            let best = null, bestScore = 0, bestExtra = Infinity;
-            for (const a of links) {
-                const t = norm(titleOf(a));
-                if (!t || !target) continue;
-                let score = 0;
-                if (t === target) score = 1000;
-                else if (t.indexOf(target) !== -1) score = target.length;
-                else if (target.indexOf(t) !== -1) score = t.length;
-                if (!score) continue;
-                const extra = t.length - target.length;
-                if (score > bestScore || (score === bestScore && extra < bestExtra)) {
-                    bestScore = score; bestExtra = extra; best = a;
+            let best = null;
+            let usedTitle = seriesTitle;
+            for (const cand of searchTitleCandidates(seriesTitle)) {
+                const q = encodeURIComponent(cand);
+                const text = (await gmFetch('https://manga-kotoba.com/search/series/?q=' + q)).text;
+                const doc = new DOMParser().parseFromString(text, 'text/html');
+                const links = [...doc.querySelectorAll('a[href*="/series/"]')];
+                if (!links.length) continue;
+                const target = norm(cand);
+                let bestScore = 0, bestExtra = Infinity;
+                for (const a of links) {
+                    const t = norm(titleOf(a));
+                    if (!t || !target) continue;
+                    let score = 0;
+                    if (t === target) score = 1000;
+                    else if (t.indexOf(target) !== -1) score = target.length;
+                    else if (target.indexOf(t) !== -1) score = t.length;
+                    if (!score) continue;
+                    const extra = t.length - target.length;
+                    if (score > bestScore || (score === bestScore && extra < bestExtra)) {
+                        bestScore = score; bestExtra = extra; best = a;
+                    }
                 }
+
+                if (best) { usedTitle = cand; break; }
             }
             if (!best) return null;
             const slug = best.getAttribute('href');
@@ -2762,21 +2767,51 @@ function authPolicySig() {
         const out = [t];
         const seen = new Set([t]);
         const push = (s) => { s = String(s || '').trim(); if (s && !seen.has(s)) { seen.add(s); out.push(s); } };
-        let s = t.replace(/【[^】]*】/g, ' ').replace(/[\s　]+/g, ' ').trim();
-        push(s);
-        let cur = s;
-        for (let i = 0; i < 6; i++) {
-            const before = cur;
-            cur = cur
-                .replace(/[\s　]*(文庫版|新装版|完全版|愛蔵版|廉価版|普及版|電子版|特装版|限定版|豪華版|分冊版|合本版|オンデマンド版|デジタル版|単行本版|ノベルズ版|ペーパーバック版)[\s　]*$/u, '')
-                .replace(/[\s　]*[(（]*(文庫|新装|完全|愛蔵|廉価|普及)[)）]*[\s　]*$/u, '')
+        const VOL = '[0-9０-９一二三四五六七八九十百]+';
 
-                .replace(/[\s　]*第?[0-9０-９一二三四五六七八九十百]+[巻話版編]?[\s　]*$/u, '')
-                .trim();
-            push(cur);
-            if (cur === before) break;
+        const VOL_TOKEN = '(?:[（(]?第?' + VOL + '[巻話]?[）)]?)';
+
+        const labelLike = (g) => /コミックス|コミック|レーベル|文庫|ノベルズ|デジタル|デラックス|電子|雑誌|単行本|ブックス|BOOKS|Books|出版|社|DIGITAL|digital|新装|完全|愛蔵|廉価|普及/.test(g);
+
+        const stripLabel = (s) => {
+            for (const re of [
+                new RegExp('^(.*?)[\\s　]*[（(]([^()（）]*)[）)][\\s　]*' + VOL_TOKEN + '[\\s　]*$', 'u'),
+                new RegExp('^(.*?)[\\s　]*' + VOL_TOKEN + '[\\s　]*[（(]([^()（）]*)[）)][\\s　]*$', 'u'),
+                /^(.*?)[\s　]*[（(]([^()（）]*)[）)][\s　]*$/u,
+            ]) {
+                const m = s.match(re);
+                if (m && labelLike(m[2]) && m[1].trim()) return m[1].trim();
+            }
+            return null;
+        };
+
+        const normalize = (seed, bareEdition) => {
+            const s = String(seed || '').replace(/【[^】]*】/g, ' ').replace(/[\s　]+/g, ' ').trim();
+            push(s);
+            let cur = s;
+            for (let i = 0; i < 6; i++) {
+                const before = cur;
+                cur = cur
+                    .replace(/[\s　]*(文庫版|新装版|完全版|愛蔵版|廉価版|普及版|電子版|特装版|限定版|豪華版|分冊版|合本版|オンデマンド版|デジタル版|モノクロ版|カラー版|単行本版|ノベルズ版|ペーパーバック版)[\s　]*$/u, '')
+
+                    .replace(/[\s　]*(?:[(（](?:文庫|新装|完全|愛蔵|廉価|普及)(?:版)?[)）]|(?:文庫|新装|完全|愛蔵|廉価|普及)(?:版)?)[\s　]*$/u, '')
+
+                    .replace(new RegExp('[\\s　]*第?' + VOL + '[巻話版編]?[\\s　]*$', 'u'), '')
+                    .trim();
+                push(cur);
+                if (cur === before) break;
+            }
+            if (bareEdition) push(s.replace(/[\s　]*版$/u, '').trim());
+        };
+
+        normalize(t, true);
+        let base = t.replace(/【[^】]*】/g, ' ').replace(/[\s　]+/g, ' ').trim();
+        for (let i = 0; i < 3; i++) {
+            const next = stripLabel(base);
+            if (!next) break;
+            base = next;
+            normalize(base, false);
         }
-        push(s.replace(/[\s　]*版$/u, '').trim());
         return out.filter(Boolean);
     }
     async function lnSearchBook(candidates) {
@@ -3910,10 +3945,16 @@ const MOKURO_BRIDGE_URL = (() => {
    cells are a third of the card wide. These are the knobs for the whole card:
    change them here and every count follows. */
 .bwdd-store-row { display: grid; grid-template-columns: repeat(${STORE_GRID_TRACKS}, minmax(0, 1fr)); gap: 6px; }
+/* A row of three is a third of the card, so the badge, padding and name shrink
+   and the state line is allowed to wrap onto a second line. Ellipsizing either
+   one was how "BookWalker" and "KU · ¥620 · 16 vols" became unreadable once the
+   card asked six shops. */
 .bwdd-store-row.is-compact { gap: 4px; }
 .bwdd-store-row.is-compact > .bwdd-store-link,
-.bwdd-store-row.is-compact > .bwdd-store-pending { padding: 3px 4px; column-gap: 3px; }
-.bwdd-store-row.is-compact .bwdd-store-badge { width: 12px; height: 12px; font-size: 9px; }
+.bwdd-store-row.is-compact > .bwdd-store-pending { padding: 2px 3px; column-gap: 2px; }
+.bwdd-store-row.is-compact .bwdd-store-badge { width: 9px; height: 9px; font-size: 7px; }
+.bwdd-store-row.is-compact .bwdd-store-name { font-size: 9.5px; letter-spacing: -0.03em; }
+.bwdd-store-row.is-compact .bwdd-store-state { white-space: normal; line-height: 1.25; }
 .bwdd-store-link, .bwdd-store-pending {
   display: grid;
   grid-template-columns: auto minmax(0, 1fr);
@@ -4544,6 +4585,162 @@ const MOKURO_BRIDGE_URL = (() => {
                 if (seen[s]) continue;
                 seen[s] = true;
                 out.push(s);
+            }
+            return out;
+        },
+    });
+
+    function dmmAvailabilityFlight(html) {
+        const text = String(html || '');
+        const re = /self\.__next_f\.push\(\[1,("(?:[^"\\]|\\.)*")\]\)/g;
+        let out = '';
+        let m;
+        while ((m = re.exec(text))) {
+            try { out += JSON.parse(m[1]); } catch (e) {}
+        }
+        return out;
+    }
+
+    function dmmAvailabilityJsonValue(text, key) {
+        const at = String(text || '').indexOf('"' + key + '":');
+        if (at < 0) return null;
+        let i = at + key.length + 3;
+        while (i < text.length && /\s/.test(text[i])) i++;
+        const first = text[i];
+        if (first !== '[' && first !== '{') return null;
+        const close = first === '[' ? ']' : '}';
+        let depth = 0;
+        let inString = false;
+        let escape = false;
+        for (let k = i; k < text.length; k++) {
+            const ch = text[k];
+            if (inString) {
+                if (escape) escape = false;
+                else if (ch === '\\') escape = true;
+                else if (ch === '"') inString = false;
+                continue;
+            }
+            if (ch === '"') { inString = true; continue; }
+            if (ch === first) depth++;
+            else if (ch === close) {
+                depth--;
+                if (depth === 0) {
+                    try { return JSON.parse(text.slice(i, k + 1)); } catch (e) { return null; }
+                }
+            }
+        }
+        return null;
+    }
+
+    function dmmAvailabilityPayload(html) {
+        const text = String(html || '').trim();
+        if (!text) return null;
+        if (text[0] === '{') {
+            try {
+                const body = JSON.parse(text);
+                if (body && Array.isArray(body.volume_books)) {
+                    return {
+                        rows: body.volume_books,
+                        total: Number(body.pager && body.pager.total_count) || body.volume_books.length,
+                        snake: true,
+                    };
+                }
+            } catch (e) {}
+            return null;
+        }
+        const flight = dmmAvailabilityFlight(html);
+        if (!flight) return null;
+        const rows = dmmAvailabilityJsonValue(flight, 'volumeBooks');
+        if (!Array.isArray(rows)) return null;
+        const pager = dmmAvailabilityJsonValue(flight, 'pager');
+        return {
+            rows: rows,
+            total: Number(pager && (pager.totalCount || pager.total_count)) || rows.length,
+            snake: false,
+        };
+    }
+
+    function dmmAvailabilityText(value) {
+        return value && value !== '$undefined' ? String(value) : '';
+    }
+
+    function dmmAvailabilityUrls(value) {
+        if (Array.isArray(value)) return value.map(dmmAvailabilityText).filter(Boolean);
+        const one = dmmAvailabilityText(value);
+        return one ? [one] : [];
+    }
+
+    function dmmAvailabilityPrice(sell) {
+        if (!sell || typeof sell !== 'object') return null;
+        for (const key of ['campaignPrice', 'campaign_price', 'fixedPrice', 'fixed_price']) {
+            const n = Number(sell[key]);
+            if (isFinite(n) && n > 0) return n;
+        }
+        return null;
+    }
+
+    function dmmAvailabilityUntil(value) {
+        const m = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/.exec(dmmAvailabilityText(value));
+        if (!m) return '';
+        const month = m[2].replace(/^0/, '');
+        const day = m[3].replace(/^0/, '');
+        return month + '/' + day + ' ' + m[4] + ':' + m[5];
+    }
+
+    function dmmAvailabilityRows(payload) {
+        const out = [];
+        if (!payload) return out;
+        for (const entry of payload.rows) {
+            if (!entry || typeof entry !== 'object') continue;
+            const title = dmmAvailabilityText(entry.title).trim();
+            if (!title) continue;
+            const volume = payload.snake ? entry.volume_number : entry.volumeNumber;
+            const limited = payload.snake ? entry.limited_free : entry.limitedFree;
+            const freeUrls = dmmAvailabilityUrls(
+                payload.snake ? entry.free_streaming_url : entry.freeStreamingUrl);
+            let url = '';
+            const productUrl = dmmAvailabilityText(payload.snake ? null : entry.productUrl);
+            if (productUrl) {
+                try { url = new URL(productUrl, 'https://book.dmm.com/').href; } catch (e) { url = ''; }
+            }
+            out.push({
+                title: title,
+                url: url,
+                vol: Number.isInteger(volume) ? volume : extractVolumeNumber(title),
+                price: dmmAvailabilityPrice(entry.sell),
+
+                free: freeUrls.length > 0,
+                until: freeUrls.length ? dmmAvailabilityUntil(limited && limited.end) : '',
+            });
+        }
+        return out;
+    }
+
+    registerAvailabilityStore({
+        id: 'dmm', siteId: 'dmm', label: 'DMMブックス', pill: 'DMM', short: 'D',
+        color: '#1b62b3', origin: 'https://book.dmm.com', hosts: ['book.dmm.com'],
+
+        search: (q) => 'https://book.dmm.com/search/?searchstr=' + encodeURIComponent(q),
+
+        product: (p) => /^\/product\/\d+\/(?:[a-z0-9]+\/)?$/i.test(p),
+        rank: (p) => (/^\/product\/\d+\/[a-z0-9]+\/$/i.test(p) ? 0.5 : 0),
+        volumes: (doc, html) => dmmAvailabilityRows(dmmAvailabilityPayload(html)),
+
+        listPages: (doc, html, url) => {
+            const payload = dmmAvailabilityPayload(html);
+            if (!payload || !(payload.total > payload.rows.length)) return [];
+            let series = '';
+            try {
+                const m = /^\/product\/(\d+)(?:\/|$)/.exec(new URL(url).pathname);
+                if (m) series = m[1];
+            } catch (e) { return []; }
+            if (!series) return [];
+            const out = [];
+            const pages = Math.ceil(payload.total / 100);
+            for (let page = 1; page <= pages; page++) {
+                out.push('https://book.dmm.com/ajax/bff/contents_book/?shop_name=general&series_id='
+                    + encodeURIComponent(series) + '&page=' + page
+                    + '&per_page=100&read_position=latest&order=asc&purchased_status=all');
             }
             return out;
         },
@@ -6173,7 +6370,8 @@ const PANEL_POS_KEY = 'bwdd-panel-pos';
                     if (info && (Array.isArray(info.fetchUpstreams) || info.upstream)) {
                         setProxyUpstreams(info.fetchUpstreams, info.upstream);
                     }
-                    addProxyPorts(info && info.fetchProxyPorts, 'bridge');
+                    addProxyPorts(info && info.fetchProxyPorts, 'bridge',
+                        { pathUpstream: !!(info && info.fetchPathUpstream) });
                 } catch (e) {}
                 mokuroMissing = !!(info && info.mokuro_installed === false);
                 bridgeBusy = !!(info && info.busy);
@@ -13886,6 +14084,1089 @@ function ebjSleep(ms) { return new Promise(r => setTimeout(r, ms)); }
         },
     });
 
+    const DMM_ORIGIN = 'https://book.dmm.com';
+    const DMM_TILE = 64;
+
+    const DMM_MAX_INFLIGHT = 256;
+    const DMM_DECODE_CONCURRENCY = 6;
+    const DMM_MAX_ATTEMPTS = 4;
+    const DMM_FETCH_TIMEOUT_MS = 45000;
+
+    const DMM_PROBE_MAX_ATTEMPTS = 4;
+    const DMM_PROBE_RETRY_MS = 5000;
+
+    function dmmFanoutPlan(total, requested, budget, inflightCap, decoders) {
+        const pages = Math.max(1, Math.floor(Number(total) || 1));
+        const cap = Math.max(1, Math.min(DMM_MAX_INFLIGHT,
+            Math.floor(Number(inflightCap) || DMM_MAX_INFLIGHT)));
+        const sockets = Math.max(1, Math.floor(Number(budget) || 6));
+        const wanted = Math.min(cap, Math.max(sockets, sockets * 4));
+        const asked = Math.max(0, Math.floor(Number(requested) || 0));
+        const fetchWidth = Math.max(1, Math.min(pages, cap, asked > 0 ? asked : wanted));
+        const decodeWidth = Math.max(1, Math.min(pages,
+            Math.floor(Number(decoders) || DMM_DECODE_CONCURRENCY)));
+        return { fetchWidth: fetchWidth, decodeWidth: decodeWidth };
+    }
+
+    const dmmState = {
+        running: false,
+        ready: false,
+
+        viewer: null,
+        seriesId: null,
+        contentId: null,
+        sample: false,
+        rawTitle: '',
+        title: '',
+        volume: null,
+        total: 0,
+        resolution: '',
+
+        probe: null,
+        probing: false,
+        probed: false,
+        probeAttempts: 0,
+        probeRetryAt: 0,
+        error: null,
+    };
+
+    function dmmLog() {
+        if (!BWDD_DEBUG) return;
+        try { console.log.apply(console, ['[bwdd/dmm]'].concat([].slice.call(arguments))); } catch (e) {}
+    }
+
+    function dmmOwnsHost() {
+        try { return /(^|\.)book\.dmm\.com$/i.test(location.hostname); } catch (e) { return false; }
+    }
+
+    function dmmParseViewerUrl(raw) {
+        let url;
+        try { url = new URL(String(raw || ''), DMM_ORIGIN); } catch (e) { return null; }
+        if (!/(^|\.)book\.dmm\.com$/i.test(url.hostname)) return null;
+        const m = /^\/product\/(\d+)\/([a-z0-9]+)\/(free_streaming|tachiyomi)\/?$/i.exec(url.pathname);
+        if (!m) return null;
+        const viewer = m[3].toLowerCase();
+        return {
+            url: url.toString(),
+            seriesId: m[1],
+            contentId: m[2],
+            viewer: viewer,
+            cid: url.searchParams.get('cid') || '',
+            lin: url.searchParams.get('lin') || (viewer === 'tachiyomi' ? '1' : '0'),
+        };
+    }
+
+    function dmmTitleFromDocument() {
+        try {
+            const og = document.querySelector('meta[property="og:title"]');
+            if (og && og.content && og.content.trim()) return og.content.trim();
+        } catch (e) {}
+        let text = '';
+        try { text = document.title || ''; } catch (e) {}
+        text = text.replace(/\s*[|｜]\s*DMMブックス.*$/i, '')
+            .replace(/\s*[-–—]\s*DMMブックス.*$/i, '')
+            .trim();
+        return text;
+    }
+
+    function dmmMaybeProbe() {
+
+        if (dmmState.running || dmmState.probing || dmmState.probe) return;
+        if (dmmState.probeAttempts >= DMM_PROBE_MAX_ATTEMPTS) return;
+        if (Date.now() < dmmState.probeRetryAt) return;
+        dmmState.probing = true;
+        dmmState.probeAttempts++;
+        dmmProbe().catch(function (e) {
+            dmmState.probeRetryAt = Date.now() + DMM_PROBE_RETRY_MS;
+            dmmLog('probe skipped', safeLogText((e && e.message) || e));
+        }).finally(function () {
+            dmmState.probing = false;
+            dmmState.probed = true;
+        });
+    }
+
+    function dmmRefreshState() {
+        const viewer = dmmParseViewerUrl(location.href);
+        if (!viewer) {
+            dmmState.viewer = null;
+            dmmState.ready = false;
+            return false;
+        }
+        const changed = !dmmState.viewer || dmmState.viewer.url !== viewer.url;
+        dmmState.viewer = viewer;
+        dmmState.seriesId = viewer.seriesId;
+        dmmState.contentId = viewer.contentId;
+        dmmState.sample = viewer.viewer === 'tachiyomi';
+        if (!changed) {
+
+            dmmMaybeProbe();
+            return true;
+        }
+        dmmState.total = 0;
+        dmmState.resolution = '';
+        dmmState.probe = null;
+        dmmState.probed = false;
+        dmmState.probeAttempts = 0;
+        dmmState.probeRetryAt = 0;
+        dmmState.error = null;
+        const raw = dmmTitleFromDocument() || ('DMM ' + viewer.contentId);
+
+        const shown = dmmState.sample && !/試し読み/.test(raw) ? raw + '（試し読み）' : raw;
+        dmmState.rawTitle = shown;
+        dmmState.title = archiveDefaultName(shown) || cleanTitle(shown) || shown;
+        const sv = splitSeriesVolume(dmmState.title);
+        dmmState.volume = sv.volNum;
+        dmmState.ready = true;
+        dmmMaybeProbe();
+        return true;
+    }
+
+    function dmmBook() {
+        if (!dmmState.ready) dmmRefreshState();
+        const title = dmmState.title || cleanTitle(dmmState.rawTitle);
+        if (!title) return null;
+        const sv = splitSeriesVolume(title);
+        return {
+            rawTitle: dmmState.rawTitle || title,
+            title: title,
+            series: sv.series,
+            volNum: sv.volNum,
+        };
+    }
+
+    function dmmCookieParams() {
+
+        const wanted = {
+            'cloudfront-policy': 'Policy',
+            'cloudfront-signature': 'Signature',
+            'cloudfront-key-pair-id': 'Key-Pair-Id',
+        };
+        const out = {};
+        let text = '';
+        try { text = document.cookie || ''; } catch (e) { text = ''; }
+        for (const part of text.split(';')) {
+            const at = part.indexOf('=');
+            if (at <= 0) continue;
+            const name = part.slice(0, at).trim();
+            let value = part.slice(at + 1).trim();
+            if (value.length >= 2 && value[0] === '"' && value[value.length - 1] === '"') {
+                value = value.slice(1, -1);
+            }
+
+            try { value = decodeURIComponent(value); } catch (e) {}
+            const canonical = wanted[name.toLowerCase()];
+            if (canonical) out[canonical] = value;
+        }
+        return Object.keys(out).length === 3 ? out : null;
+    }
+
+    function dmmBaseUrl(raw) {
+        const base = String(raw || '');
+        if (!base) throw new Error('DMM auth answer carried no content URL');
+        return base.endsWith('/') ? base : base + '/';
+    }
+
+    function dmmSignedUrl(url, session) {
+        const params = session && (session.authInfo || session.cookies);
+        if (!params) return url;
+        const out = new URL(url);
+        for (const key of Object.keys(params)) {
+            const value = params[key];
+            if (value != null) out.searchParams.set(key, String(value));
+        }
+        return out.toString();
+    }
+
+    async function dmmReadResponseText(res) {
+        if (!res) return '';
+        if (typeof res.text === 'function') return await res.text();
+        if (typeof res.blob === 'function') return await (await res.blob()).text();
+        throw new Error('DMM response had no readable body');
+    }
+
+    async function dmmReadResponseBytes(res) {
+        if (!res) throw new Error('DMM response was empty');
+        if (typeof res.arrayBuffer === 'function') return new Uint8Array(await res.arrayBuffer());
+        if (typeof res.blob === 'function') return new Uint8Array(await (await res.blob()).arrayBuffer());
+        throw new Error('DMM response had no readable bytes');
+    }
+
+    async function dmmAuth(viewer) {
+        if (!viewer || !viewer.cid) throw new Error('DMM viewer URL is missing its cid');
+        const query = new URLSearchParams({ cid: viewer.cid, lin: viewer.lin });
+        const url = DMM_ORIGIN + '/viewerapi/auth/?' + query.toString();
+        const response = await fetchWithTimeout(url, {
+            credentials: 'include',
+            headers: {
+                Accept: '*/*',
+                'Accept-Language': 'ja-JP,ja;q=0.9,en-US;q=0.8',
+            },
+        }, DMM_FETCH_TIMEOUT_MS);
+        if (!response || !response.ok) {
+            const err = new Error('DMM viewer authorization answered HTTP ' + (response ? response.status : '0'));
+            err.status = response ? response.status : 0;
+            throw err;
+        }
+        let body;
+        try { body = await response.json(); }
+        catch (e) { throw new Error('DMM viewer authorization did not return JSON'); }
+        if (String(body && body.status) !== '200' || !body.url) {
+            throw new Error('DMM viewer authorization refused this volume: '
+                + ((body && body.status) || 'no status'));
+        }
+        const authInfo = body.auth_info && typeof body.auth_info === 'object' ? body.auth_info : null;
+
+        if (authInfo) {
+            for (const key of Object.keys(authInfo)) {
+                if (typeof authInfo[key] !== 'string') continue;
+                try { authInfo[key] = decodeURIComponent(authInfo[key]); } catch (e) {}
+            }
+        }
+
+        const cookies = authInfo ? null : dmmCookieParams();
+        if (!authInfo && !cookies) {
+            throw new Error('DMM authorization returned neither auth_info nor CloudFront cookies. '
+                + 'Reload the viewer and try again.');
+        }
+        return {
+            auth: body,
+            base: dmmBaseUrl(body.url),
+            authInfo: authInfo,
+            cookies: cookies,
+            cti: typeof body.cti === 'string' ? body.cti : '',
+            at: Date.now(),
+        };
+    }
+
+    function dmmParseConfiguration(config) {
+        const contents = Array.isArray(config && config.configuration && config.configuration.contents)
+            ? config.configuration.contents
+            : [];
+        const pages = [];
+        for (const entry of contents) {
+            if (!entry || typeof entry.file !== 'string') continue;
+            const item = config[entry.file];
+            if (!item || item.Linear === 0) continue;
+            const type = entry.type === 'bmp' ? 'jpeg' : String(entry.type || 'jpeg').toLowerCase();
+            if (type !== 'jpeg' && type !== 'jpg') continue;
+            const links = item.FileLinkInfo && item.FileLinkInfo.PageLinkInfoList;
+            const list = Array.isArray(links) ? links : [{ Page: { No: 0 } }];
+            for (const link of list) {
+                const page = (link && link.Page) || {};
+                const no = Number.isInteger(page.No) ? page.No : 0;
+                const dummyWidth = Number.isFinite(page.DummyWidth) ? page.DummyWidth : null;
+                const dummyHeight = Number.isFinite(page.DummyHeight) ? page.DummyHeight : null;
+                pages.push({
+                    file: entry.file,
+                    no: no,
+                    type: type === 'jpg' ? 'jpeg' : type,
+                    width: Number(page.Size && page.Size.Width) || 0,
+                    height: Number(page.Size && page.Size.Height) || 0,
+                    dummyWidth: dummyWidth,
+                    dummyHeight: dummyHeight,
+
+                    scrambled: typeof dummyWidth === 'number' && typeof dummyHeight === 'number',
+                    pattern: dmmPattern(entry.file, no),
+                });
+            }
+        }
+        return pages;
+    }
+
+    async function dmmFetchManifest(session) {
+        const url = dmmSignedUrl(session.base + 'configuration_pack.json', session);
+        const res = await laneFetch(url, DMM_FETCH_TIMEOUT_MS, {
+            allowProxy: proxyCanServe(hostOf(url)),
+        });
+        if (!res || !res.ok) {
+            const err = new Error('DMM manifest answered HTTP ' + (res ? res.status : '0'));
+            err.status = res ? res.status : 0;
+            throw err;
+        }
+        let body;
+        try { body = JSON.parse(await dmmReadResponseText(res)); }
+        catch (e) { throw new Error('DMM configuration_pack.json is not JSON'); }
+        const pages = dmmParseConfiguration(body);
+        if (!pages.length) throw new Error('DMM configuration_pack.json listed no JPEG pages');
+        return pages;
+    }
+
+    async function dmmProbe() {
+        const viewer = dmmState.viewer;
+        if (!viewer) return null;
+        const url = viewer.url;
+        const session = await dmmAuth(viewer);
+        const pages = await dmmFetchManifest(session);
+
+        if (!dmmState.viewer || dmmState.viewer.url !== url) return null;
+        dmmState.probe = { session: session, pages: pages, at: Date.now() };
+        dmmState.total = pages.length;
+        const first = pages.find(function (page) { return page.width && page.height; });
+        dmmState.resolution = first ? (first.width + ' × ' + first.height) : '';
+        dmmLog('probe', pages.length + ' page(s)', dmmState.resolution);
+        return dmmState.probe;
+    }
+
+    function dmmProbeFresh() {
+        const probe = dmmState.probe;
+        return probe && Date.now() - probe.at < 10000 ? probe : null;
+    }
+
+    function dmmPattern(file, no) {
+        const key = String(file) + '/' + String(no);
+        let sum = 0;
+        for (let i = 0; i < key.length; i++) sum += key.charCodeAt(i);
+        return sum % 4 + 1;
+    }
+
+    function dmmVn(index, split, remainder, tile) {
+        return index * tile + (index >= split ? remainder : 0);
+    }
+
+    function dmmFu(index, count, pattern) {
+        return (index + 61 * pattern) % count;
+    }
+
+    function dmmQi(index, split, splitY, countY, pattern) {
+        const odd = pattern % 2 === 1;
+        const before = index < split ? odd : !odd;
+        let start;
+        let span;
+        if (before) { span = splitY; start = 0; }
+        else { span = countY - splitY; start = splitY; }
+        return (index + 53 * pattern + 59 * splitY) % span + start;
+    }
+
+    function dmmEs(index, splitX, splitY, countX, pattern) {
+        const odd = pattern % 2 === 1;
+        const before = index < splitY ? odd : !odd;
+        let start;
+        let span;
+        if (before) { span = countX - splitX; start = splitX; }
+        else { span = splitX; start = 0; }
+        return (index + 67 * pattern + splitX + 71) % span + start;
+    }
+
+    function dmmXu(index, count, pattern) {
+        return (index + 73 * pattern) % count;
+    }
+
+    function dmmTileRects(width, height, pattern, block) {
+        const tile = block || DMM_TILE;
+        const cols = Math.floor(width / tile);
+        const rows = Math.floor(height / tile);
+        if (cols <= 0 || rows <= 0) return [];
+        const remX = width % tile;
+        const remY = height % tile;
+        const rects = [];
+
+        let splitX = cols - (43 * pattern) % cols;
+        splitX = splitX % cols === 0 ? (cols - 4) % cols : splitX;
+        splitX = splitX === 0 ? cols - 1 : splitX;
+        let splitY = rows - (47 * pattern) % rows;
+        splitY = splitY % rows === 0 ? (rows - 4) % rows : splitY;
+        splitY = splitY === 0 ? rows - 1 : splitY;
+
+        const push = function (sx, sy, dx, dy, w, h) {
+            if (w > 0 && h > 0) rects.push({ sx: sx, sy: sy, dx: dx, dy: dy, w: w, h: h });
+        };
+
+        if (remX > 0 && remY > 0) {
+            push(splitX * tile, splitY * tile, splitX * tile, splitY * tile, remX, remY);
+        }
+        if (remY > 0) {
+            for (let x = 0; x < cols; x++) {
+                const targetX = dmmFu(x, cols, pattern);
+                const targetY = dmmQi(targetX, splitX, splitY, rows, pattern);
+                push(
+                    dmmVn(targetX, splitX, remX, tile), targetY * tile,
+                    dmmVn(x, splitX, remX, tile), splitY * tile,
+                    tile, remY,
+                );
+            }
+        }
+        if (remX > 0) {
+            for (let y = 0; y < rows; y++) {
+                const targetY = dmmXu(y, rows, pattern);
+                const targetX = dmmEs(targetY, splitX, splitY, cols, pattern);
+                push(
+                    targetX * tile, dmmVn(targetY, splitY, remY, tile),
+                    splitX * tile, dmmVn(y, splitY, remY, tile),
+                    remX, tile,
+                );
+            }
+        }
+        for (let x = 0; x < cols; x++) {
+            for (let y = 0; y < rows; y++) {
+                const targetX = (x + 29 * pattern + 31 * y) % cols;
+                const targetY = (y + 37 * pattern + 41 * targetX) % rows;
+                const shiftX = targetX >= dmmEs(targetY, splitX, splitY, cols, pattern) ? remX : 0;
+                const shiftY = targetY >= dmmQi(targetX, splitX, splitY, rows, pattern) ? remY : 0;
+                push(
+                    targetX * tile + shiftX, targetY * tile + shiftY,
+                    x * tile + (x >= splitX ? remX : 0),
+                    y * tile + (y >= splitY ? remY : 0),
+                    tile, tile,
+                );
+            }
+        }
+        return rects;
+    }
+
+    function dmmIsJpeg(bytes) {
+        return bytes && bytes.length >= 4 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff;
+    }
+
+    async function dmmDecodeImage(bytes, mime) {
+        const buffer = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes || []);
+        const blob = new Blob([buffer], { type: mime || 'image/jpeg' });
+        if (typeof createImageBitmap === 'function') {
+            try {
+                const bitmap = await createImageBitmap(blob);
+                return {
+                    element: bitmap,
+                    width: bitmap.width,
+                    height: bitmap.height,
+                    cleanup: function () { try { if (bitmap.close) bitmap.close(); } catch (e) {} },
+                };
+            } catch (e) { }
+        }
+        return new Promise(function (resolve, reject) {
+            const objectUrl = URL.createObjectURL(blob);
+            const img = new Image();
+            img.decoding = 'async';
+            img.onload = function () {
+                resolve({
+                    element: img,
+                    width: img.naturalWidth || img.width,
+                    height: img.naturalHeight || img.height,
+                    cleanup: function () {
+                        try { URL.revokeObjectURL(objectUrl); img.src = ''; } catch (e) {}
+                    },
+                });
+            };
+            img.onerror = function (e) {
+                try { URL.revokeObjectURL(objectUrl); } catch (_) {}
+                reject(e || new Error('DMM page decode failed'));
+            };
+            img.src = objectUrl;
+        });
+    }
+
+    async function dmmCanvasToBlob(canvas, mime, quality) {
+        const q = typeof quality === 'number' ? quality : undefined;
+        if (typeof canvas.toBlob === 'function') {
+            const direct = await new Promise(function (resolve) { canvas.toBlob(resolve, mime, q); });
+            if (direct) return direct;
+            if (mime && mime !== 'image/png') {
+                const fallback = await new Promise(function (resolve) { canvas.toBlob(resolve, 'image/png'); });
+                if (fallback) return fallback;
+            }
+        }
+        const dataUrl = canvas.toDataURL(mime || 'image/png');
+        const comma = dataUrl.indexOf(',');
+        const binary = atob(comma !== -1 ? dataUrl.slice(comma + 1) : dataUrl);
+        const out = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) out[i] = binary.charCodeAt(i);
+        return new Blob([out], { type: mime || 'image/png' });
+    }
+
+    async function dmmDescrambleJpeg(bytes, page) {
+        const decoded = await dmmDecodeImage(bytes, 'image/jpeg');
+        try {
+            const cleanWidth = Math.max(1, decoded.width - (Number(page.dummyWidth) || 0));
+            const cleanHeight = Math.max(1, decoded.height - (Number(page.dummyHeight) || 0));
+            const canvas = document.createElement('canvas');
+            canvas.width = cleanWidth;
+            canvas.height = cleanHeight;
+            const ctx = canvas.getContext('2d');
+            if (!ctx) throw new Error('DMM descramble needs a 2D canvas context');
+            const rects = dmmTileRects(decoded.width, decoded.height, page.pattern);
+            for (const rect of rects) {
+                const w = Math.min(rect.w, cleanWidth - rect.dx, decoded.width - rect.sx);
+                const h = Math.min(rect.h, cleanHeight - rect.dy, decoded.height - rect.sy);
+                if (w <= 0 || h <= 0) continue;
+
+                ctx.drawImage(decoded.element, rect.sx, rect.sy, w, h, rect.dx, rect.dy, w, h);
+            }
+            const blob = await dmmCanvasToBlob(canvas, IMAGE_CODEC.type, IMAGE_CODEC.quality);
+            if (!blob) throw new Error('DMM descramble produced no image');
+            return { blob: blob, ext: imageExtForMime(blob.type) || IMAGE_CODEC.ext };
+        } finally {
+            try { decoded.cleanup(); } catch (e) {}
+        }
+    }
+
+    async function dmmReencode(bytes) {
+        const decoded = await dmmDecodeImage(bytes, 'image/jpeg');
+        try {
+            const canvas = document.createElement('canvas');
+            canvas.width = decoded.width;
+            canvas.height = decoded.height;
+            const ctx = canvas.getContext('2d');
+            if (!ctx) throw new Error('DMM re-encode needs a 2D canvas context');
+            ctx.drawImage(decoded.element, 0, 0);
+            const blob = await dmmCanvasToBlob(canvas, IMAGE_CODEC.type, IMAGE_CODEC.quality);
+            if (!blob) throw new Error('DMM re-encode produced no image');
+            return { blob: blob, ext: imageExtForMime(blob.type) || IMAGE_CODEC.ext };
+        } finally {
+            try { decoded.cleanup(); } catch (e) {}
+        }
+    }
+
+    async function dmmPageBlob(bytes, page) {
+        if (!dmmIsJpeg(bytes)) throw new Error('DMM page ' + page.file + '/' + page.no + ' is not a readable JPEG');
+        if (!page.scrambled) {
+
+            if (IMAGE_CODEC.type === 'image/jpeg') {
+                return { blob: new Blob([bytes], { type: 'image/jpeg' }), ext: 'jpg' };
+            }
+            return dmmReencode(bytes);
+        }
+        return dmmDescrambleJpeg(bytes, page);
+    }
+
+    function dmmWorkerJob(id, bytes, page) {
+        if (!page || !page.scrambled || !page.width || !page.height) return null;
+        const encodedWidth = page.width + (Number(page.dummyWidth) || 0);
+        const encodedHeight = page.height + (Number(page.dummyHeight) || 0);
+        if (encodedWidth <= 0 || encodedHeight <= 0) return null;
+        const rects = dmmTileRects(encodedWidth, encodedHeight, page.pattern);
+        if (!rects.length) return null;
+        return {
+            id: id,
+            bytes: bytes,
+            rects: rects,
+            cleanWidth: page.width,
+            cleanHeight: page.height,
+            encodedWidth: encodedWidth,
+            encodedHeight: encodedHeight,
+            mime: IMAGE_CODEC.type,
+            quality: IMAGE_CODEC.quality,
+        };
+    }
+
+    function dmmWorkerMessage(job) {
+        return job;
+    }
+
+    function dmmWorkerSource() {
+        return [
+            '"use strict";',
+            'async function one(job) {',
+            '  const bmp = await createImageBitmap(new Blob([job.bytes], { type: "image/jpeg" }));',
+            '  try {',
+            '    if (bmp.width !== job.encodedWidth || bmp.height !== job.encodedHeight) {',
+            '      throw new Error("DMM page dimensions changed: " + bmp.width + "x" + bmp.height +',
+            '        " expected " + job.encodedWidth + "x" + job.encodedHeight);',
+            '    }',
+            '    const canvas = new OffscreenCanvas(job.cleanWidth, job.cleanHeight);',
+            '    const ctx = canvas.getContext("2d");',
+            '    if (!ctx) throw new Error("DMM worker has no 2D context");',
+            '    for (const r of job.rects) {',
+            '      const w = Math.min(r.w, job.cleanWidth - r.dx, bmp.width - r.sx);',
+            '      const h = Math.min(r.h, job.cleanHeight - r.dy, bmp.height - r.sy);',
+            '      if (w > 0 && h > 0) ctx.drawImage(bmp, r.sx, r.sy, w, h, r.dx, r.dy, w, h);',
+            '    }',
+            '    const opts = { type: job.mime };',
+            '    if (job.quality !== undefined && job.quality !== null) opts.quality = job.quality;',
+            '    let blob = null;',
+            '    try { blob = await canvas.convertToBlob(opts); }',
+            '    catch (e) {}',
+            '    if (!blob && job.mime !== "image/png") {',
+            '      blob = await canvas.convertToBlob({ type: "image/png" });',
+            '    }',
+            '    if (!blob) throw new Error("DMM worker produced no image");',
+            '    return { id: job.id, blob: blob };',
+            '  } finally {',
+            '    try { if (bmp.close) bmp.close(); } catch (e) {}',
+            '  }',
+            '}',
+            'self.onmessage = async function (ev) {',
+            '  const m = ev.data || {};',
+            '  const jobs = Array.isArray(m.jobs) ? m.jobs : [m];',
+            '  await Promise.all(jobs.map(async function (job) {',
+            '    try {',
+            '      const out = await one(job);',
+            '      self.postMessage({ batchId: m.batchId, id: out.id, blob: out.blob });',
+            '    } catch (e) {',
+            '      self.postMessage({ batchId: m.batchId, id: job.id, error: (e && e.message) || String(e) });',
+            '    }',
+            '  }));',
+            '};',
+        ].join('\n');
+    }
+
+    function dmmWorkerAllowed() {
+        return new Promise(function (resolve) {
+            if (typeof Worker === 'undefined' || typeof OffscreenCanvas === 'undefined'
+                || typeof createImageBitmap !== 'function') {
+                resolve(false);
+                return;
+            }
+            let url = null, worker = null, done = false;
+            const finish = function (ok) {
+                if (done) return;
+                done = true;
+                if (worker) { try { worker.terminate(); } catch (e) {} }
+                if (url) { try { URL.revokeObjectURL(url); } catch (e) {} }
+                resolve(ok);
+            };
+            try {
+                url = URL.createObjectURL(new Blob([
+                    'self.onmessage = async function () {',
+                    '  try {',
+                    '    const canvas = new OffscreenCanvas(1, 1);',
+                    '    const blob = await canvas.convertToBlob({ type: "image/png" });',
+                    '    self.postMessage(!!blob);',
+                    '  } catch (e) { self.postMessage(false); }',
+                    '};',
+                ], { type: 'text/javascript' }));
+                worker = new Worker(url);
+            } catch (e) {
+                finish(false);
+                return;
+            }
+            worker.onmessage = function (ev) { finish(!!ev.data); };
+            worker.onerror = function () { finish(false); };
+            setTimeout(function () { finish(false); }, 1500);
+            worker.postMessage(0);
+        });
+    }
+
+    async function dmmFetchPage(session, page) {
+        const url = dmmSignedUrl(session.base + page.file + '/' + page.no + '.' + page.type, session);
+        const res = await laneFetch(url, DMM_FETCH_TIMEOUT_MS, {
+            allowProxy: proxyCanServe(hostOf(url)),
+        });
+        if (!res || !res.ok) {
+            const err = new Error('DMM page ' + page.file + '/' + page.no
+                + ' answered HTTP ' + (res ? res.status : '0'));
+            err.status = res ? res.status : 0;
+            throw err;
+        }
+        return await dmmReadResponseBytes(res);
+    }
+
+    function dmmSleep(ms) {
+        return new Promise(function (resolve) { setTimeout(resolve, ms); });
+    }
+
+    function dmmRetryable(error) {
+        return !error || !error.status || error.status === 429 || error.status >= 500;
+    }
+
+    async function dmmRun(ui, mode, options) {
+        const runOptions = normalizeRunOptions(options, mode);
+        const runResult = runOptions.automation
+            ? (runOptions.result || newAutomationResult(mode, dmmState.contentId || '', runOptions.deferFinalize))
+            : null;
+        if (runResult) {
+            runOptions.result = runResult;
+            runOptions.errors = runResult.errors;
+        }
+
+        const discovery = typeof probeFetchProxy === 'function'
+            ? Promise.resolve().then(probeFetchProxy).catch(function () { return null; })
+            : null;
+
+        let harness = null;
+        let dmmPool = null;
+        let dmmPoolSeq = 0;
+        let dmmPoolFailures = 0;
+        const dmmPoolWaiters = new Map();
+
+        const dmmStopPool = function (reason) {
+            const pool = dmmPool;
+            if (!pool) return;
+            dmmPool = null;
+            for (const [id, waiter] of dmmPoolWaiters) {
+                dmmPoolWaiters.delete(id);
+                waiter.no(new Error(reason || 'DMM worker pool stopped'));
+            }
+            try { pool.terminate(); } catch (e) {}
+        };
+        const dmmPoolDone = function (result) {
+            const waiter = result && dmmPoolWaiters.get(result.id);
+            if (!waiter) return;
+            dmmPoolWaiters.delete(result.id);
+            if (result.error || !result.blob) {
+                waiter.no(new Error(result.error || 'DMM worker returned no image'));
+            } else {
+                waiter.ok(result);
+            }
+        };
+        const dmmPoolPage = function (job, pool) {
+            return new Promise(function (resolve, reject) {
+                dmmPoolWaiters.set(job.id, { ok: resolve, no: reject });
+                try {
+                    pool.submit(job);
+                } catch (e) {
+                    dmmPoolWaiters.delete(job.id);
+                    reject(e);
+                }
+            });
+        };
+
+        try {
+            reportRunProgress(runOptions, 'started', { mode: mode, cid: dmmState.contentId || '' });
+            dmmState.running = true;
+            if (!dmmState.ready) dmmRefreshState();
+            const viewer = dmmState.viewer;
+            if (!viewer || !viewer.cid) {
+                throw new Error('This is not a DMMブックス viewer page: open a free volume or a '
+                    + '試し読み sampler and start the download there.');
+            }
+
+            let session = null;
+            let pages = null;
+            const probe = dmmProbeFresh();
+            if (probe) {
+                session = probe.session;
+                pages = probe.pages;
+                dmmLog('run reuses the panel probe', pages.length + ' page(s)');
+            } else {
+                session = await dmmAuth(viewer);
+
+                let manifestError = null;
+                for (let attempt = 0; attempt < 3; attempt++) {
+                    try {
+                        pages = await dmmFetchManifest(session);
+                        break;
+                    } catch (e) {
+                        manifestError = e;
+                        if (e && e.status === 403 && attempt === 0) {
+                            session = await dmmAuth(viewer);
+                            continue;
+                        }
+                        if (dmmRetryable(e) && attempt < 2) {
+                            await dmmSleep(500 * (attempt + 1));
+                            continue;
+                        }
+                        throw e;
+                    }
+                }
+                if (!pages) throw manifestError || new Error('DMM manifest could not be read');
+                dmmState.probe = { session: session, pages: pages, at: Date.now() };
+            }
+
+            const total = pages.length;
+            if (!total) throw new Error('DMM listed no pages for this volume.');
+            dmmState.total = total;
+            const first = pages.find(function (page) { return page.width && page.height; });
+            dmmState.resolution = first ? (first.width + ' × ' + first.height) : '';
+
+            const rawTitle = dmmState.rawTitle || dmmTitleFromDocument() || ('DMM ' + viewer.contentId);
+            const title = dmmState.title || cleanTitle(rawTitle) || rawTitle;
+            const sv = splitSeriesVolume(title);
+            const archiveName = ui.syncArchiveDefault(rawTitle) || zipBaseName(sv, title);
+            const cid = viewer.contentId + (dmmState.sample ? 'sample' : '');
+
+            if (runResult) {
+                runResult.cid = cid;
+                runResult.mode = mode;
+                runResult.title = title;
+                reportRunProgress(runOptions, 'book', { title: title, cid: cid });
+            }
+
+            harness = createRunHarness(ui, mode, runOptions, {
+                title: title, archiveName: archiveName, sv: sv, total: total, cid: cid,
+            });
+            harness.setTotal(total);
+            if (runResult) {
+                runResult.total = total;
+                reportRunProgress(runOptions, 'manifest', { total: total, plaintext: true });
+            }
+            if (!runOptions.headless) {
+                renderBookCard(ui.statsEl, {
+                    title: title,
+                    pages: total,
+                    resolution: dmmState.resolution,
+                    type: dmmState.sample ? 'DMMブックス 試し読み' : 'DMMブックス 無料',
+                });
+                if (sv.series) fetchAndRenderStats(ui.statsEl, sv.series, sv.volNum);
+            }
+            harness.showBars();
+            if (harness.mokuro) await harness.mokuro.open();
+
+            const knownPorts = typeof proxyPorts !== 'undefined' && proxyPorts && proxyPorts.length;
+            if (discovery && !knownPorts) {
+                try { await discovery; } catch (e) {}
+            } else if (discovery) {
+                try { discovery.catch(function () {}); } catch (e) {}
+            }
+            const laneBudget = typeof fetchSocketBudget === 'function'
+                ? fetchSocketBudget(true) : 6;
+            let inflightCap = DMM_MAX_INFLIGHT;
+            try {
+                if (typeof window !== 'undefined' && window.__bwddMaxInflight > 0) {
+                    inflightCap = Math.max(4, Math.min(DMM_MAX_INFLIGHT,
+                        window.__bwddMaxInflight | 0));
+                }
+            } catch (e) {}
+            let cores = DMM_DECODE_CONCURRENCY;
+            try { cores = navigator.hardwareConcurrency || cores; } catch (e) {}
+            const fanout = dmmFanoutPlan(total, runOptions.dmmConcurrency, laneBudget,
+                inflightCap, Math.max(4, Math.min(8, cores)));
+            const concurrency = fanout.fetchWidth;
+            dmmLog('fan-out', concurrency + ' fetchers, ' + fanout.decodeWidth +
+                ' decoders, ' + laneBudget + ' socket slots' +
+                (typeof allLanes === 'function' ? ', ' + allLanes().length + ' lanes' : ''));
+
+            try {
+                if (typeof makePool === 'function' && await dmmWorkerAllowed()) {
+                    const size = typeof workerPoolSize === 'function'
+                        ? Math.max(2, Math.min(8, workerPoolSize())) : 8;
+                    dmmPool = makePool(size, dmmWorkerSource(), dmmPoolDone,
+                        60000, 2, dmmWorkerMessage);
+                    dmmLog('worker pool', size + ' descramblers');
+                }
+            } catch (e) {
+                dmmPool = null;
+                dmmLog('worker pool unavailable', safeLogText((e && e.message) || e));
+            }
+            const retriesWanted = runOptions.retries === undefined || runOptions.retries === null
+                ? 2 : Number(runOptions.retries);
+            const attempts = Math.max(1, Math.min(DMM_MAX_ATTEMPTS,
+                1 + (Number.isFinite(retriesWanted) ? Math.max(0, retriesWanted) : 2)));
+            let next = 0;
+            let downloaded = 0;
+            let cachedCount = 0;
+
+            let refreshing = null;
+            const refresh = function () {
+                if (!refreshing) {
+                    refreshing = dmmAuth(viewer).then(function (replacement) {
+                        session = replacement;
+                        dmmState.probe = { session: replacement, pages: pages, at: Date.now() };
+                        dmmLog('auth refreshed after a 403');
+                        return replacement;
+                    }).finally(function () {
+                        refreshing = null;
+                    });
+                }
+                return refreshing;
+            };
+
+            const failPage = function (index, error) {
+                harness.noteFailure(index + 1, 'page ' + (index + 1) + ': '
+                    + safeLogText((error && error.message) || error || 'failed'));
+            };
+
+            const fetchOne = async function (index) {
+                const page = pages[index];
+                let refreshed = false;
+
+                let failures = 0;
+                for (;;) {
+                    try {
+                        const bytes = await dmmFetchPage(session, page);
+                        harness.bumpFetched(1);
+                        downloaded++;
+                        return bytes;
+                    } catch (e) {
+                        if (e && e.status === 403 && !refreshed) {
+                            refreshed = true;
+                            await refresh();
+                            continue;
+                        }
+                        failures++;
+                        const retryable = !e || dmmRetryable(e);
+                        if (retryable && failures < attempts) {
+                            await dmmSleep(Math.min(8000, 400 * failures * failures));
+                            continue;
+                        }
+
+                        harness.bumpFetched(1);
+                        throw e;
+                    }
+                }
+            };
+
+            const decodeLimit = (function (limit) {
+                let active = 0;
+                const waiters = [];
+                return {
+                    run: async function (fn) {
+                        if (active >= limit) {
+                            await new Promise(function (resolve) { waiters.push(resolve); });
+                        } else {
+                            active++;
+                        }
+                        try {
+                            return await fn();
+                        } finally {
+                            const next = waiters.shift();
+                            if (next) next();
+                            else active--;
+                        }
+                    },
+                };
+            })(fanout.decodeWidth);
+
+            const decodeOne = async function (index, bytes, page) {
+                if (dmmPool) {
+                    const pool = dmmPool;
+                    const job = dmmWorkerJob(++dmmPoolSeq, bytes, page);
+                    if (job) {
+                        try {
+                            const out = await dmmPoolPage(job, pool);
+                            dmmPoolFailures = 0;
+                            return {
+                                blob: out.blob,
+                                ext: imageExtForMime(out.blob.type) || IMAGE_CODEC.ext,
+                            };
+                        } catch (e) {
+                            dmmPoolFailures++;
+                            dmmLog('worker page failed', safeLogText((e && e.message) || e));
+                            if (dmmPoolFailures >= 2) {
+                                dmmLog('worker pool disabled; using the main thread');
+                                dmmStopPool('DMM worker pool disabled');
+                            }
+                        }
+                    }
+                }
+                return await decodeLimit.run(function () {
+                    return dmmPageBlob(bytes, page);
+                });
+            };
+
+            const worker = async function () {
+                for (;;) {
+                    const index = next++;
+                    if (index >= total) return;
+                    if (runOptions.usePageCache) {
+                        const cached = await getCachedPage(cid, index + 1);
+                        if (cached) {
+                            harness.bumpCached(1);
+                            harness.noteCached(index + 1, cached, cachedPageCrc.get(cached));
+                            cachedCount++;
+                            continue;
+                        }
+                    }
+                    try {
+                        const bytes = await fetchOne(index);
+                        const out = await decodeOne(index, bytes, pages[index]);
+                        harness.notePage(index + 1, out.blob, undefined, out.ext);
+                    } catch (e) {
+                        failPage(index, e);
+                    }
+                }
+            };
+
+            await Promise.all(Array.from({ length: Math.max(1, Math.min(concurrency, total)) }, worker));
+
+            const retryFailures = runOptions.retryFailedPages === true || !runOptions.headless;
+            if (harness.failedIdx.size && retryFailures) {
+                const retry = Array.from(harness.failedIdx)
+                    .filter(function (page) { return page >= 1 && page <= total; })
+                    .sort(function (a, b) { return a - b; });
+                let cursor = 0;
+                const retryWorker = async function () {
+                    for (;;) {
+                        const at = cursor++;
+                        if (at >= retry.length) return;
+                        const index = retry[at] - 1;
+                        try {
+                            const bytes = await fetchOne(index);
+                            const out = await decodeOne(index, bytes, pages[index]);
+                            harness.notePage(index + 1, out.blob, undefined, out.ext);
+                        } catch (e) { }
+                    }
+                };
+                const retryWidth = Math.max(1, Math.min(24, retry.length));
+                await Promise.all(Array.from({ length: retryWidth }, retryWorker));
+            }
+
+            const missing = total - harness.okIdx.size;
+            dmmLog('pages', downloaded + ' fetched, ' + harness.okIdx.size + '/' + total + ' ready');
+
+            if (mode === 'ocr' && harness.mokuro) {
+                await harness.mokuro.settle();
+                if (runOptions.deferFinalize) return harness.mokuro.deferred();
+                const fin = await harness.mokuro.finalize();
+                harness.markFinished();
+                return harness.outcome(fin.ok);
+            }
+            if (mode === 'ocr' && !harness.mokuro) {
+                throw new Error('Mokuro OCR is unavailable for this run');
+            }
+            if (missing === total) {
+                setRunDetails(harness.details, msgAllFailedZip(), harness.errors);
+                return harness.outcome(false);
+            }
+            return await harness.finishZip();
+        } catch (e) {
+            const reported = harness ? harness.reportFailure(e) : null;
+            if (reported) throw reported;
+            throw e;
+        } finally {
+            dmmState.running = false;
+            dmmStopPool('run finished');
+            if (harness) await harness.cleanup();
+        }
+    }
+
+    registerSite({
+        id: 'dmm',
+        label: 'DMMブックス',
+        panelTitle: 'DMMブックス Native Downloader',
+        ownsHost() {
+            return dmmOwnsHost();
+        },
+        matches() {
+
+            try { return dmmOwnsHost() && !!dmmParseViewerUrl(location.href); } catch (e) { return false; }
+        },
+        refresh() {
+            dmmRefreshState();
+            return dmmState.ready;
+        },
+        getBook() {
+            return dmmBook();
+        },
+        getPreview() {
+
+            if (!dmmState.ready || !dmmState.total) return null;
+            const title = dmmState.title || cleanTitle(dmmState.rawTitle);
+            if (!title) return null;
+            return {
+                title: title,
+                pages: dmmState.total || 0,
+                resolution: dmmState.resolution || '',
+                type: dmmState.sample ? 'DMMブックス 試し読み' : 'DMMブックス 無料',
+            };
+        },
+        getCid() {
+            return dmmState.contentId
+                ? dmmState.contentId + (dmmState.sample ? 'sample' : '')
+                : '';
+        },
+        archiveDefault(rawTitle) {
+            return archiveDefaultName(rawTitle) || fsSafePath(dmmState.contentId || '');
+        },
+        run(ui, mode, options) {
+            return dmmRun(ui, mode, options);
+        },
+        state: dmmState,
+        debug: {
+            dmmState: dmmState,
+        },
+        debugGlobals: {
+            __bwddDmm: dmmState,
+            __bwddDmmProtocol: {
+                parseViewerUrl: dmmParseViewerUrl,
+                parseConfiguration: dmmParseConfiguration,
+                pattern: dmmPattern,
+                tileRects: dmmTileRects,
+                parseAuth: dmmAuth,
+                fetchManifest: dmmFetchManifest,
+                pageBlob: dmmPageBlob,
+                page: dmmFetchPage,
+            },
+        },
+    });
+
     const KINDLE_READER_HOST_RE = /^read\.amazon\./i;
     const KINDLE_MANGA_PATH_RE = /\/manga\//i;
 
@@ -14308,7 +15589,7 @@ function ebjSleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
     const KINDLE_MAX_WINDOWS = 400;
 
-    const KINDLE_FETCH_CONCURRENCY = 12;
+    const KINDLE_FETCH_CONCURRENCY = 24;
     const KINDLE_FETCH_TIMEOUT = 45000;
 
     const KINDLE_RETRY_STATUS = [429, 500, 502, 503, 504];

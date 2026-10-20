@@ -41,6 +41,7 @@ const STORE_MODULES = [
   ['sites/ebookjapan', 'ebookjapan'],
   ['sites/kindle', 'kindle'],
   ['sites/kmanga', 'kmanga'],
+  ['sites/dmm', 'dmm'],
 ];
 
 // The only URLs a store module may claim. The script now loads only on the
@@ -60,11 +61,15 @@ const READER_MATCHES = {
   ebookjapan: ['https://ebookjapan.yahoo.co.jp/viewer/*'],
   kindle: ['https://read.amazon.co.jp/manga/*'],
   kmanga: ['https://comic.k-manga.jp/viewer/*'],
+  dmm: [
+    'https://book.dmm.com/product/*/*/free_streaming/*',
+    'https://book.dmm.com/product/*/*/tachiyomi/*',
+  ],
 };
 
 // Names the pages that only lead up to the reader. Kept as a separate pattern
 // so a failure says "storefront URL" instead of just "list differs".
-const STOREFRONT_MATCH = /\/series\/|\/de[0-9a-f]{8}-|www\.cmoa\.jp\/title\/|ebookjapan\.yahoo\.co\.jp\/books\/|read\.amazon\.co\.jp\/(?!manga\/)|comic\.k-manga\.jp\/(?!viewer\/)/;
+const STOREFRONT_MATCH = /\/series\/|\/de[0-9a-f]{8}-|www\.cmoa\.jp\/title\/|ebookjapan\.yahoo\.co\.jp\/books\/|read\.amazon\.co\.jp\/(?!manga\/)|comic\.k-manga\.jp\/(?!viewer\/)|book\.dmm\.com\/(?!product\/[^/]+\/[^/]+\/(?:free_streaming|tachiyomi)\b)/;
 
 // Hosts booted in a browser. `reader` marks the pages that must select their
 // adapter; the rest are store pages on the store's own host, which must select
@@ -76,12 +81,14 @@ const EXPECT = [
   { host: 'ebookjapan.yahoo.co.jp', path: '/viewer/free/A000000001/', store: 'ebookjapan', reader: true },
   { host: 'read.amazon.co.jp', path: '/manga/B000000001', store: 'kindle', reader: true },
   { host: 'comic.k-manga.jp', path: '/viewer/pc/viewer.html', store: 'kmanga', reader: true },
+  { host: 'book.dmm.com', path: '/product/605237/b999asqex01885/free_streaming/?cid=OPAQUE&lin=0', store: 'dmm', reader: true },
   { host: 'bookwalker.jp', path: '/series/900002/list/', store: 'bookwalker', reader: false },
   { host: 'bookwalker.jp', path: '/decf5c400b-42c7-4c7f-af26-7181721d9f5e/', store: 'bookwalker', reader: false },
   { host: 'www.cmoa.jp', path: '/title/100001/', store: 'cmoa', reader: false },
   { host: 'ebookjapan.yahoo.co.jp', path: '/books/716241/A001624701/', store: 'ebookjapan', reader: false },
   { host: 'read.amazon.co.jp', path: '/dp/B000000001', store: 'kindle', reader: false },
   { host: 'comic.k-manga.jp', path: '/title/100007/pv', store: 'kmanga', reader: false },
+  { host: 'book.dmm.com', path: '/product/605237/', store: 'dmm', reader: false },
 ];
 
 // The deliberate non-reader path: the CLI sets window.__BWDD_HEADLESS__ and
@@ -95,6 +102,7 @@ const HEADLESS = [
   { host: 'ebookjapan.yahoo.co.jp', path: '/books/716241/A001624701/', store: 'ebookjapan', claims: true, capture: false },
   { host: 'read.amazon.co.jp', path: '/dp/B000000001', store: 'kindle', claims: false },
   { host: 'comic.k-manga.jp', path: '/title/100007/pv', store: 'kmanga', claims: false },
+  { host: 'book.dmm.com', path: '/product/605237/', store: 'dmm', claims: false },
 ];
 
 const carriedStoresOf = target => STORE_MODULES
@@ -200,7 +208,12 @@ const carriedStoresOf = target => STORE_MODULES
       const requests = [];
       page.on('request', req => requests.push(req.url()));
       await page.evaluateOnNewDocument(() => { window.__origFetch = window.fetch; });
-      await page.goto('https://' + exp.host + ':' + port + (exp.path || '/') + '?bwddDebug=1',
+      // A reader path can already carry a query (the DMM viewer URL needs its
+      // cid), so the debug flag joins that query instead of starting a second
+      // one that would swallow it.
+      const expPath = exp.path || '/';
+      const debugJoin = expPath.indexOf('?') === -1 ? '?' : '&';
+      await page.goto('https://' + exp.host + ':' + port + expPath + debugJoin + 'bwddDebug=1',
         { waitUntil: 'domcontentloaded' });
       await page.addScriptTag({ content: loadUserscript({ file }) });
       await sleep(900);
@@ -214,6 +227,7 @@ const carriedStoresOf = target => STORE_MODULES
           hasEjState: !!(b.ebjState || window.__bwddEbookjapan),
           hasKindleState: !!(b.kindleState || window.__bwddKindle),
           hasKmangaState: !!(b.kmangaState || window.__bwddKmanga),
+          hasDmmState: !!(b.dmmState || window.__bwddDmm),
           hasUnified: !!document.querySelector('.bwdd-unified'),
           panel: !!document.querySelector('#bwdd-root'),
           zip: !!document.querySelector('button.bwdd-btn.zip'),
@@ -268,6 +282,10 @@ const carriedStoresOf = target => STORE_MODULES
         check(`${id} on ${exp.host}: no k-manga internals`, got.hasKmangaState === false,
           `kmangaState present=${got.hasKmangaState}`);
       }
+      if (!target.modules.includes('sites/dmm')) {
+        check(`${id} on ${exp.host}: no DMM internals`, got.hasDmmState === false,
+          `dmmState present=${got.hasDmmState}`);
+      }
       // The combined artifact carries every module, but window.__bwdd gets only
       // the ACTIVE adapter's debug surface, so assert the matching one - only
       // where an adapter is supposed to be active at all. That the other modules
@@ -277,9 +295,10 @@ const carriedStoresOf = target => STORE_MODULES
           : (exp.store === 'cmoa') ? got.hasCmoaState === true
           : (exp.store === 'ebookjapan') ? got.hasEjState === true
           : (exp.store === 'kmanga') ? got.hasKmangaState === true
+          : (exp.store === 'dmm') ? got.hasDmmState === true
           : got.hasKindleState === true;
         check(`${id} on ${exp.host}: active store's internals exported`, ok,
-          `A9p=${got.a9p} cmoaState=${got.hasCmoaState} ebookjapanState=${got.hasEjState} kindleState=${got.hasKindleState} kmangaState=${got.hasKmangaState}`);
+          `A9p=${got.a9p} cmoaState=${got.hasCmoaState} ebookjapanState=${got.hasEjState} kindleState=${got.hasKindleState} kmangaState=${got.hasKmangaState} dmmState=${got.hasDmmState}`);
       }
     }
   }

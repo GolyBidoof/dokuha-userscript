@@ -160,7 +160,7 @@
    "file": "core/32-availability.js",
    "module": "feature/availability",
    "after": "core/31-mokuro.js",
-   "note": "cross-store availability: which of the five shops carry this series, at what price, linked to their store pages"
+   "note": "cross-store availability: which of the six shops carry this series, at what price, linked to their store pages"
   },
   {
    "file": "sites/bookwalker/40-availability.js",
@@ -193,9 +193,15 @@
    "note": "k-manga availability adapter: point prices, pager and free-volume button"
   },
   {
+   "file": "sites/dmm/40-availability.js",
+   "module": "feature/availability",
+   "after": "sites/kmanga/40-availability.js",
+   "note": "DMMブックス availability adapter: search results, the product page's flight payload and the BFF volume list"
+  },
+  {
    "file": "core/34-unified-link.js",
    "module": "feature/unified-link",
-   "after": "sites/kmanga/40-availability.js",
+   "after": "sites/dmm/40-availability.js",
    "note": "single-store builds only: a panel-header link to the combined script"
   },
   {
@@ -373,9 +379,27 @@
    "note": "k-manga socket pool, pipelined page loop, session resolution and adapter registration"
   },
   {
+   "file": "sites/dmm/00-state.js",
+   "module": "sites/dmm",
+   "after": "sites/kmanga/05-run.js",
+   "note": "DMMブックス detection, viewer URL parsing and panel metadata"
+  },
+  {
+   "file": "sites/dmm/01-protocol.js",
+   "module": "sites/dmm",
+   "after": "sites/dmm/00-state.js",
+   "note": "DMM auth, CloudFront signing, manifest parsing, the 64×64 tile unshuffle and page decoding"
+  },
+  {
+   "file": "sites/dmm/02-run.js",
+   "module": "sites/dmm",
+   "after": "sites/dmm/01-protocol.js",
+   "note": "DMM page fan-out, 403 refresh, run pipeline and adapter registration"
+  },
+  {
    "file": "sites/kindle/00-state.js",
    "module": "sites/kindle",
-   "after": "sites/kmanga/05-run.js",
+   "after": "sites/dmm/02-run.js",
    "note": "Kindle reader detection, the #bookInfo state, and the single-flight probe guard"
   },
   {

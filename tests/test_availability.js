@@ -9,13 +9,16 @@
 // payload, and only on a volume page; Amazon's results are per volume and its
 // card shows the Kindle Unlimited zero, so the yen charge comes off the volume's
 // own page; k-manga states its prices in points rather than yen, keeps the point
-// price on a free volume's row, and paginates its volume list as well.
+// price on a free volume's row, and paginates its volume list as well; DMMブックス
+// serves one server-rendered search card per series and carries the per-volume
+// rows in its product page's Next.js flight payload, with the rest of the run
+// read from the store's own BFF volume list.
 //
 // A pill is only rendered for a shop that actually carries the book, and a card
 // with no pills is not rendered at all. A shop that misses is still *queried*
-// (the hits assertion proves that), it is just not shown. The grid keeps five
-// pills to exactly two rows: two wide cells over three narrow ones, with the two
-// longest store names in the wide row so no name is ellipsized away.
+// (the hits assertion proves that), it is just not shown. The grid keeps six
+// pills to exactly two rows of three, with every store name ellipsis-free, and
+// the layout is computed from the pill count rather than a per-count rule.
 'use strict';
 const puppeteer = require('puppeteer');
 const { loadUserscript } = require('./_userscript');
@@ -26,7 +29,7 @@ const https = require('https');
 const CHROME = process.env.PUPPETEER_EXECUTABLE_PATH || undefined;
 
 const SERIES = 'サンプル作品';
-const SKIP = 'スキップとローファー';
+const SKIP = 'サンプル跳躍作品';
 const ABSENT = 'この本は存在しませんXYZ';
 
 const BW_SEARCH = `<html><body>
@@ -49,7 +52,7 @@ const BW_DIGITS_SERIES = `<html><body>
 
 // Vols 1 and 2 are the free 無料お試し版 (0 yen + 無料で読む), vol 3 costs 810, and
 // the last row is the unnumbered edition (no volume in its title at all), which
-// is the one a book like 小春と湊 has to be matched against by title.
+// is the one an unnumbered, bonus-included edition has to be matched against by title.
 const BW_SERIES = `<html><body>
   <div class="m-book-item">
     <a class="m-book-item__title" href="https://bookwalker.jp/def5a49973-58a0-44b0-a6ce-41abdc306335/" title="${SERIES} 1巻【無料お試し版】">${SERIES} 1巻【無料お試し版】</a>
@@ -343,6 +346,71 @@ const KM_TITLE_P2 = `<html><body>` +
   KM_ROW(12, 700, false, '') +
   `</body></html>`;
 
+// DMMブックス is server-rendered: the search page carries one card for the
+// series, and the product page embeds its volume list in the React flight
+// payload. The flight state is a sequence of JSON string literals pushed by
+// self.__next_f; the fixture splits the JSON mid-object on purpose, because the
+// store's own pages split it wherever the stream happens to break.
+function dmmFlight(payload) {
+  const text = '3a:' + JSON.stringify(payload);
+  const half = Math.floor(text.length / 2);
+  return `<script>self.__next_f.push([1,${JSON.stringify(text.slice(0, half))}])</script>` +
+    `<script>self.__next_f.push([1,${JSON.stringify(text.slice(half))}])</script>`;
+}
+const DMM_SEARCH = `<html><body>
+  <ul class="m-boxSearchBookProduct">
+    <li class="m-boxSearchBookProduct__item" data-product-id="b9000000001" data-content-id="b9000000001" data-price="660">
+      <div class="m-boxSearchListTmb">
+        <a href="https://book.dmm.com/product/900001/b9000000001/" class="fn-addI3Parameters">
+          <div class="m-boxSearchListTmbImg"><div class="m-boxSearchListTmbImg__box"><div class="m-boxSearchListTmbImg__box__img"><div class="m-bookImage"><img class="m-bookImage__img" src="cover.webp" alt="${SERIES}"></div></div></div></div>
+          <span class="m-boxSearchListTmb__ttl">${SERIES}</span>
+        </a>
+      </div>
+    </li>
+  </ul>
+</body></html>`;
+function dmmVolume(vol, price, free, end) {
+  return {
+    contentId: 'b9000000' + String(vol).padStart(3, '0'),
+    title: SERIES + ' ' + vol + '巻',
+    volumeNumber: vol,
+    freeStreamingUrl: free
+      ? ['https://book.dmm.com/product/900001/b9000000' + String(vol).padStart(3, '0') + '/free_streaming/?cid=X&lin=0']
+      : '$undefined',
+    tachiyomiUrl: 'https://book.dmm.com/product/900001/b9000000' + String(vol).padStart(3, '0') + '/tachiyomi/?cid=X&lin=1',
+    sell: { productId: 'b9000000' + String(vol).padStart(3, '0'), fixedPrice: price, campaignPrice: '$undefined' },
+    // DMM states the campaign end as an ISO timestamp in JST.
+    limitedFree: { end: free ? end : '' },
+    productUrl: '/product/900001/b9000000' + String(vol).padStart(3, '0') + '/',
+  };
+}
+const DMM_PRODUCT = `<html><body><div id="root"></div>` + dmmFlight({
+  state: {
+    volumeBooks: [
+      dmmVolume(1, 660, true, '2026-10-22T23:59:59+09:00'),
+      dmmVolume(2, 660, true, '2026-10-22T23:59:59+09:00'),
+      dmmVolume(3, 810, false, ''),
+    ],
+    pager: { page: 1, perPage: 10, totalCount: 12 },
+    totalFreeCount: 2,
+  },
+}) + `</body></html>`;
+// The BFF endpoint the product page itself calls for the volumes it does not
+// embed. Its rows are snake_case, and its price fields are the same values.
+const DMM_BFF = JSON.stringify({
+  volume_books: Array.from({ length: 12 }, (_, i) => ({
+    content_id: 'b9000000' + String(i + 1).padStart(3, '0'),
+    title: SERIES + ' ' + (i + 1) + '巻',
+    volume_number: i + 1,
+    free_streaming_url: i < 2 ? ['https://book.dmm.com/x'] : null,
+    tachiyomi_url: 'https://book.dmm.com/product/900001/x/tachiyomi/?cid=X',
+    sell: { fixed_price: i === 2 ? 810 : 660, campaign_price: null },
+    limited_free: { end: i < 2 ? '2026-10-22T23:59:59+09:00' : '' },
+  })),
+  pager: { page: 1, per_page: 100, total_count: 12 },
+  total_free_count: 2,
+});
+
 // host -> { path prefix -> html }
 const PAGES = {
   'bookwalker.jp': { '/search/': BW_SEARCH, '/series/900002/list/': BW_SERIES, '/series/999001/list/': BW_DIGITS_SERIES },
@@ -362,6 +430,14 @@ const PAGES = {
   'comic.k-manga.jp': {
     '/search/word/': KM_SEARCH,
     '/title/100006/pv/2': KM_TITLE_P2, '/title/100006/pv': KM_TITLE_P1,
+  },
+  'book.dmm.com': {
+    // The SERIES queries are the only ones this stub says DMM carries, so every
+    // other scenario keeps its pre-DMM pill set and the "no pill" case still
+    // proves a miss.
+    ['/search/?searchstr=' + encodeURIComponent(SERIES)]: DMM_SEARCH,
+    '/product/900001/b9000000001/': DMM_PRODUCT,
+    '/ajax/bff/contents_book/': DMM_BFF,
   },
 };
 
@@ -475,7 +551,7 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
       await page.waitForFunction(() => {
         if (document.querySelector('.bwdd-cards[data-stores-done="1"]')) return true;
         const h = window.__bwddTestHits || [];
-        return h.filter(u => /bookwalker\.jp|cmoa\.jp|ebookjapan\.yahoo|amazon\.co\.jp|k-manga\.jp/.test(u)).length >= 5 &&
+        return h.filter(u => /bookwalker\.jp|cmoa\.jp|ebookjapan\.yahoo|amazon\.co\.jp|k-manga\.jp|book\.dmm\.com/.test(u)).length >= 6 &&
           !document.querySelector('.bwdd-store-pending');
       }, { timeout: 15000 });
     } catch (e) {}
@@ -505,14 +581,16 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
   const a = await scenario(url(SERIES + ' 3巻'));
   const bw = pick(a.pills, 'BookWalker'), cm = pick(a.pills, 'CMOA');
   const eb = pick(a.pills, 'ebookjapan'), am = pick(a.pills, 'Kindle'), km = pick(a.pills, 'k-manga');
-  check('only shops that carry it get a pill', a.pills.length === 4, `pills=${a.pills.length}: ${shown(a.pills)}`);
+  const dm = pick(a.pills, 'DMM');
+  check('only shops that carry it get a pill', a.pills.length === 5, `pills=${a.pills.length}: ${shown(a.pills)}`);
   check('a missing shop leaves no empty frame behind', !cm, cm ? cm.text : 'no CMOA pill');
   check('CMOA: the search parameter the shop actually filters on is used',
     a.hits.some(u => u.includes('cmoa.jp/search/result/?header_word=')), a.hits.filter(u => u.includes('cmoa.jp/search')).join(' '));
   check('every store was really queried (no match cannot mean no fetch)',
     a.hits.some(u => u.includes('bookwalker.jp/search')) && a.hits.some(u => u.includes('cmoa.jp/search')) &&
     a.hits.some(u => u.includes('ebookjapan.yahoo.co.jp/search')) && a.hits.some(u => u.includes('www.amazon.co.jp/s?k=')) &&
-    a.hits.some(u => u.includes('comic.k-manga.jp/search/word/')),
+    a.hits.some(u => u.includes('comic.k-manga.jp/search/word/')) &&
+    a.hits.some(u => u.includes('book.dmm.com/search/?searchstr=')),
     a.hits.map(u => { try { return new URL(u).hostname; } catch (e) { return '?'; } }).join(' '));
   check('BookWalker: series page wins over the single-volume decoy and the magazine',
     !!bw && bw.href === 'https://bookwalker.jp/series/900002/list/', bw ? bw.href : 'none');
@@ -551,6 +629,22 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
     km ? km.text : 'none');
   check('k-manga: the whole run is counted, not the ten rows of page one',
     !!km && /2 of 12 volumes can be read free/.test(km.tip), km ? km.tip : 'none');
+  check('DMMブックス: the search is the store\'s own server-rendered GET',
+    a.hits.some(u => u.includes('book.dmm.com/search/?searchstr=')),
+    a.hits.filter(u => u.includes('dmm.com')).join(' '));
+  check('DMMブックス: links to the series product page the search matched',
+    !!dm && dm.href === 'https://book.dmm.com/product/900001/b9000000001/', dm ? dm.href : 'none');
+  check('DMMブックス: this volume\'s price comes from the product page payload',
+    !!dm && /¥810/.test(dm.text) && /this volume is ¥810/.test(dm.tip), dm ? dm.text + ' | ' + dm.tip : 'none');
+  check('DMMブックス: the product page itself is fetched for the volume rows',
+    a.hits.some(u => u === 'https://book.dmm.com/product/900001/b9000000001/'), a.hits.length + ' requests');
+  check('DMMブックス: the BFF volume list fills the run the product page does not embed',
+    !!dm && /2\/12 free/.test(dm.text) && a.hits.some(u => u.includes('book.dmm.com/ajax/bff/contents_book/')),
+    dm ? dm.text : 'none');
+  check('DMMブックス: the whole run is counted, not the three embedded volumes',
+    !!dm && /2 of 12 volumes can be read free/.test(dm.tip), dm ? dm.tip : 'none');
+  check('DMMブックス: a 試し読み-only volume still shows its own price',
+    !!dm && /¥810/.test(dm.text) && dm.free, dm ? dm.text + ' free=' + dm.free : 'none');
   const eb1 = pick(a.pills, 'ebookjapan');
   check('ebookjapan: the paid offer does not hide the free campaign for the same volume',
     !!eb1 && eb1.free && /1\/8 free/.test(eb1.text), eb1 ? eb1.text : 'none');
@@ -577,6 +671,13 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
     km1 ? km1.text : 'none');
   check('k-manga: the free reading\'s expiry is surfaced in the tooltip',
     !!km1 && /10\/22 23:59/.test(km1.tip), km1 ? km1.tip : 'none');
+  const dm1 = pick(b.pills, 'DMM');
+  check('DMMブックス: a free volume is read from its free_streaming_url, not its price',
+    !!dm1 && dm1.free && /free · 2\/12 free/.test(dm1.text) && !/¥/.test(dm1.text), dm1 ? dm1.text : 'none');
+  check('DMMブックス: the limited-free end is surfaced in the tooltip',
+    !!dm1 && /10\/22 23:59/.test(dm1.tip), dm1 ? dm1.tip : 'none');
+  check('DMMブックス: the whole run is counted for a free volume too',
+    !!dm1 && /2 of 12 volumes can be read free/.test(dm1.tip), dm1 ? dm1.tip : 'none');
 
   const c = await scenario(url(SKIP + ' 2巻') + '&rurl=' + encodeURIComponent('https://www.cmoa.jp/title/100004/'));
   const cm2 = pick(c.pills, 'CMOA');
@@ -701,41 +802,40 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
     };
   }));
   await fitPage.close();
-  check('no pill ellipsizes its shop name', fit.length === 4 && fit.every(p => p.name),
+  check('no pill ellipsizes its shop name', fit.length === 5 && fit.every(p => p.name),
     fit.map(p => (p.name ? 'ok' : 'clipped')).join(','));
-  check('no pill ellipsizes its price or free count', fit.length === 4 && fit.every(p => p.state),
+  check('no pill ellipsizes its price or free count', fit.length === 5 && fit.every(p => p.state),
     fit.map(p => (p.state ? 'ok' : 'clipped')).join(','));
 
-  // ---- 4c. five shops, two rows: the five-pill grid is two wide cells over
-  //          three narrow ones, so the pills never wrap into a third row and
-  //          the two long store names keep their full text -------------------
-  check('all five shops appear together', pg.pills.length === 5, `pills=${pg.pills.length}: ${shown(pg.pills)}`);
+  // ---- 4c. six shops, two rows of three: the six-pill grid is three cells a
+  //          row, so the pills never wrap into a third row and every store name
+  //          keeps its full text ------------------------------------------------
+  check('all six shops appear together', pg.pills.length === 6, `pills=${pg.pills.length}: ${shown(pg.pills)}`);
   const rowTops = [...new Set(pg.pills.map(p => p.top))];
-  check('five pills occupy exactly two rows', rowTops.length === 2,
+  check('six pills occupy exactly two rows', rowTops.length === 2,
     `rows=${rowTops.length}: ${shown(pg.pills)}`);
-  check('and every shop name stays readable in the five-pill grid',
-    pg.pills.length === 5 && pg.pills.every(p => p.nameFits),
+  check('and every shop name stays readable in the six-pill grid',
+    pg.pills.length === 6 && pg.pills.every(p => p.nameFits),
     pg.pills.map(p => (p.nameFits ? 'ok' : 'clipped')).join(','));
-  // The two wide cells are the two long names and the three narrow ones follow,
-  // and the span comes from the count rather than a per-count CSS rule: the row
-  // carries no count class at all.
-  const fiveSpans = pg.pills.map(p => p.span);
-  check('the five-pill row spans six tracks as two wide cells over three narrow',
-    fiveSpans.filter(s => s === 'span 3').length === 2 && fiveSpans.filter(s => s === 'span 2').length === 3,
-    fiveSpans.join(','));
+  // Every cell spans two of the six tracks, and the span comes from the count
+  // rather than a per-count CSS rule: the row carries no count class at all.
+  const sixSpans = pg.pills.map(p => p.span);
+  check('each six-pill row is three cells of two tracks',
+    sixSpans.length === 6 && sixSpans.every(s => s === 'span 2'),
+    sixSpans.join(','));
   check('the card carries no hand-tuned per-count class',
     pg.rowClass === 'bwdd-store-row is-compact', 'row class=' + (pg.rowClass || 'none'));
 
-  // ---- 4f. a sixth synthetic source: the layout is computed from the count, so
-  //          a store that did not exist when the card was written still lays out.
-  //          The store is registered at runtime into a detached column, which is
-  //          the general path without shipping a real sixth store ---------------
+  // ---- 4f. a seventh synthetic source: the layout is computed from the count,
+  //          so a store that did not exist when the card was written still lays
+  //          out. The store is registered at runtime into a detached column,
+  //          which is the general path without shipping a seventh store --------
   const sixthPage = await openPage(url(SERIES + ' 3巻'));
   const sixth = await sixthPage.evaluate(() => {
     const A = window.__bwddAvailability;
     if (!A) return { error: 'no availability debug surface' };
     const synthetic = {
-      id: 'synthetic-sixth', siteId: 'synthetic-sixth', label: 'Shinjuku Books', pill: 'Shinjuku',
+      id: 'synthetic-seventh', siteId: 'synthetic-seventh', label: 'Shinjuku Books', pill: 'Shinjuku',
       short: 'S', color: '#6b7280', origin: 'https://example.test', hosts: ['example.test'],
       search: () => 'https://example.test/search', product: () => true, rank: () => 0,
       volumes: () => [],
@@ -761,24 +861,26 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
         const n = p.querySelector('.bwdd-store-name');
         return n ? n.scrollWidth <= n.clientWidth + 1 : true;
       }),
-      layout5: A.layout(5), layout6: A.layout(6), layout7: A.layout(7), layout4: A.layout(4),
+      layout4: A.layout(4), layout5: A.layout(5), layout6: A.layout(6), layout7: A.layout(7),
     };
     A.stores.pop();
     host.remove();
     return out;
   });
   await sixthPage.close();
-  check('a sixth source is laid out from the count, not from a per-count rule',
-    !sixth.error && sixth.count === 6 && sixth.spans.every(s => s === 'span 2'),
+  check('a seventh source is laid out from the count, not from a per-count rule',
+    !sixth.error && sixth.count === 7 &&
+    JSON.stringify(sixth.spans) === JSON.stringify(['span 3', 'span 3', 'span 3', 'span 3', 'span 2', 'span 2', 'span 2']),
     sixth.error || 'pills=' + sixth.count + ' spans=' + (sixth.spans || []).join(','));
-  check('six sources make two rows of three and no name is clipped',
-    sixth.rows === 2 && sixth.fits === true, 'rows=' + sixth.rows + ' fits=' + sixth.fits);
-  check('and the six-pill row is compact by the same rule as the five-pill one',
+  check('seven sources make three rows of two, two and three and no name is clipped',
+    sixth.rows === 3 && sixth.fits === true, 'rows=' + sixth.rows + ' fits=' + sixth.fits);
+  check('and a seven-pill row is compact by the same rule as the six-pill one',
     sixth.rowClass === 'bwdd-store-row is-compact' && !/--/.test(sixth.rowClass), sixth.rowClass);
   check('the layout function pins the counts the card must keep',
     !sixth.error && JSON.stringify(sixth.layout4.rows) === '[2,2]' &&
     JSON.stringify(sixth.layout5.rows) === '[2,3]' && JSON.stringify(sixth.layout5.spans) === '[3,3,2,2,2]' &&
-    JSON.stringify(sixth.layout6.rows) === '[3,3]' && JSON.stringify(sixth.layout7.rows) === '[2,2,3]',
+    JSON.stringify(sixth.layout6.rows) === '[3,3]' && JSON.stringify(sixth.layout6.spans) === '[2,2,2,2,2,2]' &&
+    JSON.stringify(sixth.layout7.rows) === '[2,2,3]',
     sixth.error || JSON.stringify({ l4: sixth.layout4, l5: sixth.layout5, l6: sixth.layout6, l7: sixth.layout7 }));
 
   // ---- 4e. the card is painted as answers land: the first shop to carry the
@@ -788,7 +890,7 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
     pg.skeleton.seen >= 1 && pg.skeleton.names.length >= 1,
     'placeholders=' + pg.skeleton.seen + ' names=' + (pg.skeleton.names.join(',') || 'none'));
   check('no placeholder is left once every shop has answered',
-    pg.pendingLeft === 0 && pg.pills.length === 5, 'pending=' + pg.pendingLeft + ' pills=' + pg.pills.length);
+    pg.pendingLeft === 0 && pg.pills.length === 6, 'pending=' + pg.pendingLeft + ' pills=' + pg.pills.length);
 
   const e = await scenario(url(ABSENT));
   check('a title no shop carries shows no pills at all',
@@ -807,7 +909,7 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
   check('and still reports the price off the matched page',
     !!bwNoisy && /¥810/.test(bwNoisy.text), bwNoisy ? bwNoisy.text : 'none');
 
-  // 小春と湊 わたしのパートナーは女の子【イラスト特典付】 has no volume number,
+  // An unnumbered, bonus-included edition has no volume number,
   // so numbering cannot find its row - the title has to. Without that the pill
   // used to fall back to a bare "available" with no price.
   const u = await scenario(url(SERIES + '【特典付】'));

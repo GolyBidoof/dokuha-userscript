@@ -1,6 +1,6 @@
 <p align="center"><img src="docs/images/banner-dokuha-userscript.jpg" alt="The dokuha-userscript banner: 読破 in orange brushstrokes inside a purple circle over a blurred shelf of manga covers, with DOKUHA (userscript) underneath." width="720"></p>
 
-# 読破 (dokuha-userscript) · v3.0.1
+# 読破 (dokuha-userscript) · v3.1.0
 
 <p align="center"><strong>Archive the volume you already have open, at full resolution.</strong></p>
 
@@ -8,7 +8,7 @@
 
 [Quick start](#quick-start) · [Install](#install) · [Screenshots](#screenshots) · [Why people use it](#why-people-use-it) · [Supported stores](#supported-stores) · [How it works](#how-it-works) · [Related tools](#related-tools) · [Documentation](#documentation)
 
-dokuha-userscript is a browser userscript that saves the volume you already have open in BookWalker, CMOA, ebookjapan, the Kindle web manga reader or k-manga. It reads the viewer's own signed CDN URLs, fetches every page file directly, rebuilds each page offline, and gives you a ZIP or a finished Mokuro volume. You never turn a page to capture it.
+dokuha-userscript is a browser userscript that saves the volume you already have open in BookWalker, CMOA, ebookjapan, the Kindle web manga reader, k-manga or DMMブックス. It reads the viewer's own signed CDN URLs, fetches every page file directly, rebuilds each page offline, and gives you a ZIP or a finished Mokuro volume. You never turn a page to capture it.
 
 The name comes from the Japanese word 読破, to read a work through to the end, which is what the script lets you do with a book you can already read online: offline, at full resolution, in your own reader.
 
@@ -22,7 +22,7 @@ The name comes from the Japanese word 読破, to read a work through to the end,
 
 Open [`dokuha-userscript.user.js`](dokuha-userscript.user.js) and click **Install**, or install it from [GreasyFork](https://greasyfork.org/en/scripts/597313-dokuha-userscript). Install one script only: the combined build and a single-store build match the same hosts, so running both gives you two panels.
 
-Only need one store? Each store also has its own smaller userscript, carrying the shared core and that one store's code, so it can never pull in another store's protocol. The three older entries are on GreasyFork: [BookWalker Native Downloader](https://greasyfork.org/en/scripts/594508-bookwalker-native-downloader), [CMOA Native Downloader](https://greasyfork.org/en/scripts/597317-cmoa-native-downloader) and [ebookjapan Native Downloader](https://greasyfork.org/en/scripts/597318-ebookjapan-native-downloader). Kindle and k-manga install from this repository: [Kindle Native Downloader](kindle-only.user.js) and [k-manga Native Downloader](kmanga-only.user.js).
+Only need one store? Each store also has its own smaller userscript, carrying the shared core and that one store's code, so it can never pull in another store's protocol. The three older entries are on GreasyFork: [BookWalker Native Downloader](https://greasyfork.org/en/scripts/594508-bookwalker-native-downloader), [CMOA Native Downloader](https://greasyfork.org/en/scripts/597317-cmoa-native-downloader) and [ebookjapan Native Downloader](https://greasyfork.org/en/scripts/597318-ebookjapan-native-downloader). Kindle, k-manga and DMMブックス install from this repository: [Kindle Native Downloader](kindle-only.user.js), [k-manga Native Downloader](kmanga-only.user.js) and [DMMブックス Native Downloader](dmm-only.user.js).
 
 Tampermonkey asks for cross-origin access to the stats and store-search hosts. That permission powers only the reading-stat cards and the "also available on" pills; decline it and downloading, OCR and ZIP saving work exactly the same.
 
@@ -48,7 +48,8 @@ Tampermonkey asks for cross-origin access to the stats and store-search hosts. T
 ## Why people use it
 
 - **Full resolution, not screenshots.** The CDN page file is fetched and rebuilt offline, so the output is the page as published rather than a picture of the page as displayed. JPEG at q0.92 is the default, and WebP, lossless and PNG are also available.
-- **One panel, every supported store.** The same controls and output work on BookWalker, CMOA, ebookjapan, Kindle and k-manga, and the combined script picks the store from the page you are on.
+- **One panel, every supported store.** The same controls and output work on BookWalker, CMOA, ebookjapan, Kindle, k-manga and DMMブックス, and the combined script picks the store from the page you are on.
+- **Every shop checked at once.** The "also available on" card asks each supported storefront whether it carries the series and shows the ones that do, with that volume's price, free count and product-page link, so you can see where the rest of a run lives before you commit.
 - **Only on reader pages.** The scripts match the viewers and nowhere else, so series, title, product and search pages never load the panel, the bridge probe or the traffic capture.
 - **Resume, not restart.** Pages are cached as they arrive; an interrupted run continues where it stopped, and the retry only fetches what is missing.
 - **Fast on a normal browser profile.** Fetches are spread across every origin a page can open, and rebuilds run across a worker pool, so a browser's six-connections-per-origin limit is not the ceiling.
@@ -65,6 +66,9 @@ Tampermonkey asks for cross-origin access to the stats and store-search hosts. T
 | ebookjapan | `ebookjapan.yahoo.co.jp/viewer/` | the viewer's page endpoints and shuffle geometry | None |
 | Kindle | `read.amazon.co.jp/manga/` | render windows and the karamel token | Always |
 | k-manga | `comic.k-manga.jp/viewer/` | the session from the viewer URL and page data over the viewer socket | None |
+| DMMブックス | `book.dmm.com` `free_streaming/` / `tachiyomi/` | viewer auth, the CloudFront-signed manifest and a 64×64 tile unshuffle | None for free volumes and 試し読み samplers |
+
+DMMブックス currently covers the free full volumes and 試し読み samplers; paid and library volumes are not implemented, and its search is Japan-region only.
 
 Each store's protocol record sits beside its code in `src/sites/<store>/README.md`, and [docs/architecture.md](docs/architecture.md) explains how the shared pipeline uses it.
 
@@ -95,7 +99,7 @@ Both are optional: this userscript works without either of them.
 | --- | --- |
 | [docs/architecture.md](docs/architecture.md) | how the artifact is built, how a run flows, where the shared code ends and store code begins |
 | [src/README.md](src/README.md) | the source layout, the adapter contract, the fragment map and how to add a store |
-| [src/sites/bookwalker/README.md](src/sites/bookwalker/README.md), [cmoa](src/sites/cmoa/README.md), [ebookjapan](src/sites/ebookjapan/README.md), [kindle](src/sites/kindle/README.md), [kmanga](src/sites/kmanga/README.md) | each store's protocol record, next to its code |
+| [src/sites/bookwalker/README.md](src/sites/bookwalker/README.md), [cmoa](src/sites/cmoa/README.md), [ebookjapan](src/sites/ebookjapan/README.md), [kindle](src/sites/kindle/README.md), [kmanga](src/sites/kmanga/README.md), [dmm](src/sites/dmm/README.md) | each store's protocol record, next to its code |
 | [RELEASING.md](RELEASING.md) | the version, the tag, the release branch and the GreasyFork sync |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | the two rules, the build invariant and how the suite is run |
 | [tests/README.md](tests/README.md) | the hermetic suite, file by file |
@@ -109,7 +113,7 @@ Both are optional: this userscript works without either of them.
 npm install
 npm run build        # assemble every artifact from src/
 npm run check:build  # fail when a committed artifact no longer matches src/
-npm test             # the hermetic suite, 32 files
+npm test             # the hermetic suite, 37 of the 38 test files
 ```
 
 The shipped `.user.js` files are built, never edited by hand: each is the concatenation of the `src/` fragments in manifest order, so a change to the source is what changes the script. The suite runs the artifacts in headless Chrome against local stub servers, plus artifact and protocol checks that need no browser. `npm run test:acceptance` runs the opt-in live-store comparison and `npm run test:bridge` measures the fetch lanes against a throwaway bridge instance.
@@ -118,13 +122,13 @@ The shipped `.user.js` files are built, never edited by hand: each is the concat
 
 Built by [GolyBidoof](https://github.com/GolyBidoof) with **DeepSeek V4.1 Flash**, an AI coding agent. The agent reverse engineered the stores' protocols, ported the crypto and descramble logic, and iterated against live captures until every step matched.
 
-- [BookWalker](https://bookwalker.jp), [CMOA](https://www.cmoa.jp), [ebookjapan](https://ebookjapan.yahoo.co.jp), [Amazon Kindle](https://read.amazon.co.jp) and [k-manga](https://comic.k-manga.jp), for the services this tool works with. All downloaded content remains subject to their terms of service.
+- [BookWalker](https://bookwalker.jp), [CMOA](https://www.cmoa.jp), [ebookjapan](https://ebookjapan.yahoo.co.jp), [Amazon Kindle](https://read.amazon.co.jp), [k-manga](https://comic.k-manga.jp) and [DMMブックス](https://book.dmm.com), for the services this tool works with. All downloaded content remains subject to their terms of service.
 - [Brandon](https://learnnatively.com/user/brandon/), for the difficulty levels, JLPT-band colours, ratings and book metadata shown in the stats card, and [ChristopherFritz](https://community.wanikani.com/u/christopherfritz) for the Manga Kotoba vocabulary statistics.
 - [kha-white/mokuro](https://github.com/kha-white/mokuro) and [manga-ocr](https://github.com/kha-white/manga-ocr), the upstream OCR engine and model, with [GolyBidoof/mokuro](https://github.com/GolyBidoof/mokuro) as the batched fork that mokuro-bridge recommends; detection uses [comic-text-detector](https://github.com/dmMaze/comic-text-detector).
 - [aaa4xu/bookworm](https://github.com/aaa4xu/bookworm), the offline BookWalker client whose algorithm the descramble implementation was validated against.
 - [ChristopherFritz](https://github.com/ChristopherFritz), for the BookWalker manifest page naming and the ZIP ordering that keeps it stable.
 
-"BookWalker", "CMOA", "ebookjapan", "Kindle" and "k-manga" are trademarks of their respective owners. This project is not affiliated with or endorsed by any of them.
+"BookWalker", "CMOA", "ebookjapan", "Kindle", "k-manga" and "DMMブックス" are trademarks of their respective owners. This project is not affiliated with or endorsed by any of them.
 
 For personal, lawful use: download only content you are entitled to access, such as purchased books, free samples and trial chapters. Respect the services' terms of service and the rights of authors and publishers. The maintainer assumes no liability for misuse.
 

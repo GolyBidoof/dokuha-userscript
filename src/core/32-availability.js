@@ -44,7 +44,7 @@
     // One lookup per title per page: the panel re-renders, the answers do not.
     const availabilityMemory = new Map();
     // One shared in-flight promise per key: the boot poll often asks again while
-    // the first round-trip is still running, and the same three stores must not
+    // the first round-trip is still running, and the same six stores must not
     // be queried twice.
     const availabilityInflight = new Map();
     const AVAILABILITY_CACHE_MAX = 50;
@@ -472,10 +472,16 @@
    cells are a third of the card wide. These are the knobs for the whole card:
    change them here and every count follows. */
 .bwdd-store-row { display: grid; grid-template-columns: repeat(${STORE_GRID_TRACKS}, minmax(0, 1fr)); gap: 6px; }
+/* A row of three is a third of the card, so the badge, padding and name shrink
+   and the state line is allowed to wrap onto a second line. Ellipsizing either
+   one was how "BookWalker" and "KU · ¥620 · 16 vols" became unreadable once the
+   card asked six shops. */
 .bwdd-store-row.is-compact { gap: 4px; }
 .bwdd-store-row.is-compact > .bwdd-store-link,
-.bwdd-store-row.is-compact > .bwdd-store-pending { padding: 3px 4px; column-gap: 3px; }
-.bwdd-store-row.is-compact .bwdd-store-badge { width: 12px; height: 12px; font-size: 9px; }
+.bwdd-store-row.is-compact > .bwdd-store-pending { padding: 2px 3px; column-gap: 2px; }
+.bwdd-store-row.is-compact .bwdd-store-badge { width: 9px; height: 9px; font-size: 7px; }
+.bwdd-store-row.is-compact .bwdd-store-name { font-size: 9.5px; letter-spacing: -0.03em; }
+.bwdd-store-row.is-compact .bwdd-store-state { white-space: normal; line-height: 1.25; }
 .bwdd-store-link, .bwdd-store-pending {
   display: grid;
   grid-template-columns: auto minmax(0, 1fr);

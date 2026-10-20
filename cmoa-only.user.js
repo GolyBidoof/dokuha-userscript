@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         CMOA Native Downloader
 // @namespace    http://tampermonkey.net/
-// @version      3.0.1
+// @version      3.1.0
 // @description  Saves a book from the CMOA speed reader as a ZIP or CBZ of full-resolution page images, fetched from the CDN and unscrambled offline. Optional Japanese OCR through mokuro-bridge, with upload to MEGA, Google Drive or OneDrive.
 // @author       GolyBidoof
 // @homepageURL  https://github.com/GolyBidoof/dokuha-userscript
@@ -64,7 +64,7 @@
             const v = (typeof GM_info !== 'undefined') && GM_info.script && GM_info.script.version;
             if (v) return v;
         } catch (e) { }
-        return '3.0.1';
+        return '3.1.0';
     })();
 
     const BWDD_DEBUG = (() => {
@@ -1695,19 +1695,7 @@ function effectiveBurst(base) {
     }
     async function lookupMangaKotoba(seriesTitle, volumeNum) {
         try {
-            let links = null;
-            let search = '';
-            let usedTitle = seriesTitle;
-            for (const cand of searchTitleCandidates(seriesTitle)) {
-                const q = encodeURIComponent(cand);
-                const text = (await gmFetch('https://manga-kotoba.com/search/series/?q=' + q)).text;
-                const doc = new DOMParser().parseFromString(text, 'text/html');
-                const l = [...doc.querySelectorAll('a[href*="/series/"]')];
-                if (l.length) { links = l; search = text; usedTitle = cand; break; }
-            }
-            if (!links) return null;
             const norm = (x) => String(x || '').replace(/[\s　\u30fb・:：()（）]/g, '').toLowerCase();
-            const target = norm(usedTitle);
 
             const titleOf = (a) => {
                 const h = a.querySelector('.japanese-title, .series-title, h3');
@@ -1715,19 +1703,31 @@ function effectiveBurst(base) {
                 const line = String(a.textContent || '').split(/\n/).map(x => x.trim()).find(Boolean);
                 return line || '';
             };
-            let best = null, bestScore = 0, bestExtra = Infinity;
-            for (const a of links) {
-                const t = norm(titleOf(a));
-                if (!t || !target) continue;
-                let score = 0;
-                if (t === target) score = 1000;
-                else if (t.indexOf(target) !== -1) score = target.length;
-                else if (target.indexOf(t) !== -1) score = t.length;
-                if (!score) continue;
-                const extra = t.length - target.length;
-                if (score > bestScore || (score === bestScore && extra < bestExtra)) {
-                    bestScore = score; bestExtra = extra; best = a;
+            let best = null;
+            let usedTitle = seriesTitle;
+            for (const cand of searchTitleCandidates(seriesTitle)) {
+                const q = encodeURIComponent(cand);
+                const text = (await gmFetch('https://manga-kotoba.com/search/series/?q=' + q)).text;
+                const doc = new DOMParser().parseFromString(text, 'text/html');
+                const links = [...doc.querySelectorAll('a[href*="/series/"]')];
+                if (!links.length) continue;
+                const target = norm(cand);
+                let bestScore = 0, bestExtra = Infinity;
+                for (const a of links) {
+                    const t = norm(titleOf(a));
+                    if (!t || !target) continue;
+                    let score = 0;
+                    if (t === target) score = 1000;
+                    else if (t.indexOf(target) !== -1) score = target.length;
+                    else if (target.indexOf(t) !== -1) score = t.length;
+                    if (!score) continue;
+                    const extra = t.length - target.length;
+                    if (score > bestScore || (score === bestScore && extra < bestExtra)) {
+                        bestScore = score; bestExtra = extra; best = a;
+                    }
                 }
+
+                if (best) { usedTitle = cand; break; }
             }
             if (!best) return null;
             const slug = best.getAttribute('href');
@@ -1755,21 +1755,51 @@ function effectiveBurst(base) {
         const out = [t];
         const seen = new Set([t]);
         const push = (s) => { s = String(s || '').trim(); if (s && !seen.has(s)) { seen.add(s); out.push(s); } };
-        let s = t.replace(/【[^】]*】/g, ' ').replace(/[\s　]+/g, ' ').trim();
-        push(s);
-        let cur = s;
-        for (let i = 0; i < 6; i++) {
-            const before = cur;
-            cur = cur
-                .replace(/[\s　]*(文庫版|新装版|完全版|愛蔵版|廉価版|普及版|電子版|特装版|限定版|豪華版|分冊版|合本版|オンデマンド版|デジタル版|単行本版|ノベルズ版|ペーパーバック版)[\s　]*$/u, '')
-                .replace(/[\s　]*[(（]*(文庫|新装|完全|愛蔵|廉価|普及)[)）]*[\s　]*$/u, '')
+        const VOL = '[0-9０-９一二三四五六七八九十百]+';
 
-                .replace(/[\s　]*第?[0-9０-９一二三四五六七八九十百]+[巻話版編]?[\s　]*$/u, '')
-                .trim();
-            push(cur);
-            if (cur === before) break;
+        const VOL_TOKEN = '(?:[（(]?第?' + VOL + '[巻話]?[）)]?)';
+
+        const labelLike = (g) => /コミックス|コミック|レーベル|文庫|ノベルズ|デジタル|デラックス|電子|雑誌|単行本|ブックス|BOOKS|Books|出版|社|DIGITAL|digital|新装|完全|愛蔵|廉価|普及/.test(g);
+
+        const stripLabel = (s) => {
+            for (const re of [
+                new RegExp('^(.*?)[\\s　]*[（(]([^()（）]*)[）)][\\s　]*' + VOL_TOKEN + '[\\s　]*$', 'u'),
+                new RegExp('^(.*?)[\\s　]*' + VOL_TOKEN + '[\\s　]*[（(]([^()（）]*)[）)][\\s　]*$', 'u'),
+                /^(.*?)[\s　]*[（(]([^()（）]*)[）)][\s　]*$/u,
+            ]) {
+                const m = s.match(re);
+                if (m && labelLike(m[2]) && m[1].trim()) return m[1].trim();
+            }
+            return null;
+        };
+
+        const normalize = (seed, bareEdition) => {
+            const s = String(seed || '').replace(/【[^】]*】/g, ' ').replace(/[\s　]+/g, ' ').trim();
+            push(s);
+            let cur = s;
+            for (let i = 0; i < 6; i++) {
+                const before = cur;
+                cur = cur
+                    .replace(/[\s　]*(文庫版|新装版|完全版|愛蔵版|廉価版|普及版|電子版|特装版|限定版|豪華版|分冊版|合本版|オンデマンド版|デジタル版|モノクロ版|カラー版|単行本版|ノベルズ版|ペーパーバック版)[\s　]*$/u, '')
+
+                    .replace(/[\s　]*(?:[(（](?:文庫|新装|完全|愛蔵|廉価|普及)(?:版)?[)）]|(?:文庫|新装|完全|愛蔵|廉価|普及)(?:版)?)[\s　]*$/u, '')
+
+                    .replace(new RegExp('[\\s　]*第?' + VOL + '[巻話版編]?[\\s　]*$', 'u'), '')
+                    .trim();
+                push(cur);
+                if (cur === before) break;
+            }
+            if (bareEdition) push(s.replace(/[\s　]*版$/u, '').trim());
+        };
+
+        normalize(t, true);
+        let base = t.replace(/【[^】]*】/g, ' ').replace(/[\s　]+/g, ' ').trim();
+        for (let i = 0; i < 3; i++) {
+            const next = stripLabel(base);
+            if (!next) break;
+            base = next;
+            normalize(base, false);
         }
-        push(s.replace(/[\s　]*版$/u, '').trim());
         return out.filter(Boolean);
     }
     async function lnSearchBook(candidates) {
@@ -4228,7 +4258,8 @@ const PANEL_POS_KEY = 'bwdd-panel-pos';
                     if (info && (Array.isArray(info.fetchUpstreams) || info.upstream)) {
                         setProxyUpstreams(info.fetchUpstreams, info.upstream);
                     }
-                    addProxyPorts(info && info.fetchProxyPorts, 'bridge');
+                    addProxyPorts(info && info.fetchProxyPorts, 'bridge',
+                        { pathUpstream: !!(info && info.fetchPathUpstream) });
                 } catch (e) {}
                 mokuroMissing = !!(info && info.mokuro_installed === false);
                 bridgeBusy = !!(info && info.busy);

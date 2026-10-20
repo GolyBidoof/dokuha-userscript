@@ -10,10 +10,11 @@
    "sites/ebookjapan",
    "sites/kindle",
    "sites/kmanga",
+   "sites/dmm",
    "entry"
   ],
   "name": "dokuha-userscript",
-  "description": "Saves a book from the BookWalker viewer, the CMOA speed reader, the ebookjapan reader, the Kindle web manga reader or the k-manga viewer as a ZIP or CBZ of full-resolution page images, fetched from the store and unscrambled offline. Optional Japanese OCR through mokuro-bridge, with upload to MEGA, Google Drive or OneDrive.",
+  "description": "Saves a book from the BookWalker viewer, the CMOA speed reader, the ebookjapan reader, the Kindle web manga reader, the k-manga viewer or the DMMブックス viewer as a ZIP or CBZ of full-resolution page images, fetched from the store and unscrambled offline. Optional Japanese OCR through mokuro-bridge, with upload to MEGA, Google Drive or OneDrive.",
   "icon": "https://www.google.com/s2/favicons?sz=64&domain=bookwalker.jp",
   "matches": [
    "https://viewer.bookwalker.jp/*",
@@ -24,7 +25,9 @@
    "https://www.cmoa.jp/reader/*",
    "https://ebookjapan.yahoo.co.jp/viewer/*",
    "https://read.amazon.co.jp/manga/*",
-   "https://comic.k-manga.jp/viewer/*"
+   "https://comic.k-manga.jp/viewer/*",
+   "https://book.dmm.com/product/*/*/free_streaming/*",
+   "https://book.dmm.com/product/*/*/tachiyomi/*"
   ],
   "connects": [
    "learnnatively.com",
@@ -43,11 +46,14 @@
    "comic.k-manga.jp",
    "bv.k-manga.jp",
    "ws.viewer.k-manga.jp",
+   "book.dmm.com",
+   "*.dmm.com",
+   "*.dmm.co.jp",
    "127.0.0.1",
    "localhost"
   ],
   "banner": [
-   "One script, five stores. The panel, its controls, the Mokuro bridge, the",
+   "One script, six stores. The panel, its controls, the Mokuro bridge, the",
    "reading-stat cards, the ZIP naming and the headless automation API are shared",
    "verbatim; only the store-specific protocol lives in its own module under",
    "src/sites/. Only the readers are matched; BookWalker stays the fallback for a",
@@ -209,6 +215,38 @@
    "cards, the ZIP naming and the headless automation API are the shared core; the",
    "k-manga protocol — the BCP000 viewer socket, the LCG block permutation and the",
    "canvas descrambler — lives in src/sites/kmanga/."
+  ]
+ },
+ "dmm": {
+  "out": "dmm-only.user.js",
+  "modules": [
+   "_meta",
+   "core",
+   "feature/unified-link",
+   "sites/dmm",
+   "entry"
+  ],
+  "name": "DMMブックス Native Downloader",
+  "description": "Saves a book from the DMMブックス free viewer or 試し読み sampler as a ZIP or CBZ of full-resolution page images, fetched from the signed CDN and unscrambled in the browser. Optional Japanese OCR through mokuro-bridge, with upload to MEGA, Google Drive or OneDrive.",
+  "icon": "https://www.google.com/s2/favicons?sz=64&domain=book.dmm.com",
+  "matches": [
+   "https://book.dmm.com/product/*/*/free_streaming/*",
+   "https://book.dmm.com/product/*/*/tachiyomi/*"
+  ],
+  "connects": [
+   "book.dmm.com",
+   "*.dmm.com",
+   "*.dmm.co.jp",
+   "learnnatively.com",
+   "manga-kotoba.com",
+   "127.0.0.1",
+   "localhost"
+  ],
+  "banner": [
+   "One script, one store. The panel, its controls, the Mokuro bridge, the reading-stat",
+   "cards, the ZIP naming and the headless automation API are the shared core; the DMM",
+   "protocol — the viewer auth call, CloudFront signing, the manifest and the 64×64 tile",
+   "unshuffle — lives in src/sites/dmm/."
   ]
  }
 }

@@ -37,10 +37,12 @@
     const KINDLE_MAX_WINDOWS = 400;
     // CloudFront fronts this content over HTTP/2, so the browser's
     // six-connections-per-origin ceiling — the thing that forces CMOA and
-    // BookWalker through a proxy-port pool — does not apply. A fixed, modest
-    // fan-out is both faster and far kinder to memory: a page is ~600 KB on the
-    // wire and ~570 KB decoded, and every worker holds one plus its base64 body.
-    const KINDLE_FETCH_CONCURRENCY = 12;
+    // BookWalker through a proxy-port pool — does not apply. Multiplexed streams
+    // only fill the link when enough requests are outstanding: at a 300 ms
+    // round trip a page is mostly waiting, and 24 streams reach ~82% of the link
+    // where 12 reaches ~70%. A page is ~600 KB on the wire and ~570 KB decoded,
+    // and every worker holds one plus its base64 body, so 24 is still bounded.
+    const KINDLE_FETCH_CONCURRENCY = 24;
     const KINDLE_FETCH_TIMEOUT = 45000;
     // Retryable transport statuses. These were once mistaken for CDN throttling:
     // the run was slowed right down to cure a 502 wall that was really the

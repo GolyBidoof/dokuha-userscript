@@ -77,6 +77,6 @@ Both are searched and reported. A transform only counts if it compares the large
 
 Downloads go to a temp directory and are deleted unless `--keep` is passed.
 
-## Kindle and k-manga are not covered
+## Kindle, k-manga and DMMブックス are not covered
 
-The live suite discovers free volumes on BookWalker, CMOA and ebookjapan, the three stores that serve a readable target anonymously. `read.amazon.co.jp` needs a signed-in Amazon session and the k-manga reader is not wired into the discovery layer, so neither is part of the run rather than being added as a known-broken job.
+The live suite discovers free volumes on BookWalker, CMOA and ebookjapan, the three stores its discovery layer is wired for. `read.amazon.co.jp` needs a signed-in Amazon session, the k-manga reader is not wired into discovery, and DMMブックス, which does serve free volumes and 試し読み samplers anonymously, has no discovery entry yet, so none of the three is part of the run rather than being added as a known-broken job.

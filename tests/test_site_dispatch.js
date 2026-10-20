@@ -54,6 +54,7 @@ const STOREFRONTS = [
     ['an ebookjapan volume page', 'https://ebookjapan.yahoo.co.jp/books/716241/A001624701/?bwddDebug=1'],
     ['a Kindle product page outside /manga/', 'https://read.amazon.co.jp/dp/B000000001?bwddDebug=1'],
     ['a k-manga title page', 'https://comic.k-manga.jp/title/100007/pv?bwddDebug=1'],
+    ['a DMMブックス product page', 'https://book.dmm.com/product/605237/?bwddDebug=1'],
 ];
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -102,7 +103,8 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
                 title: (document.querySelector('#bwdd-panel-title') || {}).textContent || '',
                 fetchWrapped: window.fetch !== window.__origFetch,
                 hasDebug: !!(window.__bwdd || window.__bwddSite || window.__bwddUI ||
-                    window.__bwddCmoa || window.__bwddEbookjapan || window.__bwddKindle || window.__bwddKmanga),
+                    window.__bwddCmoa || window.__bwddEbookjapan || window.__bwddKindle ||
+                    window.__bwddKmanga || window.__bwddDmm),
                 hasAutomation: !!window.__bwddAutomation,
                 automationVersion: (window.__bwddAutomation && window.__bwddAutomation.version) || null,
                 cmoaCid: window.__bwddCmoa ? window.__bwddCmoa.cid : null,
@@ -110,6 +112,7 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
                 kindleAsin: window.__bwddKindle ? window.__bwddKindle.asin : null,
                 ejCode: window.__bwddEbookjapan ? window.__bwddEbookjapan.code : null,
                 kmangaBookId: window.__bwddKmanga ? window.__bwddKmanga.bookId : null,
+                dmmContentId: window.__bwddDmm ? window.__bwddDmm.contentId : null,
             }));
             await page.close();
             // The bridge's ports are asked for at page load on a live page. The
@@ -175,6 +178,15 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
         check('the k-manga adapter exposes its own debug surface',
             kmanga.hasDebug === true && kmanga.kmangaBookId === '100007',
             'kmangaDebug=' + kmanga.hasDebug + ' bookId=' + JSON.stringify(kmanga.kmangaBookId));
+
+        const dmm = await probe('https://book.dmm.com/product/605237/b999asqex01885/free_streaming/'
+            + '?cid=OPAQUE&lin=0&bwddDebug=1');
+        check('a DMMブックス free_streaming page selects the DMM adapter', dmm.siteId === 'dmm', 'adapter=' + dmm.siteId);
+        check('the DMM panel is branded for DMMブックス',
+            /DMM/.test(dmm.title) && !/BookWalker/.test(dmm.title), JSON.stringify(dmm.title.trim()));
+        check('the DMM adapter exposes its own debug surface and content id',
+            dmm.hasDebug === true && dmm.dmmContentId === 'b999asqex01885',
+            'dmmDebug=' + dmm.hasDebug + ' contentId=' + JSON.stringify(dmm.dmmContentId));
 
         // ---- Storefronts: the store owns the host, so no adapter may be picked.
         for (const [name, url] of STOREFRONTS) {

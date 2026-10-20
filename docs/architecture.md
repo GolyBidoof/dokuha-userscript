@@ -12,7 +12,7 @@ Three files drive the build:
 - `src/targets.json` declares each artifact: output filename, metadata name and description, icon, `@match` list, `@connect` list, banner and the modules it includes. Every field is substituted into `src/_meta/00-header.txt`, so no artifact can claim a store its code cannot handle.
 - `src/core/00-identity.js` holds the version literal and the repository URL. `build.mjs` substitutes the version into `@version`, `tools/bump.mjs` is the only writer, and `tests/test_artifacts.js` fails when an artifact and the source disagree.
 
-Six artifacts are built: the combined `dokuha-userscript.user.js` with all five stores and availability module, plus `bookwalker-only`, `cmoa-only`, `ebookjapan-only`, `kindle-only` and `kmanga-only`, each carrying the shared core and exactly one store module. `tests/test_split_builds.js` boots every artifact and inspects what it carries, so isolation is a tested property rather than a convention.
+Seven artifacts are built: the combined `dokuha-userscript.user.js` with all six stores and availability module, plus `bookwalker-only`, `cmoa-only`, `ebookjapan-only`, `kindle-only`, `kmanga-only` and `dmm-only`, each carrying the shared core and exactly one store module. `tests/test_split_builds.js` boots every artifact and inspects what it carries, so isolation is a tested property rather than a convention.
 
 ## The runtime at a glance
 
@@ -37,14 +37,19 @@ Every store follows the same shape, and only the middle differs.
 | ebookjapan | viewer state, then the viewer's own `open_book` and `get_drm` calls | the viewer's book manifest | the viewer's wasm core on a page-realm canvas |
 | Kindle | the reader's embedded `#bookInfo` JSON | `/renderer/render` TAR windows | AES-GCM for encrypted resources, otherwise the JPEG itself |
 | k-manga | the viewer URL and the viewer WebSocket session | the viewer's BCP000 page list | block permutation on a canvas |
+| DMMブックス | the viewer URL, then `/viewerapi/auth/` | `configuration_pack.json` | 64×64 tile permutation on a canvas |
 
-Each store's protocol record lives with its code under `src/sites/<store>/README.md`: [BookWalker](../src/sites/bookwalker/README.md), [CMOA](../src/sites/cmoa/README.md), [ebookjapan](../src/sites/ebookjapan/README.md), [Kindle](../src/sites/kindle/README.md), [k-manga](../src/sites/kmanga/README.md).
+Each store's protocol record lives with its code under `src/sites/<store>/README.md`: [BookWalker](../src/sites/bookwalker/README.md), [CMOA](../src/sites/cmoa/README.md), [ebookjapan](../src/sites/ebookjapan/README.md), [Kindle](../src/sites/kindle/README.md), [k-manga](../src/sites/kmanga/README.md), [DMMブックス](../src/sites/dmm/README.md).
+
+## The cross-store availability card
+
+The "also available on" card lives in `core/32-availability.js`, tagged module `feature/availability`, which only the combined artifact includes: the single-store builds carry neither its markup and CSS nor the storefront hosts it queries. Each store registers one adapter from `src/sites/<store>/40-availability.js` through `registerAvailabilityStore()` and supplies only what is true of that shop: its search URL, which of its paths are product pages, and how to read a volume row's price, free state and unit, plus any further list pages. The core owns the shared work: the scored title match, the per-series merge that turns volume rows into "which shops carry this series, at what price", the card markup and the count-driven layout. All six supported stores register an adapter, so the card asks six shops, and it appears as soon as the first one confirms the book, with a placeholder pill for every shop whose search is still in flight; a shop that does not carry the book gets no pill at all. DMMブックス is the newest of the six: its results page is server-rendered and one card stands for a whole series, so its adapter reads the per-volume rows out of the product page's Next.js flight payload and fills a truncated run from the store's own BFF volume list.
 
 ## The shared run harness
 
 `core/61-run-harness.js` owns everything a run shows and everything that is not the store's protocol: the progress bars, the page accounting, the page cache, the OCR session lifecycle, ZIP assembly and naming, the result object and teardown. A store calls `notePage(index, blob, crc, ext)` for a page it rebuilt and `noteFailure(index, message)` for one it could not, and the harness keeps the two bars honest.
 
-Four stores use the harness today: CMOA, ebookjapan, Kindle and k-manga. BookWalker's full and trial pipelines predate it and keep their own bookkeeping; moving them onto the harness is the largest open refactor in the repository.
+Five stores use the harness today: CMOA, ebookjapan, Kindle, k-manga and DMMブックス. BookWalker's full and trial pipelines predate it and keep their own bookkeeping; moving them onto the harness is the largest open refactor in the repository.
 
 The harness also holds the panel's run lock and the browser's unload guard for the length of a run. Every fetched and descrambled page is in the tab's memory, and the finalize stream is a request that tab is reading, so a stray tab close would throw the run away. The lock is released in a `finally`, so a failed run cannot leave the panel disabled.
 
@@ -92,7 +97,7 @@ Progress reporting has one shared shape for the panel, the automation API and th
 
 ## Testing and verification
 
-The default suite is hermetic and runs in headless Chrome against local stub servers plus artifact checks that need no browser. It covers the build and artifact invariants, site dispatch and the reader-only gate, every store's pipeline at least against a synthetic storefront, the transport lanes, the page cache, the panel, the automation API and the mokuro-bridge wire protocol. `tests/README.md` lists every file.
+The default suite is hermetic and runs in headless Chrome against local stub servers plus artifact checks that need no browser. It covers the build and artifact invariants, site dispatch and the reader-only gate, every store's protocol against recorded data or a synthetic storefront, the transport lanes, the page cache, the panel, the automation API, the six-shop availability card and the mokuro-bridge wire protocol. `tests/README.md` lists every file.
 
 Two suites are opt-in because they need the outside world. `tests/acceptance/` downloads a real free volume from BookWalker, CMOA or ebookjapan and compares the pages with dokuha-cli's independent descrambler. `tests/test_bridge_e2e.js` measures the bridge's fetch-proxy lanes against a throwaway bridge instance. Both are excluded from `npm test` by default.
 

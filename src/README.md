@@ -4,12 +4,13 @@ The userscripts are **built**, not hand-edited. Each is the concatenation of the
 
 | Artifact | Modules |
 | --- | --- |
-| `dokuha-userscript.user.js` | core + all five stores |
+| `dokuha-userscript.user.js` | core + all six stores |
 | `bookwalker-only.user.js` | core + `sites/bookwalker` |
 | `cmoa-only.user.js` | core + `sites/cmoa` |
 | `ebookjapan-only.user.js` | core + `sites/ebookjapan` |
 | `kindle-only.user.js` | core + `sites/kindle` |
 | `kmanga-only.user.js` | core + `sites/kmanga` |
+| `dmm-only.user.js` | core + `sites/dmm` |
 
 The split artifacts share the compiled core and carry exactly one store module, so none contains a line of another store's logic. `tests/test_split_builds.js` enforces it: metadata, fragment-level absence, and the adapter that actually boots.
 
@@ -23,9 +24,9 @@ npm run bump patch               # bump the version, then rebuild everything
 
 The fragments are plain, ordered pieces of **one IIFE**: they share a single closure, so any fragment can call anything else in the file. There is no module loader, no bundler and no source map. That is deliberate: the shipped file stays readable and diffable against `src/` line for line, and `node build.mjs --check` can prove the artifact matches its sources exactly.
 
-## Why one file, five stores
+## Why one file, six stores
 
-A userscript has to be a single installable file, but it serves five stores. The split is therefore by **ownership**, not by load order:
+A userscript has to be a single installable file, but it serves six stores. The split is therefore by **ownership**, not by load order:
 
 ```
 src/
@@ -36,6 +37,7 @@ src/
   sites/cmoa/          CMOA protocol only
   sites/kindle/        Kindle protocol only
   sites/kmanga/        k-manga protocol only
+  sites/dmm/           DMMブックス protocol only
   entry/90-boot.js     pick an adapter from the host, then boot the shared panel
 ```
 
@@ -69,7 +71,7 @@ Everything else is shared verbatim, which is what keeps the stores from drifting
 - the panel, its controls, the progress bars and the archive-name field (`core/51-panel.js`, `core/50-styles.js`)
 - the optional mokuro-bridge hand-off, where mokuro-bridge is an independent local service this script acts as a client of: health, idle gate, session, ordered page streaming, early cover upload, finalize, upload progress (`core/31-mokuro.js`, `core/60-mokuro-flow.js`, and `core/61-run-harness.js`)
 - the manga-kotoba and LearnNatively cards (`core/30-stats.js`)
-- the cross-store "also available on" card: the title match, the per-series merge and the count-driven layout live in `core/32-availability.js` (module `feature/availability`, which only the combined target includes), and each store declares its own search URL and volume reader in `src/sites/<store>/40-availability.js` through `registerAvailabilityStore()`
+- the cross-store "also available on" card, which asks all six shops: the title match, the per-series merge and the count-driven layout live in `core/32-availability.js` (module `feature/availability`, which only the combined target includes), and each store declares its own search URL and volume reader in `src/sites/<store>/40-availability.js` through `registerAvailabilityStore()`
 - archive naming, the ZIP writer and the outcome wording (`core/40-naming.js`, `core/41-zip.js`)
 - the page cache (`core/13-pagecache.js`) and the headless automation API (`core/11-automation.js`)
 
@@ -90,11 +92,11 @@ await H.finishZip();                      // or H.mokuro.finalize()
 return H.outcome(missing === 0);
 ```
 
-The harness owns the bars, progress reporting, the Mokuro session lifecycle, ZIP assembly and naming, the result object and teardown. A site keeps only what is genuinely its own: **how** pages are fetched. BookWalker drives a worker descramble engine, CMOA a quality and token retry ladder over a canvas descrambler, Kindle a render-window walk, and k-manga a WebSocket pipeline. Those have nothing in common, and forcing them through one generic fetch loop would mean rewriting the tuned BookWalker path that works.
+The harness owns the bars, progress reporting, the Mokuro session lifecycle, ZIP assembly and naming, the result object and teardown. A site keeps only what is genuinely its own: **how** pages are fetched. BookWalker drives a worker descramble engine, CMOA a quality and token retry ladder over a canvas descrambler, Kindle a render-window walk, k-manga a WebSocket pipeline, and DMM a signed manifest plus a 64×64 tile unshuffle. Those have nothing in common, and forcing them through one generic fetch loop would mean rewriting the tuned BookWalker path that works.
 
 It also owns the run lock, via `ui.setRunLock(busy)`: a run disables the action buttons and the destination section, and it holds the browser's own "leave site?" prompt (`beforeunload`) for exactly as long as it is in progress. Every page already fetched and descrambled is in that tab's memory and the finalize stream is a request that tab is reading, so a stray Cmd-W would throw the run away without a word. The guard is armed on `true` and dropped on `false`, never left behind, so a later navigation is not nagged. Headless/CLI pages get no panel and so no prompt.
 
-**Four stores create a harness today**: CMOA, ebookjapan, Kindle and k-manga (`sites/cmoa/02-run.js`, `sites/ebookjapan/05-run.js`, `sites/kindle/03-run.js`, `sites/kmanga/05-run.js`). `sites/bookwalker/22-run.js` and `21-trial-zip.js` still hand-roll the same stages, so for BookWalker this section describes where the code is going rather than where it is. Unifying that is the largest open refactor in the repo.
+**Five stores create a harness today**: CMOA, ebookjapan, Kindle, k-manga and DMM (`sites/cmoa/02-run.js`, `sites/ebookjapan/05-run.js`, `sites/kindle/03-run.js`, `sites/kmanga/05-run.js`, `sites/dmm/02-run.js`). `sites/bookwalker/22-run.js` and `21-trial-zip.js` still hand-roll the same stages, so for BookWalker this section describes where the code is going rather than where it is. Unifying that is the largest open refactor in the repo.
 
 What they *do* share is the transport. Those pipelines fetch through `laneFetch()`, so they all get the same fan-out across the manager lane and every local fetch-proxy port a running mokuro-bridge advertises, and they size their worker count from `fetchSocketBudget()`. A site that reaches for `GM_xmlhttpRequest` directly gets one lane and no port fan-out, which is why CMOA originally downloaded at about one page per request round-trip no matter how many bridge ports were running.
 
@@ -219,6 +221,15 @@ Each store keeps its protocol record next to its code, linked from the heading b
 | `kmanga/04-descramble.js` | the canvas descrambler and page decoding |
 | `kmanga/05-run.js` | k-manga run pipeline and adapter registration |
 | `kmanga/40-availability.js` | k-manga availability adapter (module `feature/availability`, combined build only) |
+
+### `src/sites/dmm/` ([protocol notes](sites/dmm/README.md))
+
+| File | Purpose |
+| --- | --- |
+| `dmm/00-state.js` | DMM viewer detection, URL parsing and panel metadata |
+| `dmm/01-protocol.js` | auth, CloudFront signing, manifest parsing, the 64×64 tile unshuffle and page decoding |
+| `dmm/02-run.js` | DMM page fan-out, 403 refresh, run pipeline and adapter registration |
+| `dmm/40-availability.js` | DMMブックス availability adapter: server-rendered search, the Next.js flight payload's volume rows and the BFF volume list (module `feature/availability`, combined build only) |
 
 ### `src/entry/`
 

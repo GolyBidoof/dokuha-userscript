@@ -6,7 +6,7 @@
 npm run bump minor     # patch | minor | major | x.y.z; bumps the core version,
                        # README title and package.json, then rebuilds every artifact
 # add the "## vX.Y.Z" section to CHANGELOG.md
-npm test               # the whole userscript suite (31 files, browser fixtures)
+npm test               # the default suite (37 of the 38 test files, browser fixtures)
 git add -A && git commit -m "Release vX.Y.Z"
 git tag vX.Y.Z
 git push origin main --tags
@@ -15,7 +15,7 @@ git push origin main --tags
 Two things about that last line, both learned the hard way:
 
 - **The tag push is what starts the release.** If the tag goes up in the same push that introduces `.github/workflows/release.yml` for the first time, GitHub does not run it for that push. `gh workflow run release.yml` publishes from the default branch instead, which is why that file also has a `workflow_dispatch` trigger.
-- **Never delete a release tag.** Deleting a tag that a published release points at silently turns the release into a **draft**. `releases/latest/download/...` then stops resolving, so installed scripts stop finding updates. Re-pushing the tag does not repair it either, because the workflow's "already released?" guard skips the publish step. `gh release edit vX.Y.Z --draft=false` is the fix, and `gh release view vX.Y.Z --json isDraft,assets` is the check: `draft=false` and six assets.
+- **Never delete a release tag.** Deleting a tag that a published release points at silently turns the release into a **draft**. `releases/latest/download/...` then stops resolving, so installed scripts stop finding updates. Re-pushing the tag does not repair it either, because the workflow's "already released?" guard skips the publish step. `gh release edit vX.Y.Z --draft=false` is the fix, and `gh release view vX.Y.Z --json isDraft,assets` is the check: `draft=false` and seven assets.
 
 **Pushing to `main` publishes nothing.** `ci.yml` builds every artifact, proves the committed files match `src/` and compile, and runs the full suite, and that is all it does. Work in progress can sit on `main` for as long as you like.
 
@@ -72,11 +72,11 @@ The old `bookwalker-native-downloader.user.js` name no longer exists in any rele
 | [597317](https://greasyfork.org/en/scripts/597317-cmoa-native-downloader) | `cmoa-only.user.js` | CMOA Native Downloader |
 | [597318](https://greasyfork.org/en/scripts/597318-ebookjapan-native-downloader) | `ebookjapan-only.user.js` | ebookjapan Native Downloader |
 
-The Kindle and k-manga single-store builds ship as artifacts but have no GreasyFork entry yet; `npm run sync-urls` prints their raw URLs the moment one is created.
+The Kindle, k-manga and DMMブックス single-store builds ship as artifacts but have no GreasyFork entry yet; `npm run sync-urls` prints their raw URLs the moment one is created. None of them belongs in entry 594508, which stays on `bookwalker-only.user.js`.
 
 Entry 597313 was repointed when v3.0.0 shipped and now serves the combined script: its title, code and listing are the v3 ones, and its version follows `dokuha-userscript.user.js` on the `release` branch. Later releases need nothing beyond the tag; GreasyFork pulls the new `@version` on its next poll, or immediately from the entry's **sync now** button.
 
-All six artifacts are committed on `main` as of v3.0.0, so their raw `main` URLs resolve. GreasyFork should still sync from the `release` branch, which only ever carries published versions.
+All seven artifacts are committed on `main` as of v3.1.0, so their raw `main` URLs resolve. GreasyFork should still sync from the `release` branch, which only ever carries published versions.
 
 ### Listing copy
 
@@ -95,7 +95,7 @@ The combined build and the single-store builds advertise different things: the "
 
 ### Size
 
-GreasyFork's limit is 2 MB. The combined artifact is the largest at ~872 KB and the splits run 291-527 KB, so all six fit.
+GreasyFork's limit is 2 MB. The combined artifact is the largest at ~904 KB and the splits run 283-517 KB, so all seven fit.
 
 ### The changelog
 
@@ -104,7 +104,7 @@ Source sync replaces the **code**; the per-version changelog is a separate field
 - **Paste it.** `node tools/release-notes.mjs v3.0.0` prints the section with the `## vX.Y.Z` heading stripped, which is what the field wants: GreasyFork already shows the version above it, so the heading in the v1.5.1 paste is redundant. One paste per entry per release.
 - **Do not duplicate it.** Put a link to the [releases page](https://github.com/GolyBidoof/dokuha-userscript/releases) in each entry's description and let the release carry the notes. Nothing recurring, at the cost of bare version numbers in GreasyFork's version list.
 
-Either way there is one wrinkle: all six artifacts share a version and a changelog, so a BookWalker-only reader gets notes about the CMOA build and the cross-store card. Trimming those lines while pasting is the cheap answer; splitting `CHANGELOG.md` per target is the expensive one.
+Either way there is one wrinkle: all seven artifacts share a version and a changelog, so a BookWalker-only reader gets notes about the CMOA build and the cross-store card. Trimming those lines while pasting is the cheap answer; splitting `CHANGELOG.md` per target is the expensive one.
 
 Unverified: GreasyFork's *additional-info* sync might carry the changelog automatically (the field names in its form suggest a raw URL plus a `##<lang>` suffix, but the settings page renders client-side and I could not read it). Worth a look on the entry's settings after the first sync.
 

@@ -6,7 +6,7 @@
             const v = (typeof GM_info !== 'undefined') && GM_info.script && GM_info.script.version;
             if (v) return v;
         } catch (e) { /* not in a userscript manager (e.g. injected in a test) */ }
-        return '3.0.1';   // the single source of truth: build.mjs substitutes this into @version
+        return '3.1.0';   // the single source of truth: build.mjs substitutes this into @version
     })();
     // Debug-only: internals on window.* are exposed only when the page URL
     // carries ?bwddDebug=1, so page scripts cannot reach mutable script state by

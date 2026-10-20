@@ -1,6 +1,6 @@
 # BookWalker protocol notes
 
-BookWalker is the reference store of the five: its protocol was reverse engineered first and everything shared was tuned against it. The adapter claims the four viewer hosts (`viewer.bookwalker.jp`, `viewer-trial.bookwalker.jp`, `viewer-ptrial.bookwalker.jp`, `viewer-subscription.bookwalker.jp`) and nothing else on the domain, so series, title, product and search pages stay inert.
+BookWalker is the reference store of the six: its protocol was reverse engineered first and everything shared was tuned against it. The adapter claims the four viewer hosts (`viewer.bookwalker.jp`, `viewer-trial.bookwalker.jp`, `viewer-ptrial.bookwalker.jp`, `viewer-subscription.bookwalker.jp`) and nothing else on the domain, so series, title, product and search pages stay inert.
 
 ## Where the protocol lives
 

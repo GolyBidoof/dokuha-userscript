@@ -9,7 +9,7 @@
 
 A store is a module under `src/sites/<store>/`, listed in `src/manifest.json` and selected by `src/targets.json`. It implements the adapter contract: which hosts it matches, how it reads the viewer, how it plans the page list, how it fetches one page and how it rebuilds that page offline. The shared core around it (panel, progress, page cache, archive writer, transport lanes, bridge hand off, automation API) is not the place for a store's quirks.
 
-When a protocol detail is non-obvious, record it in `src/sites/<store>/README.md` next to the code, and add the regression to the matching `tests/test_<store>_*.js`. Each store has a hermetic test that runs against a local stub of the viewer, so a protocol change is verifiable without downloading anything.
+When a protocol detail is non-obvious, record it in `src/sites/<store>/README.md` next to the code, and add the regression to the matching `tests/test_<store>_*.js`. Each store has hermetic coverage beside its code, usually a test that runs the adapter against a local stub of the viewer, so a protocol change is verifiable without downloading anything.
 
 ## Tests
 
@@ -17,7 +17,7 @@ When a protocol detail is non-obvious, record it in `src/sites/<store>/README.md
 npm install
 npm run build        # assemble every artifact from src/
 npm run check:build  # committed artifact equals what src/ builds
-npm test             # the full suite, 31 files, headless Chrome plus artifact checks
+npm test             # the default suite, 37 of the 38 test files, headless Chrome plus artifact checks
 ```
 
 The default suite is hermetic: local stub servers only, no network, no credentials and no real store. Tests that need the outside world are opt-in and excluded from `npm test`: `tests/acceptance/` downloads a real free volume and compares it with dokuha-cli's independent descrambler, and `npm run test:bridge` measures the fetch proxy lanes against a throwaway bridge. See [tests/README.md](tests/README.md) for the file list.
